@@ -1,0 +1,11 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Local, machine-specific Claude Code settings (permissions allowlist)
+.claude/settings.local.json
+
+# Generated audit reports
+seo-report-*.html
+seo-report-*.pdf
+seo-report-*.json
