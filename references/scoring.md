@@ -26,14 +26,14 @@ The overall score is a weighted average of the eight category scores:
 
 | category | weight | what it covers |
 |----------|--------|----------------|
-| crawlability | 0.20 | reachability, status codes, redirects, robots/sitemap, client-render, soft 404, noindex |
-| on page | 0.18 | title, meta description, H1, headings, word count, duplicates, alt text, CTA |
-| cwv | 0.15 | Core Web Vitals via PageSpeed Insights — lab LCP/INP/CLS/TBT/FCP plus real-user CrUX field data (LCP, INP, CLS at the 75th percentile) when available |
-| schema | 0.10 | JSON-LD presence/validity, schema/content mismatches (e.g. FAQPage without FAQ) |
-| trust | 0.10 | HTTPS, security headers (CSP, HSTS, X-Frame-Options, etc.) |
-| social | 0.10 | Open Graph / Twitter tags, share image dimensions & weight, favicon |
-| mobile | 0.10 | viewport meta, responsive scaling, zoom |
-| ai search | 0.07 | content visible to non-JS AI crawlers, html lang, AI-crawler robots rules |
+| crawlability | 0.20 | reachability, status codes, redirect chains, robots/sitemap quality, client-render, soft 404s, noindex (meta + header), canonicals, hreflang, host variants, 404 handling, broken internal links |
+| on page | 0.18 | title, meta description, H1, heading hierarchy, word count, duplicates, alt text, CTA, URL hygiene, internal linking, analytics presence |
+| performance | 0.15 | page-observable signals (compression, render-blocking JS, page weight, DOM size, image dimensions/lazy-loading/formats, asset caching, TTFB) plus PageSpeed Insights — lab LCP/INP/CLS/TBT/FCP and real-user CrUX field data (LCP, INP, CLS at the 75th percentile) when available |
+| schema | 0.10 | JSON-LD presence/validity, schema/content mismatches (e.g. FAQPage without FAQ), entity schema (Organization/WebSite, sameAs), breadcrumbs, LocalBusiness completeness |
+| trust | 0.10 | HTTPS enforcement (incl. the plain-http variant), TLS certificate expiry, security headers, mixed content, contact route & trust pages (E-E-A-T) |
+| social | 0.10 | Open Graph / Twitter tags & completeness, share image dimensions & weight, favicon |
+| mobile | 0.10 | viewport meta, responsive scaling, zoom; Lighthouse font-size / tap-targets when PSI runs |
+| ai search | 0.07 | content visible to non-JS AI crawlers, html lang, AI-crawler robots rules (RFC 9309 group merging) |
 
 To change weights, edit `CATEGORY_WEIGHTS` in `seo_audit.py` (they don't need to sum to
 1; the overall is normalized by the weights actually used).
@@ -55,12 +55,16 @@ and comparable across runs and crawl depths. The per-page tables still list ever
 so coverage is unchanged; only the double-counting in the score is removed. (See the dedup
 loop in `score_categories()`.)
 
-### Core Web Vitals special-casing
+### Performance special-casing
 
-- If PageSpeed returns a performance score, the `cwv` category is capped at that score.
-- If PageSpeed is rate-limited, skipped, or unavailable, `cwv` is set to 100 (neutral) —
-  we don't penalize a site for a measurement we couldn't take. An INFO finding records
-  that it was unavailable so the reader knows it wasn't actually verified.
+- The base `performance` score reflects signals observed directly from the HTML and
+  headers (compression, render-blocking JS, page weight, DOM size, image handling,
+  caching, response time) — those always count because we did observe them.
+- If PageSpeed returns a performance score, the category is additionally **capped** at
+  that score.
+- If PageSpeed is rate-limited, skipped, or unavailable, no cap is applied and an INFO
+  finding records that CWV wasn't verified — the site isn't punished for a measurement
+  we couldn't take, but the observable findings still stand.
 - **Field data (CrUX):** when the site has enough traffic, PageSpeed returns real-user
   metrics at the 75th percentile. INP (which replaced FID in March 2024) and field LCP/CLS
   in the SLOW band add a HIGH finding; AVERAGE adds a MEDIUM. This is the data Google
@@ -78,37 +82,88 @@ Shown in the report header (low / medium / high):
 ## The checks (by category)
 
 This is the current set. Each lives inline in `analyze_page()`, `analyze_social()`,
-`pagespeed()`, or the site-wide section of `run_audit()`.
+`pagespeed()`, the site-wide check functions (`check_host_variants`, `check_custom_404`,
+`tls_certificate`, `check_trust_pages`, `check_broken_links`, `check_asset_caching`,
+`detect_analytics`), or the site-wide section of `run_audit()`.
 
-**crawlability:** unreachable page (CRITICAL); 5xx (CRITICAL) / 4xx (HIGH); redirect
-(LOW); client-rendered / content missing from raw HTML (CRITICAL); soft 404 (HIGH);
-noindex (HIGH); robots.txt missing (MEDIUM); sitemap missing (MEDIUM); robots blocks all
-(CRITICAL).
+**crawlability:** unreachable page (CRITICAL); 5xx (CRITICAL) / 4xx (HIGH); redirect (LOW,
+suppressed when it's mere scheme/www/slash normalization); redirect chain ≥2 hops (MEDIUM —
+`fetch()` follows redirects manually and records the hop chain); client-rendered / content
+missing from raw HTML (CRITICAL); soft 404 (HIGH); noindex via meta (HIGH) or X-Robots-Tag
+header (HIGH); meta-refresh redirect (HIGH); canonical to another domain / to http:// / to a
+different URL (MEDIUM each); hreflang set without self-reference (LOW); robots.txt missing
+(MEDIUM); sitemap missing (MEDIUM) / empty (MEDIUM) / not referenced in robots.txt (LOW) /
+listing redirecting URLs (LOW); robots blocks all (CRITICAL); duplicate host serving without
+redirect — www vs non-www (MEDIUM); host variants unreachable (LOW); missing pages return
+200 (HIGH) or redirect to homepage (MEDIUM); broken internal links from a ≤30-link sample
+(HIGH); internal links hitting 5xx (MEDIUM) or redirects (LOW); Lighthouse `crawlable-anchors`
+/ `canonical` / `hreflang` failures when PSI runs.
 
 **on page:** missing/over-long/short title; missing/over-long/short meta description;
-meta description lacks CTA verb; missing H1 (HIGH); multiple H1; thin content <300 words;
-long content (≥600 words) without subheadings (LOW); missing canonical tag (LOW);
-images missing alt; duplicate title across pages; duplicate meta description across pages.
+meta description lacks CTA verb; missing H1 (HIGH); multiple H1 (LOW); heading levels skip
+(LOW); thin content <300 words; long content (≥600 words) without subheadings (LOW);
+missing canonical tag (LOW); URL slug not clean — uppercase/underscores/spaces (LOW);
+dead-end page with no internal links (LOW); very high internal link count >300 (LOW);
+images missing alt; duplicate title across pages; duplicate meta description across pages;
+no analytics detected (INFO) / only deprecated Universal Analytics (LOW).
+
+**Client-render suppression:** when a page is detected as client-rendered, the dependent
+content checks (missing H1, thin content, alt text, trust-page/link checks) are suppressed —
+the content exists after JS runs, we just can't see it. One CRITICAL carries that root cause
+instead of a pile of misleading findings that would double-count it.
 
 **schema:** no JSON-LD (LOW); invalid JSON-LD (MEDIUM); FAQPage schema without visible FAQ
-content (MEDIUM); homepage missing Organization/WebSite schema (LOW).
+content (MEDIUM); homepage missing Organization/WebSite schema (LOW); social profiles not in
+`sameAs` (LOW); no BreadcrumbList on any crawled page when ≥3 pages have server-rendered text
+(LOW); LocalBusiness schema incomplete — missing phone/address/geo/hours (LOW); local signals
+(tel:/Maps links) but no LocalBusiness schema at all (MEDIUM).
 
-**trust:** not HTTPS (CRITICAL); mixed content — http:// subresources on an HTTPS page
-(MEDIUM); missing security headers (MEDIUM if CSP missing, else LOW).
+**trust:** not HTTPS (CRITICAL); http:// version serves 200 without redirecting to HTTPS
+(HIGH); mixed content — http:// subresources on an HTTPS page (MEDIUM); missing security
+headers (MEDIUM if CSP missing, else LOW); TLS certificate expired (CRITICAL) / <14 days
+(HIGH) / <30 days (MEDIUM); no visible contact route — no contact page, tel: or mailto:
+(MEDIUM); trust pages (about/privacy/terms) not found (LOW). Contact/trust checks are
+skipped when the site exposes no crawlable links at all.
 
 **social:** OG image aspect ratio far from 1.91:1 (MEDIUM); no OG image (MEDIUM); image over
-1 MB (LOW); missing twitter:card (LOW); missing og:title (LOW); favicon over 100 KB (LOW);
-no CTA verb in social title/description (LOW).
+1 MB (LOW); missing twitter:card (LOW); missing og:title (LOW); OG set incomplete —
+og:description/og:url/og:type/og:site_name (LOW); favicon over 100 KB (LOW); no CTA verb in
+social title/description (LOW).
 
 **mobile:** missing viewport (HIGH); non-responsive viewport (MEDIUM); viewport disables
-zoom (LOW).
+zoom (LOW); Lighthouse `font-size` / `tap-targets` failures when PSI runs (MEDIUM each) —
+those need a real rendering browser, which PSI provides.
 
 **ai search:** content invisible to AI crawlers when client-rendered (HIGH); missing html
-lang (LOW); robots.txt blocks a named AI crawler like GPTBot/ClaudeBot (LOW); no llms.txt
-(INFO — emerging convention, no measured citation benefit, so it never moves the score).
+lang (LOW); robots.txt blocks named AI crawlers — one aggregated finding (LOW; the list
+covers GPTBot, OAI-SearchBot, ChatGPT-User, ClaudeBot, Claude-Web, anthropic-ai,
+PerplexityBot, Perplexity-User, Google-Extended, Applebot-Extended, Amazonbot,
+meta-externalagent, Bytespider, CCBot, cohere-ai, DuckAssistBot); no llms.txt (INFO —
+emerging convention, no measured citation benefit, so it never moves the score).
+Robots evaluation follows RFC 9309: groups for the same agent are merged across the file
+and `Allow` wins a specificity tie — so a Cloudflare-managed `Disallow: /` that the
+operator re-allows below is correctly read as allowed.
 
-**cwv:** field LCP/INP/CLS poor at 75th pct (HIGH) / needs improvement (MEDIUM); poor
-PageSpeed score <50 (HIGH); <90 (MEDIUM); PSI rate-limited/unavailable (INFO).
+**performance (page-observable, no PSI needed):** HTML served without compression (MEDIUM);
+large/heavy HTML document (MEDIUM/LOW); render-blocking scripts in head (MEDIUM/LOW); many
+resource requests (MEDIUM/LOW); very large DOM (MEDIUM/LOW); images without width/height —
+CLS risk (MEDIUM/LOW); no lazy-loading with ≥8 images (LOW); no modern image formats with
+≥5 JPEG/PNG (LOW); slow server response (MEDIUM/LOW); static assets without long-lived
+Cache-Control, sampled from the homepage's first CSS/JS/image (LOW).
+
+**performance (PSI):** field LCP/INP/CLS poor at 75th pct (HIGH) / needs improvement
+(MEDIUM); poor PageSpeed score <50 (HIGH); <90 (MEDIUM); top 3 Lighthouse opportunities
+≥300 ms (INFO — the perf score already caps the category, these add the "what to do");
+PSI rate-limited/unavailable (INFO). PSI is queried with all four Lighthouse categories,
+so the report also shows Lighthouse SEO / Accessibility / Best-practices scores.
+
+## Site health checks (report table)
+
+`run_audit()` assembles a `health` list rendered as the **Site health checks** table:
+host-variant behavior (http/https × www/non-www), 404 handling, TLS certificate expiry
+and issuer, contact & trust pages, the internal-link sample result, detected analytics,
+llms.txt, and AI-crawler access. The scored findings above are derived from these same
+probes; the table gives the reader the raw observations.
 
 ## Social & local footprint (mostly non-scoring)
 

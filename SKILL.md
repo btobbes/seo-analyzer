@@ -18,7 +18,9 @@ description: >-
 
 Crawl a website, score it, and write a report a non-expert can act on. The report
 mirrors the format of a professional SEO audit: one headline score, eight category
-scores, a **Top priorities** action list (highest-leverage fixes first), a **Keyword
+scores, a **Top priorities** action list (highest-leverage fixes first), a **Site
+health checks** table (host-variant redirects, 404 handling, TLS certificate, contact
+& trust pages, sampled internal links, analytics stack, AI-crawler access), a **Keyword
 focus** section (which terms the site emphasizes in the places that matter to SEO), a
 social-share preview block, a **Social & local footprint** section (linked social
 profiles + Google Business Profile / local signals), and per-page tables of findings —
@@ -63,6 +65,28 @@ and visibility to AI answer engines (server-rendered content, schema, AI-crawler
 
 ## How it works (so you can explain or adjust it)
 
+- **Site-wide probes** go beyond the crawled pages: all four host variants (http/https ×
+  www/non-www) are fetched to verify they 301 to one canonical origin; a nonsense URL is
+  probed to verify real 404 handling (soft-404 detection); the TLS certificate's expiry
+  runway is inspected; up to 30 internal links beyond the crawled set are sampled for
+  404s/5xx/redirects; the first same-site CSS/JS/image is checked for long-lived caching;
+  and the analytics stack (GA4/GTM/Plausible/…) is detected. `fetch()` follows redirects
+  manually, so redirect **chains** (≥2 hops) are flagged with the full hop list.
+- **E-E-A-T / trust pages**: the crawl looks for a contact route (contact page, tel:,
+  mailto:) and about/privacy/terms links — the things quality raters check. Skipped
+  honestly when a client-rendered site exposes no crawlable links at all.
+- **Client-render suppression**: when a page's raw HTML has no content but ships scripts,
+  one CRITICAL finding carries that root cause and the dependent checks (H1, word count,
+  alt text, trust pages) are suppressed instead of misreporting the rendered page.
+- **Robots evaluation is RFC 9309-correct**: groups for the same user-agent merge across
+  the file and Allow wins specificity ties — so a Cloudflare-managed "Disallow: /" that
+  the operator re-allows below is read as allowed. The AI-crawler list covers 16 agents
+  (GPTBot, OAI-SearchBot, ClaudeBot, Claude-Web, PerplexityBot, Google-Extended,
+  Applebot-Extended, Amazonbot, meta-externalagent, Bytespider, CCBot, …).
+- **PageSpeed runs all four Lighthouse categories** when `--pagespeed` is set: the report
+  shows Lighthouse SEO/Accessibility/Best-practices scores, mobile-only checks we can't do
+  without a browser (font size, tap targets, crawlable anchors) become findings, and the
+  top three load-time opportunities are listed as INFO.
 - **Keyword focus** ranks the terms (1–3 word phrases) the site emphasizes by *weighted
   prominence*, not raw frequency: a term scores higher for appearing in the title (×5),
   H1 (×4), H2–H3/meta (×3), URL/schema (×2) than in body copy (×1, capped so repetition

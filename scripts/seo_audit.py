@@ -70,14 +70,23 @@ CTA_VERBS = {
 
 # AI crawlers that do NOT execute JavaScript — content missing from raw HTML is invisible
 # to them, which increasingly matters for visibility in AI answers.
-AI_CRAWLERS = ["GPTBot", "ClaudeBot", "PerplexityBot", "Google-Extended", "CCBot"]
+AI_CRAWLERS = [
+    "GPTBot", "OAI-SearchBot", "ChatGPT-User",           # OpenAI (training / search / live browse)
+    "ClaudeBot", "Claude-Web", "anthropic-ai",           # Anthropic
+    "PerplexityBot", "Perplexity-User",                  # Perplexity
+    "Google-Extended",                                   # Gemini training opt-out token
+    "Applebot-Extended",                                 # Apple Intelligence
+    "Amazonbot", "meta-externalagent", "Bytespider",     # Amazon / Meta / ByteDance
+    "CCBot", "cohere-ai", "DuckAssistBot",               # Common Crawl / Cohere / DuckDuckGo
+]
 
 
 # =================================================================================
 # Fetching
 # =================================================================================
 class Response:
-    def __init__(self, url, final_url, status, headers, body, elapsed_ms, error=None):
+    def __init__(self, url, final_url, status, headers, body, elapsed_ms, error=None,
+                 chain=None):
         self.url = url
         self.final_url = final_url
         self.status = status
@@ -85,6 +94,7 @@ class Response:
         self.body = body or b""
         self.elapsed_ms = elapsed_ms
         self.error = error
+        self.chain = chain or []   # [(url, status), …] one entry per redirect hop
 
     @property
     def text(self):
@@ -105,52 +115,81 @@ class Response:
         return default
 
 
-def fetch(url, method="GET", max_bytes=None):
-    """Fetch a URL, following redirects, decoding gzip/deflate. Never raises."""
-    ctx = ssl.create_default_context()
-    start = _dt.datetime.now()
-    req = urllib.request.Request(
-        url,
-        method=method,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Encoding": "gzip, deflate",
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, context=ctx, timeout=TIMEOUT) as r:
-            raw = r.read(max_bytes) if max_bytes else r.read()
-            enc = (r.headers.get("Content-Encoding") or "").lower()
-            if "gzip" in enc:
-                try:
-                    raw = gzip.decompress(raw)
-                except OSError:
-                    pass
-            elif "deflate" in enc:
-                import zlib
-                try:
-                    raw = zlib.decompress(raw)
-                except zlib.error:
-                    try:
-                        raw = zlib.decompress(raw, -zlib.MAX_WBITS)
-                    except zlib.error:
-                        pass
-            elapsed = (_dt.datetime.now() - start).total_seconds() * 1000
-            return Response(url, r.geturl(), r.status, dict(r.headers), raw, elapsed)
-    except urllib.error.HTTPError as e:
-        elapsed = (_dt.datetime.now() - start).total_seconds() * 1000
-        body = b""
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # surface 3xx as HTTPError so fetch() can record the hop
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect())
+
+
+def _decode_body(raw, enc):
+    enc = (enc or "").lower()
+    if "gzip" in enc:
         try:
-            body = e.read()
-        except Exception:
-            pass
-        return Response(url, url, e.code, dict(e.headers or {}), body, elapsed)
-    except (urllib.error.URLError, ssl.SSLError, socket.timeout, ConnectionError,
-            ValueError, OSError) as e:
-        elapsed = (_dt.datetime.now() - start).total_seconds() * 1000
-        return Response(url, url, 0, {}, b"", elapsed, error=str(e))
+            return gzip.decompress(raw)
+        except (OSError, EOFError):  # EOFError: body truncated by max_bytes
+            return raw
+    if "deflate" in enc:
+        import zlib
+        try:
+            return zlib.decompress(raw)
+        except zlib.error:
+            try:
+                return zlib.decompress(raw, -zlib.MAX_WBITS)
+            except zlib.error:
+                return raw
+    return raw
+
+
+def fetch(url, method="GET", max_bytes=None, max_redirects=10):
+    """Fetch a URL, following redirects manually so the hop chain is recorded
+    (Response.chain). Decodes gzip/deflate. Never raises."""
+    start = _dt.datetime.now()
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    chain = []
+    current = url
+
+    def elapsed():
+        return (_dt.datetime.now() - start).total_seconds() * 1000
+
+    for _ in range(max_redirects + 1):
+        try:
+            req = urllib.request.Request(current, method=method, headers=headers)
+        except ValueError as e:
+            return Response(url, current, 0, {}, b"", elapsed(), error=str(e), chain=chain)
+        try:
+            with _OPENER.open(req, timeout=TIMEOUT) as r:
+                raw = r.read(max_bytes) if max_bytes else r.read()
+                raw = _decode_body(raw, r.headers.get("Content-Encoding"))
+                return Response(url, current, r.status, dict(r.headers), raw, elapsed(),
+                                chain=chain)
+        except urllib.error.HTTPError as e:
+            loc = e.headers.get("Location") if e.headers else None
+            if 300 <= e.code < 400 and loc and len(chain) < max_redirects:
+                chain.append((current, e.code))
+                nxt = urllib.parse.urljoin(current, loc.strip())
+                if nxt == current:  # self-redirect loop
+                    return Response(url, current, 0, {}, b"", elapsed(),
+                                    error="redirect loop", chain=chain)
+                current = nxt
+                continue
+            body = b""
+            try:
+                body = e.read()
+            except Exception:
+                pass
+            return Response(url, current, e.code, dict(e.headers or {}), body, elapsed(),
+                            chain=chain)
+        except (urllib.error.URLError, ssl.SSLError, socket.timeout, ConnectionError,
+                ValueError, OSError) as e:
+            return Response(url, current, 0, {}, b"", elapsed(), error=str(e), chain=chain)
+    return Response(url, current, 0, {}, b"", elapsed(), error="too many redirects", chain=chain)
 
 
 # =================================================================================
@@ -184,6 +223,8 @@ class PageParser(HTMLParser):
         self.element_count = 0          # DOM size proxy (count of start tags)
         self.scripts = []               # {src, async, defer, in_head}
         self._in_head = False
+        self.heading_sequence = []      # heading tags in document order, e.g. ["h1","h2"]
+        self.imgs = []                  # {src, loading} per <img>
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
@@ -194,7 +235,7 @@ class PageParser(HTMLParser):
         if tag == "head":
             self._in_head = True
         elif tag == "script":
-            self.scripts.append({"src": bool(a.get("src")), "async": "async" in a,
+            self.scripts.append({"src": (a.get("src") or "").strip(), "async": "async" in a,
                                  "defer": "defer" in a, "in_head": self._in_head})
         if tag == "title":
             self._in_title = True
@@ -210,12 +251,15 @@ class PageParser(HTMLParser):
             self.links.append(a["href"])
         elif tag == "img":
             self.img_total += 1
+            self.imgs.append({"src": (a.get("src") or a.get("data-src") or "").strip(),
+                              "loading": (a.get("loading") or "").lower()})
             if not (a.get("alt") or "").strip():
                 self.img_missing_alt += 1
             if not (a.get("width") and a.get("height")):
                 self.img_missing_dim += 1
         elif tag in HEADING_TAGS:
             self._heading_stack.append([tag, []])
+            self.heading_sequence.append(tag)
         elif tag == "script" and (a.get("type") or "").lower() == "application/ld+json":
             self._in_jsonld = True
             self._jsonld_buf = []
@@ -271,6 +315,19 @@ class PageParser(HTMLParser):
         for lt in self.link_tags:
             if "canonical" in (lt.get("rel") or "").lower():
                 return (lt.get("href") or "").strip()
+        return ""
+
+    @property
+    def hreflangs(self):
+        return [((lt.get("hreflang") or "").strip(), (lt.get("href") or "").strip())
+                for lt in self.link_tags
+                if "alternate" in (lt.get("rel") or "").lower() and lt.get("hreflang")]
+
+    @property
+    def meta_refresh(self):
+        for m in self.metas:
+            if (m.get("http-equiv") or "").lower() == "refresh":
+                return (m.get("content") or "").strip()
         return ""
 
     @property
@@ -410,30 +467,62 @@ def same_site(a, b):
     return ha == hb
 
 
+def _trivial_redirect(a, b):
+    """True when a→b is mere scheme/www/trailing-slash normalization — expected
+    behavior, not an SEO issue worth a finding."""
+    pa, pb = urllib.parse.urlparse(a), urllib.parse.urlparse(b)
+    return (same_site(a, b)
+            and pa.path.rstrip("/") == pb.path.rstrip("/")
+            and pa.query == pb.query)
+
+
 def parse_robots(text):
+    """RFC 9309-style evaluation of root ('/') access per agent.
+
+    Real robots.txt files often contain MULTIPLE groups for the same agent (e.g.
+    Cloudflare's managed 'Disallow: /' block followed by the operator's own
+    'Allow: /' block). Groups for the same agent merge, and on an allow/disallow
+    tie of equal specificity, Allow wins — so a naive 'saw Disallow: /' scan
+    reports crawlers as blocked that are actually allowed."""
+    groups = []                     # (agents_lower, rules) — rules: [(is_allow, path)]
+    cur_agents, cur_rules = [], []
+    prev_was_ua = False
     sitemaps = []
-    ai_blocked = []
-    cur_agents = []
-    blocks_all = False
     for line in text.splitlines():
         line = line.split("#", 1)[0].strip()
-        if not line:
-            continue
-        if ":" not in line:
+        if not line or ":" not in line:
             continue
         field, _, val = line.partition(":")
         field = field.strip().lower()
         val = val.strip()
+        if field == "user-agent":
+            if not prev_was_ua:      # a new group starts
+                if cur_agents:
+                    groups.append((cur_agents, cur_rules))
+                cur_agents, cur_rules = [], []
+            cur_agents.append(val.lower())
+            prev_was_ua = True
+            continue
+        prev_was_ua = False
         if field == "sitemap":
             sitemaps.append(val)
-        elif field == "user-agent":
-            cur_agents = [val]
-        elif field == "disallow" and val == "/":
-            for agent in cur_agents:
-                if agent == "*":
-                    blocks_all = True
-                if agent in AI_CRAWLERS:
-                    ai_blocked.append(agent)
+        elif field in ("allow", "disallow") and cur_agents and val:
+            cur_rules.append((field == "allow", val))
+    if cur_agents:
+        groups.append((cur_agents, cur_rules))
+
+    def rules_for(agent_lower):
+        if any(agent_lower in agents for agents, _ in groups):
+            return [r for agents, rules in groups if agent_lower in agents for r in rules]
+        return [r for agents, rules in groups if "*" in agents for r in rules]
+
+    def root_blocked(rules):
+        dis = any(not allow and p.rstrip("*") == "/" for allow, p in rules)
+        alw = any(allow and p.rstrip("*") == "/" for allow, p in rules)
+        return dis and not alw
+
+    blocks_all = root_blocked(rules_for("*"))
+    ai_blocked = [c for c in AI_CRAWLERS if root_blocked(rules_for(c.lower()))]
     return {"sitemaps": sitemaps, "ai_blocked": ai_blocked, "blocks_all": blocks_all}
 
 
@@ -464,21 +553,21 @@ def collect_sitemap_urls(url, seen=None, depth=0):
     return out
 
 
-def discover_pages(base_url, max_pages, robots_info):
-    """Return an ordered list of page URLs to audit, homepage first."""
+def discover_pages(base_url, max_pages, sm_urls):
+    """Return an ordered list of (url, source) to audit, homepage first. Sources:
+    'homepage', 'sitemap', 'link' — the report shows how each page was discovered."""
     home = base_url
-    pages = [home]
+    pages = [(home, "homepage")]
+    seen = {home.rstrip("/")}
     # Prefer the sitemap — it's the site's own statement of what matters.
-    sm_urls = []
-    for sm in robots_info.get("sitemaps", []):
-        sm_urls.extend(collect_sitemap_urls(sm))
-    if not sm_urls:
-        sm_urls = collect_sitemap_urls(normalize(base_url, "/sitemap.xml"))
     for u in sm_urls:
-        if u not in pages and same_site(base_url, u):
-            pages.append(u)
+        u = u.strip()
         if len(pages) >= max_pages:
             break
+        if not u or not same_site(base_url, u) or u.rstrip("/") in seen:
+            continue
+        seen.add(u.rstrip("/"))
+        pages.append((u, "sitemap"))
     # Fall back to following homepage links if the sitemap was thin.
     if len(pages) < max_pages:
         r = fetch(home)
@@ -492,11 +581,12 @@ def discover_pages(base_url, max_pages, robots_info):
                 u = normalize(home, href)
                 if not u or not u.startswith("http"):
                     continue
-                if u in pages or not same_site(base_url, u):
+                if u.rstrip("/") in seen or not same_site(base_url, u):
                     continue
                 if re.search(r"\.(pdf|jpg|jpeg|png|gif|svg|zip|mp4|css|js|webp|ico)(\?|$)", u, re.I):
                     continue
-                pages.append(u)
+                seen.add(u.rstrip("/"))
+                pages.append((u, "link"))
                 if len(pages) >= max_pages:
                     break
     return pages[:max_pages]
@@ -549,16 +639,30 @@ def analyze_page(url):
     })
 
     # ---- crawlability ----
-    if not same_site(url, r.final_url) or r.final_url.rstrip("/") != url.rstrip("/"):
-        if r.final_url != url:
+    page["chain_hops"] = len(r.chain)
+    if r.chain:
+        hops = len(r.chain)
+        if hops >= 2:
+            chain_str = " → ".join([u for u, _ in r.chain] + [r.final_url])
+            findings.append(f("MEDIUM", f"Redirect chain ({hops} hops)", "crawlability", 3, 2,
+                              trunc(chain_str, 180),
+                              "Collapse the chain into a single 301 straight to the final URL — every "
+                              "extra hop adds latency and leaks crawl budget and link equity."))
+        elif not _trivial_redirect(url, r.final_url):
             findings.append(f("LOW", "Page redirects", "crawlability", 2, 2,
                               f"{url} → {r.final_url}",
                               "Link directly to the final URL to avoid redirect latency and lost link equity."))
 
     # Client-render detection: raw HTML has almost no words but ships scripts.
+    # When this fires, downstream content checks (H1, word count, alt text…) are
+    # SUPPRESSED — the content exists after JS runs, we just can't see it, and
+    # reporting "missing H1 / thin content" on top would be double-counting one
+    # root cause and likely wrong about the rendered page.
     raw_words = p.word_count
     script_heavy = r.text.lower().count("<script") >= 3
-    if raw_words < 20 and script_heavy and r.status < 400:
+    client_rendered = raw_words < 20 and script_heavy and r.status < 400
+    page["client_rendered"] = client_rendered
+    if client_rendered:
         findings.append(f("CRITICAL",
                           "Page may be client-rendered — content missing from raw HTML",
                           "crawlability", 5, 4,
@@ -566,7 +670,8 @@ def analyze_page(url):
                           f"{'no H1' if not p.headings['h1'] else 'H1 present'}",
                           "Enable prerendering or static export. AI crawlers (GPTBot, ClaudeBot, "
                           "PerplexityBot) and Bing's first pass do not run JavaScript. For SPAs use "
-                          "SSR/SSG, react-snap, or a prerender service."))
+                          "SSR/SSG, react-snap, or a prerender service. (On-page content checks are "
+                          "skipped for this page — they can't be measured from empty HTML.)"))
         findings.append(f("HIGH", "Content invisible to AI crawlers", "ai search", 4, 4,
                           f"{raw_words} words in raw HTML",
                           "Serve meaningful content in the initial HTML so AI answer engines can cite this page."))
@@ -576,10 +681,23 @@ def analyze_page(url):
                           "0 words, no title",
                           "Return a real 404 status for missing pages, or fix the missing content."))
 
-    if "noindex" in p.meta_robots:
+    if "noindex" in p.meta_robots or p.meta_robots.strip() == "none":
         findings.append(f("HIGH", "Page set to noindex", "crawlability", 4, 1,
                           f'meta robots="{p.meta_robots}"',
                           "Remove noindex if this page should appear in search results."))
+
+    xrobots = r.header("x-robots-tag", "").lower()
+    if "noindex" in xrobots or xrobots.strip() == "none":
+        findings.append(f("HIGH", "Noindexed via X-Robots-Tag header", "crawlability", 4, 1,
+                          f"X-Robots-Tag: {xrobots}",
+                          "Remove the noindex directive from the HTTP response header if this page "
+                          "should appear in search results (check CDN/server config)."))
+
+    if "url=" in p.meta_refresh.lower():
+        findings.append(f("HIGH", "Meta-refresh redirect", "crawlability", 4, 2,
+                          f"meta refresh: {trunc(p.meta_refresh, 80)}",
+                          "Replace the meta refresh with a server-side 301 — meta refreshes are slow, "
+                          "pass less link equity, and can be treated as sneaky redirects."))
 
     # ---- on page ----
     if not p.title:
@@ -611,14 +729,25 @@ def analyze_page(url):
                              "Add a verb like 'Learn', 'Explore', 'Get', or 'Compare' to invite the click."))
 
     h1s = p.headings["h1"]
-    if len(h1s) == 0:
+    if len(h1s) == 0 and not client_rendered:
         findings.append(f("HIGH", "Missing H1 tag", "on page", 5, 1, "No H1 element on the page",
                           "Add one H1 describing the page's main topic, aligned with the title and primary keyword."))
     elif len(h1s) > 1:
         findings.append(f("LOW", "Multiple H1 tags", "on page", 2, 1, f"{len(h1s)} H1 elements",
                           "Use a single H1 per page; demote the others to H2/H3 to keep a clear hierarchy."))
 
-    if p.word_count < 300 and r.status == 200:
+    prev_lvl = 0
+    for htag in p.heading_sequence:
+        lvl = int(htag[1])
+        if prev_lvl and lvl > prev_lvl + 1:
+            findings.append(f("LOW", "Heading levels skip", "on page", 1, 1,
+                              f"h{prev_lvl} followed directly by h{lvl}",
+                              "Keep a sequential heading outline (H1 → H2 → H3) — a clean structure helps "
+                              "search engines and AI answer engines parse and cite sections."))
+            break
+        prev_lvl = lvl
+
+    if p.word_count < 300 and r.status == 200 and not client_rendered:
         findings.append(f("MEDIUM", "Thin content (<300 words)", "on page", 3, 4, f"{p.word_count} words",
                           "Add depth: examples, definitions, FAQ, or related links. Or noindex if it's a thin utility page."))
 
@@ -635,8 +764,61 @@ def analyze_page(url):
         findings.append(f("LOW", "Missing canonical tag", "on page", 2, 1, "No rel=canonical link",
                           "Add <link rel=\"canonical\"> pointing to the preferred URL to consolidate "
                           "duplicate or parameter variants and focus ranking signals."))
+    elif p.canonical and r.status == 200:
+        can = normalize(r.final_url, p.canonical)
+        if can and can.startswith("http"):
+            cu, fu = urllib.parse.urlparse(can), urllib.parse.urlparse(r.final_url)
+            if not same_site(can, r.final_url):
+                findings.append(f("MEDIUM", "Canonical points to another domain", "crawlability", 3, 1,
+                                  f"{r.final_url} → canonical {can}",
+                                  "Unless this is deliberate syndication, point rel=canonical at this "
+                                  "page's own URL — a cross-domain canonical hands your ranking signals "
+                                  "to the other site."))
+            elif cu.scheme == "http" and fu.scheme == "https":
+                findings.append(f("MEDIUM", "Canonical points at the http:// version", "crawlability", 3, 1,
+                                  f"canonical {can}",
+                                  "Update rel=canonical to the https:// URL so signals consolidate on "
+                                  "the secure version."))
+            elif cu.path.rstrip("/") != fu.path.rstrip("/"):
+                findings.append(f("MEDIUM", "Canonicalized to a different URL", "crawlability", 3, 1,
+                                  f"{fu.path or '/'} → canonical {cu.path or '/'}",
+                                  "This page tells search engines to index a different URL instead of "
+                                  "itself. If that's not intentional, set the canonical to this page's "
+                                  "own URL."))
 
-    if p.img_total and p.img_missing_alt:
+    upath = urllib.parse.urlparse(url).path
+    if re.search(r"[A-Z]|_|%20", upath):
+        findings.append(f("LOW", "URL slug not clean", "on page", 1, 3, upath,
+                          "Prefer short, lowercase, hyphen-separated URL slugs (301-redirect old URLs "
+                          "if you rename)."))
+
+    if p.hreflangs:
+        alt_urls = {(normalize(r.final_url, h) or "").rstrip("/") for _, h in p.hreflangs if h}
+        if r.final_url.rstrip("/") not in alt_urls:
+            findings.append(f("LOW", "hreflang set lacks a self-reference", "crawlability", 2, 1,
+                              f"{len(p.hreflangs)} hreflang link(s), none pointing at this URL",
+                              "Every page must include an hreflang link to itself, or search engines may "
+                              "ignore the whole hreflang set."))
+
+    internal_links = 0
+    for href in p.links:
+        u2 = normalize(url, href)
+        if u2 and u2.startswith("http") and same_site(u2, url):
+            internal_links += 1
+    page["internal_links"] = internal_links
+    if r.status == 200 and p.word_count > 100:
+        if internal_links == 0:
+            findings.append(f("LOW", "Dead-end page (no internal links)", "on page", 2, 1,
+                              "0 internal links on the page",
+                              "Link to related pages so users and crawlers can continue — dead ends "
+                              "strand the authority this page earns."))
+        elif internal_links > 300:
+            findings.append(f("LOW", "Very high internal link count", "on page", 1, 3,
+                              f"{internal_links} internal links",
+                              "Trim navigation/footer link bloat — hundreds of links per page dilute "
+                              "the value each one passes."))
+
+    if p.img_total and p.img_missing_alt and not client_rendered:
         sev = "MEDIUM" if p.img_missing_alt > p.img_total / 2 else "LOW"
         findings.append(f(sev, "Images missing alt text", "on page", 2, 2,
                           f"{p.img_missing_alt}/{p.img_total} images without alt",
@@ -646,8 +828,11 @@ def analyze_page(url):
     types, valid, invalid = parse_jsonld_types(p.jsonld)
     page["schema_types"] = sorted(types)
     if not p.jsonld:
-        findings.append(f("LOW", "No structured data (JSON-LD)", "schema", 2, 2, "No JSON-LD found",
-                          "Add schema.org JSON-LD (Organization, WebSite, BreadcrumbList, and page-appropriate types)."))
+        obs = ("No JSON-LD in the raw HTML (JS may inject some at runtime, but AI crawlers "
+               "and Bing's first pass won't see it)") if client_rendered else "No JSON-LD found"
+        findings.append(f("LOW", "No structured data (JSON-LD)", "schema", 2, 2, obs,
+                          "Add schema.org JSON-LD (Organization, WebSite, BreadcrumbList, and page-appropriate types) "
+                          "to the server-rendered HTML."))
     if invalid:
         findings.append(f("MEDIUM", "Invalid JSON-LD", "schema", 3, 1, f"{invalid} block(s) failed to parse",
                           "Fix the JSON syntax; validate with Google's Rich Results Test."))
@@ -743,6 +928,23 @@ def analyze_page(url):
                               f"{p.img_missing_dim}/{p.img_total} images lack explicit dimensions",
                               "Set width and height (or CSS aspect-ratio) so the browser reserves space — "
                               "prevents Cumulative Layout Shift (CLS)."))
+
+        lazy = sum(1 for im in p.imgs if im["loading"] == "lazy")
+        if p.img_total >= 8 and lazy == 0:
+            findings.append(f("LOW", "No lazy-loading on images", "performance", 2, 1,
+                              f'0 of {p.img_total} <img> tags use loading="lazy"',
+                              'Add loading="lazy" to below-the-fold images so they don\'t compete with '
+                              "the hero/LCP element for bandwidth."))
+
+        legacy_imgs = sum(1 for im in p.imgs if re.search(r"\.(jpe?g|png)(\?|$)", im["src"], re.I))
+        modern_imgs = sum(1 for im in p.imgs
+                          if re.search(r"\.(webp|avif)(\?|$)|f(ormat)?[=_](webp|avif|auto)", im["src"], re.I))
+        if legacy_imgs >= 5 and modern_imgs == 0:
+            findings.append(f("LOW", "No modern image formats detected", "performance", 2, 2,
+                              f"{legacy_imgs} JPEG/PNG <img> sources, no WebP/AVIF "
+                              "(srcset/CDN content negotiation not counted)",
+                              "Serve WebP or AVIF via <picture>, srcset, or a CDN that auto-negotiates — "
+                              "typically 30–60% smaller than JPEG/PNG at the same quality."))
 
         if r.elapsed_ms > 4000:
             findings.append(f("MEDIUM", "Slow server response", "performance", 3, 3,
@@ -1082,7 +1284,7 @@ def extract_footprint(pages):
                           "search and AI engines connect them to your entity (a knowledge-graph signal)."))
 
     return {"social": social, "sameas_present": bool(sameas), "google": google,
-            "findings": findings}
+            "no_links": not links and not sameas, "findings": findings}
 
 
 def _google_signals(links, nodes):
@@ -1167,6 +1369,303 @@ def _local_fields(n):
 
 
 # =================================================================================
+# Site-wide checks: host variants, 404 handling, TLS, trust pages, broken links,
+# asset caching, analytics — the checks a professional audit runs once per site.
+# =================================================================================
+_SKIP_LINK_RE = re.compile(
+    r"\.(pdf|jpe?g|png|gif|svg|webp|avif|ico|css|js|mjs|zip|gz|mp3|mp4|webm|woff2?|xml)(\?|$)"
+    r"|add-to-cart|logout|wp-login|/cart(/|$|\?)|/checkout(/|$|\?)|replytocom=", re.I)
+
+
+def check_host_variants(base, canonical_final_url):
+    """http/https × www/non-www should all 301 to one canonical origin. Serving the
+    site on two hosts splits link equity; serving plain http is a trust problem."""
+    pu = urllib.parse.urlparse(base)
+    host = pu.hostname or ""
+    alt = host[4:] if host.startswith("www.") else "www." + host
+    canon_host = urllib.parse.urlparse(canonical_final_url).hostname or host
+    findings, health, results = [], [], []
+    for v in (f"http://{host}/", f"https://{alt}/", f"http://{alt}/"):
+        r = fetch(v, max_bytes=2048)
+        results.append((v, r))
+        if r.status == 0:
+            health.append((v, f"unreachable ({trunc(r.error or 'no response', 60)})"))
+        else:
+            fu = urllib.parse.urlparse(r.final_url)
+            arrow = f"→ {fu.scheme}://{fu.hostname or ''}" if r.chain else "no redirect"
+            health.append((v, f"{arrow} (HTTP {r.status})"))
+
+    http_live = [v for v, r in results if r.status == 200
+                 and urllib.parse.urlparse(r.final_url).scheme == "http"]
+    if http_live:
+        findings.append(f("HIGH", "HTTP version not redirected to HTTPS", "trust", 4, 1,
+                          "; ".join(http_live) + " serves 200 over plain http",
+                          "301-redirect all http:// traffic to the https:// canonical host — a duplicate "
+                          "insecure copy of the site splits signals and erodes trust."))
+    dup_hosts = [v for v, r in results if r.status == 200
+                 and urllib.parse.urlparse(r.final_url).scheme == "https"
+                 and (urllib.parse.urlparse(r.final_url).hostname or "") != canon_host]
+    if dup_hosts:
+        findings.append(f("MEDIUM", "Duplicate host serves the site without redirect", "crawlability", 3, 1,
+                          "; ".join(f"{v} answers 200 without redirecting to {canon_host}" for v in dup_hosts),
+                          f"301-redirect the alternate hostname to https://{canon_host}/ so indexing and "
+                          "link equity consolidate on one host (a canonical tag helps, but the redirect "
+                          "is the robust fix)."))
+    unreach = [v for v, r in results if r.status == 0]
+    if unreach:
+        findings.append(f("LOW", "Some host variants unreachable", "crawlability", 2, 2,
+                          "; ".join(unreach),
+                          "Make every variant (http/https, www/non-www) resolve and 301 to the canonical "
+                          "URL so no typed or linked variant dead-ends."))
+    return findings, health
+
+
+def check_custom_404(base):
+    """Probe a URL that can't exist and verify the site answers with a real 404."""
+    probe = normalize(base, "/seo-audit-404-probe-x9q3z7/")
+    r = fetch(probe, max_bytes=4096)
+    findings = []
+    if r.status == 200 and r.final_url.rstrip("/") == base.rstrip("/"):
+        findings.append(f("MEDIUM", "Missing pages redirect to the homepage", "crawlability", 3, 2,
+                          f"GET {probe} redirects to the homepage",
+                          "Return a 404 status with a helpful not-found page instead — Google treats "
+                          "blanket redirects to the homepage as soft 404s."))
+        health = ("404 handling", "redirects to homepage (soft 404)")
+    elif r.status == 200:
+        findings.append(f("HIGH", "Missing pages return HTTP 200 (soft 404)", "crawlability", 4, 2,
+                          f"GET {probe} → 200",
+                          "Return a real 404 status for unknown URLs — soft 404s waste crawl budget and "
+                          "can get junk URLs indexed."))
+        health = ("404 handling", "returns 200 for missing pages (soft 404)")
+    elif r.status in (404, 410):
+        health = ("404 handling", f"correct (HTTP {r.status})")
+    elif r.status == 0:
+        health = ("404 handling", "could not test")
+    else:
+        health = ("404 handling", f"returns HTTP {r.status}")
+    return findings, health
+
+
+def tls_certificate(host):
+    """Inspect the TLS certificate: expiry runway and issuer. Best effort."""
+    findings = []
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((host, 443), timeout=10) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                cert = ssock.getpeercert()
+        exp = ssl.cert_time_to_seconds(cert["notAfter"])
+        days = int((exp - _dt.datetime.now(_dt.timezone.utc).timestamp()) // 86400)
+        issuer = ""
+        for rdn in cert.get("issuer", ()):
+            for k, v in rdn:
+                if k == "organizationName":
+                    issuer = v
+        if days < 0:
+            findings.append(f("CRITICAL", "TLS certificate expired", "trust", 5, 2,
+                              f"expired {-days} day(s) ago",
+                              "Renew the certificate immediately — browsers are blocking the site."))
+        elif days <= 14:
+            findings.append(f("HIGH", "TLS certificate expires very soon", "trust", 4, 2,
+                              f"{days} day(s) left",
+                              "Renew now and enable auto-renewal before browsers start showing "
+                              "security errors."))
+        elif days <= 30:
+            findings.append(f("MEDIUM", "TLS certificate expires within 30 days", "trust", 3, 2,
+                              f"{days} day(s) left", "Confirm certificate auto-renewal is working."))
+        health = ("TLS certificate", f"valid · {days} days left" + (f" · {issuer}" if issuer else ""))
+    except Exception as e:
+        health = ("TLS certificate", f"could not inspect ({e.__class__.__name__})")
+    return findings, health
+
+
+_TRUST_PATTERNS = {
+    "contact": re.compile(r"/(contact|contact-?us|kontakt|get-?in-?touch|book-?now)(/|$|\.|\?)", re.I),
+    "about": re.compile(r"/(about|about-?us|our-?story|who-?we-?are|team|meet-)", re.I),
+    "privacy": re.compile(r"privacy|datenschutz|privacybeleid", re.I),
+    "terms": re.compile(r"/(terms|tos$|terms-?of|conditions|legal|imprint|impressum|refund|cancellation)", re.I),
+}
+
+
+def check_trust_pages(pages):
+    """E-E-A-T basics: can a visitor (or a quality rater) reach contact info and
+    policy pages from the crawled pages? Returns (findings, health_row, signals)."""
+    paths, has_tel, has_mailto = set(), False, False
+    for page in pages:
+        p = page.get("parser")
+        if not p:
+            continue
+        for href in p.links:
+            low = href.strip().lower()
+            if low.startswith("tel:"):
+                has_tel = True
+            elif low.startswith("mailto:"):
+                has_mailto = True
+            else:
+                u = normalize(page["url"], href)
+                if u and u.startswith("http") and same_site(u, page["url"]):
+                    paths.add(urllib.parse.urlparse(u).path.lower())
+    found = {k: any(rx.search(pt) for pt in paths) for k, rx in _TRUST_PATTERNS.items()}
+    findings = []
+    if not paths and not (has_tel or has_mailto):
+        # Nothing crawlable to judge (fully client-rendered site) — don't claim pages
+        # are missing when we simply can't see any links.
+        return findings, ("Contact & trust pages",
+                          "could not evaluate — no crawlable links in the raw HTML"), \
+               {"has_tel": has_tel, "has_mailto": has_mailto, "found": found}
+    if not (found["contact"] or has_tel or has_mailto):
+        findings.append(f("MEDIUM", "No visible contact route", "trust", 3, 2,
+                          "No contact page link, tel: or mailto: found on the crawled pages",
+                          "Add a contact page and put phone/email in the footer — contactability is a "
+                          "core trust/E-E-A-T signal for search engines and customers alike."))
+    missing = [k for k in ("privacy", "terms", "about") if not found[k]]
+    if missing:
+        findings.append(f("LOW", "Trust pages not found: " + ", ".join(missing), "trust", 2, 3,
+                          f"No link to {', '.join(missing)} page(s) on the crawled pages",
+                          "Publish and footer-link About, Privacy Policy, and Terms pages — E-E-A-T "
+                          "assessments look for them. If they exist but aren't linked, just link them."))
+    contact_bits = [b for b, ok in (("contact page", found["contact"]),
+                                    ("tel:", has_tel), ("mailto:", has_mailto)) if ok]
+    health = ("Contact & trust pages",
+              (", ".join(contact_bits) or "no contact signals")
+              + " · " + " ".join(f"{k} {'✓' if found[k] else '✗'}" for k in ("about", "privacy", "terms")))
+    return findings, health, {"has_tel": has_tel, "has_mailto": has_mailto, "found": found}
+
+
+def check_broken_links(pages, crawled_urls, limit=30):
+    """Sample internal links beyond the crawled pages and verify they resolve.
+    Broken internal links are among the highest-confidence findings an audit can make."""
+    seen = {u.rstrip("/") for u in crawled_urls}
+    candidates = []
+    for page in pages:
+        p = page.get("parser")
+        if not p:
+            continue
+        for href in p.links:
+            u = normalize(page["url"], href)
+            if not u or not u.startswith("http") or not same_site(u, page["url"]):
+                continue
+            if _SKIP_LINK_RE.search(u):
+                continue
+            key = u.rstrip("/")
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(u)
+            if len(candidates) >= limit:
+                break
+        if len(candidates) >= limit:
+            break
+    findings = []
+    if not candidates:
+        return findings, ("Internal links checked", "no uncrawled internal links found")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(lambda u: fetch(u, max_bytes=1024), candidates))
+    broken = [(u, r.status) for u, r in zip(candidates, results) if r.status in (404, 410)]
+    errors5 = [(u, r.status) for u, r in zip(candidates, results) if r.status >= 500]
+    redirs = [u for u, r in zip(candidates, results)
+              if r.chain and not _trivial_redirect(u, r.final_url)]
+    if broken:
+        findings.append(f("HIGH", f"Broken internal links ({len(broken)} of {len(candidates)} sampled)",
+                          "crawlability", 4, 2,
+                          trunc("; ".join(u for u, _ in broken[:4]), 220),
+                          "Fix or remove links to these URLs (or 301 them to the right page) — broken "
+                          "links leak crawl budget, link equity, and user trust."))
+    if errors5:
+        findings.append(f("MEDIUM", f"Internal links hit server errors ({len(errors5)})",
+                          "crawlability", 3, 3,
+                          trunc("; ".join(f"{u} ({s})" for u, s in errors5[:4]), 220),
+                          "Investigate the 5xx responses on these linked URLs."))
+    if len(redirs) >= 5:
+        findings.append(f("LOW", f"Internal links point at redirects ({len(redirs)} of {len(candidates)})",
+                          "crawlability", 2, 2, trunc("; ".join(redirs[:4]), 200),
+                          "Update internal links to the final URLs so crawlers and users skip the extra hop."))
+    health = ("Internal links checked",
+              f"{len(candidates)} sampled · {len(broken)} broken · {len(redirs)} redirecting")
+    return findings, health
+
+
+def check_asset_caching(home_page):
+    """Sample the first same-site stylesheet, script, and image and check for
+    long-lived Cache-Control — repeat-visit speed and a cheap CWV win."""
+    p = home_page.get("parser")
+    if not p:
+        return []
+    base_url = home_page["url"]
+    cands = []
+    for lt in p.link_tags:
+        if "stylesheet" in (lt.get("rel") or "").lower() and lt.get("href"):
+            cands.append(lt["href"])
+            break
+    for s in p.scripts:
+        if s.get("src"):
+            cands.append(s["src"])
+            break
+    for im in p.imgs:
+        if im.get("src"):
+            cands.append(im["src"])
+            break
+    checked, stale = [], []
+    for href in cands[:3]:
+        u = normalize(base_url, href)
+        if not u or not u.startswith("http") or not same_site(u, base_url):
+            continue
+        ar = fetch(u, max_bytes=256)
+        if ar.status != 200:
+            continue
+        cc = ar.header("cache-control", "").lower()
+        m = re.search(r"max-age=(\d+)", cc)
+        age = int(m.group(1)) if m else 0
+        checked.append(u)
+        if "immutable" not in cc and age < 86400:
+            stale.append(f"{u.rsplit('/', 1)[-1][:40] or u} (cache-control: {cc or 'none'})")
+    findings = []
+    if checked and len(stale) == len(checked):
+        findings.append(f("LOW", "Static assets lack long-lived caching", "performance", 2, 1,
+                          trunc("; ".join(stale), 200),
+                          "Serve CSS/JS/images with Cache-Control: max-age=31536000, immutable (use "
+                          "fingerprinted filenames) so repeat visits render instantly."))
+    return findings
+
+
+_ANALYTICS_SIGNS = [
+    ("GA4 (gtag.js)", r"googletagmanager\.com/gtag/js|gtag\("),
+    ("Google Tag Manager", r"googletagmanager\.com/gtm\.js|GTM-[A-Z0-9]{4,}"),
+    ("Universal Analytics (deprecated)", r"google-analytics\.com/analytics\.js|['\"]UA-\d{4,}-\d"),
+    ("Plausible", r"plausible\.io/js"),
+    ("Fathom", r"usefathom\.com"),
+    ("Matomo", r"matomo\.js|matomo\.php|piwik\.js"),
+    ("Microsoft Clarity", r"clarity\.ms"),
+    ("Hotjar", r"static\.hotjar\.com"),
+    ("Meta Pixel", r"connect\.facebook\.net/[^\"']*fbevents"),
+]
+
+
+def detect_analytics(home_page):
+    """Which measurement stack is installed? Not scored (INFO) — but an audit that
+    doesn't mention a missing analytics setup isn't finished."""
+    r = home_page.get("response")
+    if not r:
+        return [], ("Analytics", "not checked")
+    txt = r.text[:400_000]
+    hits = [name for name, rx in _ANALYTICS_SIGNS if re.search(rx, txt)]
+    findings = []
+    ua_only = any(h.startswith("Universal") for h in hits) and not any(
+        h.startswith(("GA4", "Google Tag Manager", "Plausible", "Fathom", "Matomo",
+                      "Microsoft", "Hotjar")) for h in hits)
+    if not hits:
+        findings.append(f("INFO", "No analytics detected", "on page", 1, 1,
+                          "No GA4/GTM/Plausible/Matomo/Clarity/Hotjar snippet in the homepage HTML",
+                          "Install analytics (GA4 or a privacy-friendly alternative) and verify the site "
+                          "in Google Search Console — you can't improve what you don't measure."))
+    elif ua_only:
+        findings.append(f("LOW", "Only deprecated Universal Analytics found", "on page", 2, 1,
+                          "; ".join(hits),
+                          "Universal Analytics stopped processing data in July 2023 — migrate to GA4."))
+    return findings, ("Analytics", ", ".join(hits) or "none detected")
+
+
+# =================================================================================
 # Social preview
 # =================================================================================
 def analyze_social(home_page):
@@ -1218,6 +1717,15 @@ def analyze_social(home_page):
     if not p.og("og:title"):
         out["findings"].append(f("LOW", "Missing Open Graph title", "social", 2, 1, "og:title missing",
                                  "Add og:title for control over how shared links read."))
+    elif og_image:
+        # they've adopted OG — check the set is complete
+        missing_og = [t for t in ("og:description", "og:url", "og:type", "og:site_name")
+                      if not p.og(t)]
+        if missing_og:
+            out["findings"].append(f("LOW", "Open Graph tags incomplete", "social", 2, 1,
+                                     "missing " + ", ".join(missing_og),
+                                     "Add the missing OG tags so shared links render consistently on "
+                                     "every platform (and messaging apps)."))
 
     # favicon
     fav_href = p.favicon_href or "/favicon.ico"
@@ -1248,7 +1756,9 @@ def pagespeed(url, enabled):
     if not enabled:
         return {"status": "skipped", "findings": []}
     api = ("https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
-           "?strategy=mobile&category=performance&url=" + urllib.parse.quote(url, safe=""))
+           "?strategy=mobile&category=performance&category=seo"
+           "&category=accessibility&category=best-practices"
+           "&url=" + urllib.parse.quote(url, safe=""))
     key = os.environ.get("PAGESPEED_API_KEY")
     if key:
         api += "&key=" + urllib.parse.quote(key)
@@ -1277,7 +1787,51 @@ def pagespeed(url, enabled):
             "FCP": audits.get("first-contentful-paint", {}).get("displayValue", "—"),
             "Speed Index": audits.get("speed-index", {}).get("displayValue", "—"),
         }
+        # Lighthouse also grades SEO, accessibility, and best practices when asked —
+        # free second opinions from a real rendering browser (it executes JS, we don't).
+        for ckey, label in (("seo", "Lighthouse SEO"), ("accessibility", "Accessibility"),
+                            ("best-practices", "Best practices")):
+            c = lh["categories"].get(ckey)
+            if c and c.get("score") is not None:
+                metrics[label] = f"{round(c['score'] * 100)}/100"
         findings = []
+
+        # Curated Lighthouse audit failures we can't measure without a browser —
+        # mobile legibility/tap targets and crawlability of JS-driven links.
+        LH_CHECKS = [
+            ("font-size", "MEDIUM", "Text too small to read on mobile", "mobile", 3, 2,
+             "Use a base font size of ≥16px so mobile users don't have to zoom."),
+            ("tap-targets", "MEDIUM", "Tap targets too small or too close together", "mobile", 3, 2,
+             "Make buttons and links at least 48x48px with spacing so they're easily tappable."),
+            ("crawlable-anchors", "LOW", "Links not crawlable (no proper href)", "crawlability", 2, 2,
+             'Use <a href="…"> for navigation instead of JavaScript click handlers so crawlers '
+             "can follow the links."),
+            ("canonical", "MEDIUM", "Invalid rel=canonical (Lighthouse)", "crawlability", 3, 1,
+             "Fix the canonical URL Lighthouse flagged as invalid."),
+            ("hreflang", "LOW", "Invalid hreflang (Lighthouse)", "crawlability", 2, 1,
+             "Fix the hreflang values/links Lighthouse flagged as invalid."),
+        ]
+        for aid, sev, title, cat, imp, eff, fix in LH_CHECKS:
+            a = audits.get(aid)
+            if a and a.get("score") == 0:
+                findings.append(f(sev, title, cat, imp, eff,
+                                  a.get("displayValue") or "failed Lighthouse audit "
+                                  + repr(aid), fix))
+
+        # Top load-time opportunities, as INFO: the perf score already caps the category,
+        # so these add the "what to actually do" without double-counting.
+        opps = []
+        for a in audits.values():
+            det = a.get("details") or {}
+            if isinstance(det, dict) and det.get("type") == "opportunity":
+                ms = det.get("overallSavingsMs") or 0
+                if ms >= 300 and (a.get("score") is None or a.get("score") < 0.9):
+                    opps.append((ms, a.get("title", "opportunity")))
+        for ms, title in sorted(opps, reverse=True)[:3]:
+            findings.append(f("INFO", f"Speed opportunity: {title}", "performance", 3, 3,
+                              f"~{ms / 1000:.1f} s potential saving (Lighthouse estimate)",
+                              "This is one of the levers behind the performance score above — details "
+                              "in PageSpeed Insights."))
 
         # Real-user field data (CrUX) — this is what Google actually uses to assess
         # page experience, measured at the 75th percentile. Present only for sites with
@@ -1374,7 +1928,19 @@ def run_audit(start_url, max_pages=5, use_pagespeed=False):
     robots_resp = fetch(normalize(base, "/robots.txt"))
     robots_found = robots_resp.status == 200 and robots_resp.body
     robots_info = parse_robots(robots_resp.text) if robots_found else {"sitemaps": [], "ai_blocked": [], "blocks_all": False}
-    sitemap_found = bool(robots_info["sitemaps"]) or fetch(normalize(base, "/sitemap.xml")).status == 200
+
+    sm_urls = []
+    for sm in robots_info["sitemaps"]:
+        sm_urls.extend(collect_sitemap_urls(sm))
+    sitemap_exists = bool(robots_info["sitemaps"])
+    if not sm_urls:
+        default_sm = normalize(base, "/sitemap.xml")
+        r_sm = fetch(default_sm, max_bytes=200_000)
+        head = r_sm.body[:4096].lower()
+        if r_sm.status == 200 and (b"<urlset" in head or b"<sitemapindex" in head):
+            sitemap_exists = True
+            sm_urls = collect_sitemap_urls(default_sm)
+    sitemap_found = sitemap_exists and bool(sm_urls)
 
     # llms.txt — an emerging convention for giving AI crawlers a curated content index.
     # We report it, but only as INFO: large-scale studies have found no measurable link
@@ -1383,23 +1949,35 @@ def run_audit(start_url, max_pages=5, use_pagespeed=False):
     llms_found = (llms_resp.status == 200 and bool(llms_resp.body)
                   and b"<html" not in llms_resp.body[:2000].lower())
 
-    pages_urls = discover_pages(base, max_pages, robots_info)
+    page_specs = discover_pages(base, max_pages, sm_urls)
+    pages_urls = [u for u, _ in page_specs]
 
     site_findings = []
     if not robots_found:
         site_findings.append(f("MEDIUM", "robots.txt not found", "crawlability", 3, 1, "/robots.txt missing",
                                "Add a robots.txt that allows crawling and points to your sitemap."))
-    if not sitemap_found:
+    elif sitemap_exists and not robots_info["sitemaps"]:
+        site_findings.append(f("LOW", "Sitemap not referenced in robots.txt", "crawlability", 2, 1,
+                               "robots.txt exists but has no Sitemap: line",
+                               "Add 'Sitemap: <absolute sitemap URL>' to robots.txt so every crawler "
+                               "finds it without guessing."))
+    if not sitemap_exists:
         site_findings.append(f("MEDIUM", "XML sitemap not found", "crawlability", 3, 2, "no sitemap.xml",
                                "Publish an XML sitemap and reference it from robots.txt."))
+    elif not sm_urls:
+        site_findings.append(f("MEDIUM", "Sitemap contains no URLs", "crawlability", 3, 2,
+                               "A sitemap exists but no <loc> entries could be read from it",
+                               "Fix or regenerate the sitemap — an empty one gives crawlers nothing."))
     if robots_info.get("blocks_all"):
         site_findings.append(f("CRITICAL", "robots.txt blocks all crawlers", "crawlability", 5, 1,
                                "User-agent: * Disallow: /",
                                "Remove the site-wide Disallow so search engines can index the site."))
-    for agent in robots_info.get("ai_blocked", []):
-        site_findings.append(f("LOW", f"robots.txt blocks {agent}", "ai search", 2, 1,
-                               f"{agent} disallowed",
-                               f"Allow {agent} if you want this content cited in AI answers."))
+    if robots_info.get("ai_blocked"):
+        agents = sorted(set(robots_info["ai_blocked"]))
+        site_findings.append(f("LOW", "robots.txt blocks AI crawlers", "ai search", 2, 1,
+                               ", ".join(agents) + " disallowed",
+                               "Allow these crawlers if you want this content cited in AI answers "
+                               "(ChatGPT, Claude, Perplexity…); keep the block only if it's deliberate policy."))
     if not llms_found:
         site_findings.append(f("INFO", "No llms.txt file", "ai search", 1, 1, "/llms.txt not found",
                                "Optional/emerging: an llms.txt at the site root offers AI crawlers a curated "
@@ -1412,6 +1990,16 @@ def run_audit(start_url, max_pages=5, use_pagespeed=False):
     workers = min(8, max(1, len(pages_urls)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         pages = [pg for pg, _ in ex.map(analyze_page, pages_urls)]
+    for pg, (_, src) in zip(pages, page_specs):
+        pg["source"] = src
+
+    # Sitemap hygiene: the sitemap should list final URLs, not redirects.
+    sm_redirects = [p["url"] for p in pages if p.get("source") == "sitemap" and p.get("chain_hops")]
+    if len(sm_redirects) >= 2:
+        site_findings.append(f("LOW", f"Sitemap lists redirecting URLs ({len(sm_redirects)})",
+                               "crawlability", 2, 1, trunc("; ".join(sm_redirects[:4]), 200),
+                               "Regenerate the sitemap with final canonical URLs — redirecting entries "
+                               "waste crawl budget."))
 
     descriptions = {}
     titles = {}
@@ -1449,6 +2037,46 @@ def run_audit(start_url, max_pages=5, use_pagespeed=False):
                 "Add Organization (with logo and sameAs links to your social/profile URLs) and WebSite "
                 "JSON-LD so search and AI engines can identify and trust the entity behind the site."))
 
+    # Breadcrumb schema: with several pages crawled and none declaring breadcrumbs,
+    # SERPs show raw URLs instead of the site hierarchy. Skipped when nothing is
+    # server-rendered — the client-render CRITICAL already covers that root cause.
+    any_rendered = any(p.get("word_count", 0) > 0 for p in pages)
+    if (any_rendered and len(pages) >= 3
+            and not any("BreadcrumbList" in (p.get("schema_types") or []) for p in pages)):
+        site_findings.append(f("LOW", "No BreadcrumbList schema on any crawled page", "schema", 2, 2,
+                               f"0 of {len(pages)} pages declare breadcrumb structured data",
+                               "Add BreadcrumbList JSON-LD (and visible breadcrumbs) so search results "
+                               "show your site hierarchy instead of a raw URL."))
+
+    # ---- site-wide checks: host variants, 404 handling, TLS, trust pages,
+    # broken links, asset caching, analytics ----
+    health = []
+    hv_f, hv_h = check_host_variants(base, pages[0]["final_url"] if pages else base)
+    site_findings.extend(hv_f)
+    health.extend(hv_h)
+    n4_f, n4_h = check_custom_404(base)
+    site_findings.extend(n4_f)
+    health.append(n4_h)
+    tls_f, tls_h = tls_certificate(parsed.hostname or domain)
+    site_findings.extend(tls_f)
+    health.append(tls_h)
+    tr_f, tr_h, tr_sig = check_trust_pages(pages)
+    site_findings.extend(tr_f)
+    health.append(tr_h)
+    crawled = {p["url"] for p in pages} | {p["final_url"] for p in pages if p.get("final_url")}
+    bl_f, bl_h = check_broken_links(pages, crawled)
+    site_findings.extend(bl_f)
+    health.append(bl_h)
+    if pages:
+        site_findings.extend(check_asset_caching(pages[0]))
+        an_f, an_h = detect_analytics(pages[0])
+        site_findings.extend(an_f)
+        health.append(an_h)
+    health.append(("llms.txt", "found" if llms_found else "not found (optional)"))
+    health.append(("AI crawler access",
+                   ("blocked: " + ", ".join(sorted(set(robots_info["ai_blocked"]))))
+                   if robots_info.get("ai_blocked") else "no AI crawlers blocked in robots.txt"))
+
     # PageSpeed on the homepage
     psi = pagespeed(pages[0]["final_url"] if pages else base, use_pagespeed)
 
@@ -1457,6 +2085,30 @@ def run_audit(start_url, max_pages=5, use_pagespeed=False):
     # keyword focus + footprint — must run while page parsers are still attached
     keywords = extract_keywords(pages)
     footprint = extract_footprint(pages)
+
+    # Local-business schema: if the site shows local signals (phone links, Google
+    # Maps/Business Profile links) it should declare LocalBusiness — and if it does,
+    # the record should be complete enough to feed the map pack and AI answers.
+    local = (footprint.get("google") or {}).get("local")
+    has_local_signals = (tr_sig.get("has_tel")
+                         or (footprint.get("google") or {}).get("gbp_links")
+                         or (footprint.get("google") or {}).get("maps_links"))
+    if local:
+        missing_local = [lbl for k, lbl in (("telephone", "telephone"), ("address", "address"),
+                                            ("geo", "geo coordinates"), ("hours", "opening hours"))
+                         if not local.get(k)]
+        if missing_local:
+            site_findings.append(f("LOW", "LocalBusiness schema incomplete", "schema", 2, 1,
+                                   "missing: " + ", ".join(missing_local),
+                                   "Fill in telephone, full address, geo, and openingHours in the "
+                                   "LocalBusiness JSON-LD — complete data feeds the map pack and AI answers."))
+    elif has_local_signals:
+        site_findings.append(f("MEDIUM", "No LocalBusiness schema for a local business", "schema", 3, 2,
+                               "Site shows local signals (phone / Google Maps links) but no "
+                               "LocalBusiness JSON-LD",
+                               "Add LocalBusiness (or a specific subtype like TouristAttraction or "
+                               "Restaurant) with name, address, telephone, geo, openingHours, and sameAs — "
+                               "the backbone of local SEO."))
 
     # gather every finding for scoring
     all_findings = (list(site_findings) + list(social["findings"])
@@ -1485,6 +2137,7 @@ def run_audit(start_url, max_pages=5, use_pagespeed=False):
         "scores": scores,
         "robots_found": bool(robots_found),
         "sitemap_found": bool(sitemap_found),
+        "health": health,
         "psi": psi,
         "social": social,
         "keywords": keywords,
