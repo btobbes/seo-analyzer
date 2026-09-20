@@ -43,6 +43,10 @@ and visibility to AI answer engines (server-rendered content, schema, AI-crawler
 
    Useful flags:
    - `--max-pages N` — how many pages to crawl (default 5; homepage is always first).
+   - `--include-pages URL,URL` — force-include specific URLs or paths (repeatable).
+     Use this when the operator named templates that sitemap order would skip
+     (e.g. `/apply`, a winner page, a market hub). `--max-pages` is raised
+     automatically so the seed set plus the homepage always fits.
    - `--out DIR` — where to write the report (default: current dir). Default to the
      user's working directory or `~/Downloads` unless they say otherwise.
    - `--pagespeed` — also query Google PageSpeed Insights for Core Web Vitals. Pulls both
@@ -83,6 +87,12 @@ and visibility to AI answer engines (server-rendered content, schema, AI-crawler
   the operator re-allows below is read as allowed. The AI-crawler list covers 16 agents
   (GPTBot, OAI-SearchBot, ClaudeBot, Claude-Web, PerplexityBot, Google-Extended,
   Applebot-Extended, Amazonbot, meta-externalagent, Bytespider, CCBot, …).
+  **HTTP access is probed separately.** A robots Allow is not treated as proof a
+  crawler can read the site. The auditor fetches the homepage as a sample of
+  named AI UAs (GPTBot, ClaudeBot, PerplexityBot, OAI-SearchBot, CCBot,
+  Bytespider, Amazonbot, Google-Extended). A 403/4xx/5xx from the edge is a
+  HIGH "AI crawlers blocked at the HTTP edge" finding. Never report AI
+  visibility from robots.txt alone.
 - **PageSpeed runs all four Lighthouse categories** when `--pagespeed` is set: the report
   shows Lighthouse SEO/Accessibility/Best-practices scores, mobile-only checks we can't do
   without a browser (font size, tap targets, crawlable anchors) become findings, and the

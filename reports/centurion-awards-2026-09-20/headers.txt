@@ -1,0 +1,58 @@
+=== home ===
+HTTP/2 200 
+date: Sun, 20 Sep 2026 20:22:32 GMT
+content-type: text/html
+cf-cache-status: HIT
+cache-control: public, max-age=0, must-revalidate
+etag: "aca7e4d41211d1b53a91bc778b5984c3"
+strict-transport-security: max-age=31536000
+content-security-policy: default-src 'self'; script-src 'self' 'unsafe-inline' https://www.googletagmanager.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https:; connect-src 'self' https://www.googletagmanager.com https://www.google-analytics.com https://*.google-analytics.com https://*.analytics.google.com; frame-ancestors 'self'; base-uri 'self'; form-action 'self'; object-src 'none'
+permissions-policy: camera=(), microphone=(), geolocation=()
+referrer-policy: strict-origin-when-cross-origin
+x-content-type-options: nosniff
+x-frame-options: SAMEORIGIN
+x-robots-tag: noindex
+report-to: {"group":"cf-nel","max_age":604800,"endpoints":[{"url":"https://a.nel.cloudflare.com/report/v4?s=l9niHWv0kPw8JDGanQ9kXyksVY2i6alxmWUQEbxjcbxgl%2BTmspKzGIVmJNYciGIq1XancqKkWL806LLYwFCQ%2BaJD0vekp1XemlsOlEuBw29OMt2QKLzbRllJl4Nc5J8%2Bi8aJL9Vo"}]}
+nel: {"report_to":"cf-nel","success_fraction":0.0,"max_age":604800}
+server: cloudflare
+cf-ray: a3e38af45e306019-CMH
+alt-svc: h3=":443"; ma=86400
+
+=== sitemap ===
+HTTP/2 200 
+date: Sun, 20 Sep 2026 20:22:33 GMT
+content-type: application/xml; charset=utf-8
+cache-control: public, max-age=3600
+strict-transport-security: max-age=31536000
+content-security-policy: default-src 'self'; script-src 'self' 'unsafe-inline' https://www.googletagmanager.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https:; connect-src 'self' https://www.googletagmanager.com https://www.google-analytics.com https://*.google-analytics.com https://*.analytics.google.com; frame-ancestors 'self'; base-uri 'self'; form-action 'self'; object-src 'none'
+permissions-policy: camera=(), microphone=(), geolocation=()
+referrer-policy: strict-origin-when-cross-origin
+x-content-type-options: nosniff
+x-frame-options: SAMEORIGIN
+x-robots-tag: noindex
+report-to: {"group":"cf-nel","max_age":604800,"endpoints":[{"url":"https://a.nel.cloudflare.com/report/v4?s=7XlFJL7%2F%2B0Mp5gdJGYdyuBI2IQm8acDDMEGP560CUP0%2BSDn8V7pQNoDeKmoweSQMonkvf1HXo0oy0PjRP7ukXT%2FpUbuIMNDHipNJIlyysMumK%2BV4tBWtW53E0XZ7jwETu4JJAePQ"}]}
+nel: {"report_to":"cf-nel","success_fraction":0.0,"max_age":604800}
+server: cloudflare
+cf-ray: a3e38af67b595751-CMH
+alt-svc: h3=":443"; ma=86400
+
+=== robots ===
+HTTP/2 200 
+date: Sun, 20 Sep 2026 20:22:33 GMT
+content-type: text/plain
+cf-cache-status: HIT
+cache-control: public, max-age=0, must-revalidate
+etag: "495037545ab46a1ce967f92b7abc3c70"
+strict-transport-security: max-age=31536000
+content-security-policy: default-src 'self'; script-src 'self' 'unsafe-inline' https://www.googletagmanager.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https:; connect-src 'self' https://www.googletagmanager.com https://www.google-analytics.com https://*.google-analytics.com https://*.analytics.google.com; frame-ancestors 'self'; base-uri 'self'; form-action 'self'; object-src 'none'
+permissions-policy: camera=(), microphone=(), geolocation=()
+referrer-policy: strict-origin-when-cross-origin
+x-content-type-options: nosniff
+x-frame-options: SAMEORIGIN
+x-robots-tag: noindex
+report-to: {"group":"cf-nel","max_age":604800,"endpoints":[{"url":"https://a.nel.cloudflare.com/report/v4?s=FNERsUIZ9XZrduRonFUw%2Fv5cQt5p8bz7Q7MR%2B565fSi2AYzXSkrglccQ9m6d3iPuiQrk74Zi9E5jjLSDfAJj%2BGyRtgFW9u5IWIfID5fuN38WxYdiJCMNDDCYk1ehccTwHTVEk38i"}]}
+nel: {"report_to":"cf-nel","success_fraction":0.0,"max_age":604800}
+server: cloudflare
+cf-ray: a3e38af8a8d570f3-CMH
+alt-svc: h3=":443"; ma=86400
+

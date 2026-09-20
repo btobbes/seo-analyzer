@@ -1,0 +1,1201 @@
+{
+  "url": "https://centurionawards.com/",
+  "domain": "centurionawards.com",
+  "generated": "2026-09-20 20:22:44.418730",
+  "page_count": 14,
+  "confidence": "medium",
+  "overall": 79,
+  "scores": {
+    "crawlability": 30,
+    "on page": 74,
+    "performance": 96,
+    "schema": 92,
+    "trust": 100,
+    "social": 100,
+    "mobile": 100,
+    "ai search": 80
+  },
+  "robots_found": true,
+  "sitemap_found": true,
+  "health": [
+    [
+      "http://centurionawards.com/",
+      "\u2192 https://centurionawards.com (HTTP 200)"
+    ],
+    [
+      "https://www.centurionawards.com/",
+      "\u2192 https://centurionawards.com (HTTP 200)"
+    ],
+    [
+      "http://www.centurionawards.com/",
+      "\u2192 https://centurionawards.com (HTTP 200)"
+    ],
+    [
+      "404 handling",
+      "correct (HTTP 404)"
+    ],
+    [
+      "TLS certificate",
+      "valid \u00b7 53 days left \u00b7 Google Trust Services"
+    ],
+    [
+      "Contact & trust pages",
+      "tel:, mailto: \u00b7 about \u2713 privacy \u2713 terms \u2713"
+    ],
+    [
+      "Internal links checked",
+      "30 sampled \u00b7 0 broken \u00b7 1 redirecting"
+    ],
+    [
+      "Analytics",
+      "GA4 (gtag.js)"
+    ],
+    [
+      "llms.txt",
+      "found"
+    ],
+    [
+      "AI crawler access",
+      "HTTP blocked: GPTBot HTTP 403, ClaudeBot HTTP 403, CCBot HTTP 403, Bytespider HTTP 403, Amazonbot HTTP 403; HTTP 200: PerplexityBot, OAI-SearchBot, Google-Extended. robots.txt Allow is not access."
+    ]
+  ],
+  "psi": {
+    "status": "rate-limited",
+    "findings": [
+      {
+        "severity": "INFO",
+        "title": "PageSpeed Insights rate-limited",
+        "category": "performance",
+        "impact": 1,
+        "effort": 1,
+        "observed": "PSI 429",
+        "fix": "Get a free key at developers.google.com/speed and set PAGESPEED_API_KEY to avoid limits."
+      }
+    ]
+  },
+  "social": {
+    "metrics": [
+      [
+        "Image dimensions",
+        "1200x630"
+      ],
+      [
+        "Image size",
+        "225 KB"
+      ],
+      [
+        "Image type",
+        "image/png"
+      ],
+      [
+        "Title length",
+        "61 chars"
+      ],
+      [
+        "Description length",
+        "120 chars"
+      ],
+      [
+        "twitter:card",
+        "summary_large_image"
+      ],
+      [
+        "Favicon dimensions",
+        "180x180"
+      ],
+      [
+        "Favicon size",
+        "21.75 KB"
+      ],
+      [
+        "Favicon type",
+        "image/png"
+      ]
+    ],
+    "findings": []
+  },
+  "keywords": {
+    "available": true,
+    "terms": [
+      {
+        "term": "centurion",
+        "score": 231,
+        "prominence": 100,
+        "body_count": 96,
+        "zones": [
+          "title",
+          "h1",
+          "heading",
+          "meta",
+          "url",
+          "schema",
+          "body"
+        ],
+        "n": 1
+      },
+      {
+        "term": "award",
+        "score": 172,
+        "prominence": 74,
+        "body_count": 157,
+        "zones": [
+          "title",
+          "h1",
+          "heading",
+          "meta",
+          "schema",
+          "body"
+        ],
+        "n": 1
+      },
+      {
+        "term": "awards",
+        "score": 166,
+        "prominence": 72,
+        "body_count": 85,
+        "zones": [
+          "title",
+          "heading",
+          "meta",
+          "schema",
+          "body"
+        ],
+        "n": 1
+      },
+      {
+        "term": "business",
+        "score": 165,
+        "prominence": 71,
+        "body_count": 230,
+        "zones": [
+          "title",
+          "h1",
+          "heading",
+          "meta",
+          "url",
+          "schema",
+          "body"
+        ],
+        "n": 1
+      },
+      {
+        "term": "best",
+        "score": 132,
+        "prominence": 57,
+        "body_count": 69,
+        "zones": [
+          "title",
+          "h1",
+          "heading",
+          "meta",
+          "schema",
+          "body"
+        ],
+        "n": 1
+      },
+      {
+        "term": "centurion awards",
+        "score": 131,
+        "prominence": 57,
+        "body_count": 55,
+        "zones": [
+          "title",
+          "meta",
+          "schema",
+          "body"
+        ],
+        "n": 2
+      },
+      {
+        "term": "winner",
+        "score": 117,
+        "prominence": 51,
+        "body_count": 84,
+        "zones": [
+          "title",
+          "h1",
+          "heading",
+          "meta",
+          "schema",
+          "body"
+        ],
+        "n": 1
+      },
+      {
+        "term": "flagstaff",
+        "score": 111,
+        "prominence": 48,
+        "body_count": 53,
+        "zones": [
+          "title",
+          "h1",
+          "heading",
+          "meta",
+          "url",
+          "schema",
+          "body"
+        ],
+        "n": 1
+      },
+      {
+        "term": "published",
+        "score": 107,
+        "prominence": 46,
+        "body_count": 82,
+        "zones": [
+          "heading",
+          "meta",
+          "schema",
+          "body"
+        ],
+        "n": 1
+      },
+      {
+        "term": "verified",
+        "score": 105,
+        "prominence": 45,
+        "body_count": 48,
+        "zones": [
+          "title",
+          "h1",
+          "heading",
+          "meta",
+          "url",
+          "schema",
+          "body"
+        ],
+        "n": 1
+      },
+      {
+        "term": "record",
+        "score": 98,
+        "prominence": 42,
+        "body_count": 86,
+        "zones": [
+          "heading",
+          "meta",
+          "schema",
+          "body"
+        ],
+        "n": 1
+      },
+      {
+        "term": "criteria",
+        "score": 93,
+        "prominence": 40,
+        "body_count": 75,
+        "zones": [
+          "heading",
+          "meta",
+          "schema",
+          "body"
+        ],
+        "n": 1
+      }
+    ],
+    "primary": "centurion",
+    "insights": [
+      "Your standout keyword \u201ccenturion\u201d is well-aligned \u2014 it appears in the title, H1, and body, which is exactly what you want for your primary term.",
+      "Themes present in your content but absent from any title or H1: \u201cpublished\u201d, \u201crecord\u201d, \u201ccriteria\u201d. Work the most relevant of these into headings to rank for them.",
+      "Strongest multi-word phrases (usually higher-intent, easier to rank than single words): \u201ccenturion awards\u201d."
+    ],
+    "analyzed_pages": 14
+  },
+  "footprint": {
+    "social": [
+      {
+        "platform": "Facebook",
+        "url": "https://www.facebook.com/beaverstreetbrewery/",
+        "in_sameas": true
+      },
+      {
+        "platform": "Facebook",
+        "url": "https://www.facebook.com/freakyfoottours",
+        "in_sameas": true
+      },
+      {
+        "platform": "Facebook",
+        "url": "https://www.facebook.com/profile.php?id=61590914451901",
+        "in_sameas": true
+      },
+      {
+        "platform": "Instagram",
+        "url": "https://www.instagram.com/centurion.awards/",
+        "in_sameas": true
+      },
+      {
+        "platform": "Instagram",
+        "url": "https://www.instagram.com/freakyfoottours",
+        "in_sameas": true
+      },
+      {
+        "platform": "LinkedIn",
+        "url": "https://www.linkedin.com/in/brendanltobin/",
+        "in_sameas": true
+      },
+      {
+        "platform": "LinkedIn",
+        "url": "https://www.linkedin.com/in/eatsleeplaunchrepeat/",
+        "in_sameas": true
+      },
+      {
+        "platform": "TikTok",
+        "url": "https://www.tiktok.com/@centurion.awards",
+        "in_sameas": true
+      },
+      {
+        "platform": "TripAdvisor",
+        "url": "https://www.tripadvisor.com/Attraction_Review-g60971-d21318392-Reviews-Freaky_Foot_Tours_Flagstaff-Flagstaff_Arizona.html",
+        "in_sameas": true
+      },
+      {
+        "platform": "TripAdvisor",
+        "url": "https://www.tripadvisor.com/Attraction_Review-g60971-d3513301-Reviews-Beaver_Street_Brewery-Flagstaff_Arizona.html",
+        "in_sameas": true
+      },
+      {
+        "platform": "X / Twitter",
+        "url": "https://twitter.com/beaverbrewery",
+        "in_sameas": true
+      },
+      {
+        "platform": "X / Twitter",
+        "url": "https://x.com/CenturionAwards",
+        "in_sameas": true
+      },
+      {
+        "platform": "Yelp",
+        "url": "https://www.yelp.com/biz/beaver-street-brewery-and-whistle-stop-cafe-flagstaff-2",
+        "in_sameas": true
+      },
+      {
+        "platform": "Yelp",
+        "url": "https://www.yelp.com/biz/freaky-foot-tours-flagstaff",
+        "in_sameas": true
+      }
+    ],
+    "sameas_present": true,
+    "google": {
+      "maps_links": [
+        "https://www.google.com/maps/search/?api=1&query=Freaky+Foot+Tours+212+W+Aspen+Ave+Flagstaff+AZ+86001",
+        "https://www.google.com/maps/search/?api=1&query=Freaky+Foot+Tours+212+W+Aspen+Ave+Flagstaff+AZ+86001",
+        "https://www.google.com/maps/search/?api=1&query=Freaky+Foot+Tours+212+W+Aspen+Ave+Flagstaff+AZ+86001",
+        "https://www.google.com/maps/search/?api=1&query=Beaver%20Street%20Brewery%2011%20S%20Beaver%20St%2C%20Flagstaff%2C%20AZ%2086001"
+      ],
+      "gbp_links": [],
+      "local": {
+        "name": "Freaky Foot Tours",
+        "telephone": "+1-928-224-0518",
+        "address": "212 W Aspen Ave, Flagstaff, AZ, US",
+        "price_range": "$25+",
+        "geo": "35.1999, -111.6519"
+      }
+    },
+    "no_links": false,
+    "findings": []
+  },
+  "site_findings": [
+    {
+      "severity": "HIGH",
+      "title": "Sitemap served with X-Robots-Tag: noindex",
+      "category": "crawlability",
+      "impact": 4,
+      "effort": 1,
+      "observed": "https://centurionawards.com/sitemap.xml X-Robots-Tag: noindex",
+      "fix": "Remove noindex from the sitemap response before a Search Console upload. Google can fetch a noindexed sitemap, but every listed URL that also sends noindex will be discovered and then excluded. Flip the header on the sitemap and on the pages you want indexed in the same change."
+    },
+    {
+      "severity": "HIGH",
+      "title": "AI crawlers blocked at the HTTP edge",
+      "category": "ai search",
+      "impact": 4,
+      "effort": 2,
+      "observed": "GPTBot HTTP 403; ClaudeBot HTTP 403; CCBot HTTP 403; Bytespider HTTP 403; Amazonbot HTTP 403",
+      "fix": "robots.txt Allow is not access. An edge/WAF/bot-fight rule is refusing named AI crawlers. Lift those blocks before claiming AI visibility, and do not treat a robots Allow as proof a crawler can read the page."
+    },
+    {
+      "severity": "LOW",
+      "title": "LocalBusiness schema incomplete",
+      "category": "schema",
+      "impact": 2,
+      "effort": 1,
+      "observed": "missing: opening hours",
+      "fix": "Fill in telephone, full address, geo, and openingHours in the LocalBusiness JSON-LD \u2014 complete data feeds the map pack and AI answers."
+    }
+  ],
+  "pages": [
+    {
+      "url": "https://centurionawards.com/",
+      "status": 200,
+      "final_url": "https://centurionawards.com/",
+      "error": null,
+      "elapsed_ms": 414,
+      "title": "The Centurion Awards \u2014 Best of Your Town. Earned, Not Bought.",
+      "description": "The Centurion Awards verify local businesses against published criteria. You can\u2019t pay or vote your way in. Explore winners or nominate a business you love.",
+      "word_count": 1213,
+      "h1": [
+        "Best of your town.Earned, not bought."
+      ],
+      "canonical": "https://centurionawards.com/",
+      "lang": "en",
+      "robots": "",
+      "chain_hops": 0,
+      "client_rendered": false,
+      "internal_links": 46,
+      "schema_types": [
+        "Organization",
+        "WebSite"
+      ],
+      "findings": [
+        {
+          "severity": "HIGH",
+          "title": "Noindexed via X-Robots-Tag header",
+          "category": "crawlability",
+          "impact": 4,
+          "effort": 1,
+          "observed": "X-Robots-Tag: noindex",
+          "fix": "Remove the noindex directive from the HTTP response header if this page should appear in search results (check CDN/server config)."
+        },
+        {
+          "severity": "MEDIUM",
+          "title": "Images missing alt text",
+          "category": "on page",
+          "impact": 2,
+          "effort": 2,
+          "observed": "1/1 images without alt",
+          "fix": "Add descriptive alt text for accessibility and image search."
+        }
+      ],
+      "source": "homepage"
+    },
+    {
+      "url": "https://centurionawards.com/business",
+      "status": 200,
+      "final_url": "https://centurionawards.com/business",
+      "error": null,
+      "elapsed_ms": 45,
+      "title": "For Business Owners | The Centurion Awards",
+      "description": "A permanent, dated winner page that links to your site, a print-ready certificate, and a ready-to-post announcement kit. Evaluation is free.",
+      "word_count": 1773,
+      "h1": [
+        "The award your workalready earned."
+      ],
+      "canonical": "https://centurionawards.com/business",
+      "lang": "en",
+      "robots": "",
+      "chain_hops": 0,
+      "client_rendered": false,
+      "internal_links": 27,
+      "schema_types": [
+        "BreadcrumbList",
+        "ListItem",
+        "WebPage"
+      ],
+      "findings": [
+        {
+          "severity": "HIGH",
+          "title": "Noindexed via X-Robots-Tag header",
+          "category": "crawlability",
+          "impact": 4,
+          "effort": 1,
+          "observed": "X-Robots-Tag: noindex",
+          "fix": "Remove the noindex directive from the HTTP response header if this page should appear in search results (check CDN/server config)."
+        },
+        {
+          "severity": "LOW",
+          "title": "Meta description lacks a CTA verb",
+          "category": "on page",
+          "impact": 2,
+          "effort": 1,
+          "observed": "A permanent, dated winner page that links to your site, a print-ready certificate, and a r\u2026",
+          "fix": "Add a verb like 'Learn', 'Explore', 'Get', or 'Compare' to invite the click."
+        },
+        {
+          "severity": "LOW",
+          "title": "Heading levels skip",
+          "category": "on page",
+          "impact": 1,
+          "effort": 1,
+          "observed": "h2 followed directly by h4",
+          "fix": "Keep a sequential heading outline (H1 \u2192 H2 \u2192 H3) \u2014 a clean structure helps search engines and AI answer engines parse and cite sections."
+        }
+      ],
+      "source": "include"
+    },
+    {
+      "url": "https://centurionawards.com/apply",
+      "status": 200,
+      "final_url": "https://centurionawards.com/apply",
+      "error": null,
+      "elapsed_ms": 40,
+      "title": "Apply for Your Award | The Centurion Awards",
+      "description": "Check your eligibility for a Centurion Award in one five-minute flow. Selection is never paid. The processing fee publishes an award you already earned.",
+      "word_count": 635,
+      "h1": [
+        "Check the bar.Claim what you\u2019ve earned."
+      ],
+      "canonical": "https://centurionawards.com/apply",
+      "lang": "en",
+      "robots": "noindex",
+      "chain_hops": 0,
+      "client_rendered": false,
+      "internal_links": 10,
+      "schema_types": [],
+      "findings": [
+        {
+          "severity": "HIGH",
+          "title": "Page set to noindex",
+          "category": "crawlability",
+          "impact": 4,
+          "effort": 1,
+          "observed": "meta robots=\"noindex\"",
+          "fix": "Remove noindex if this page should appear in search results."
+        },
+        {
+          "severity": "HIGH",
+          "title": "Noindexed via X-Robots-Tag header",
+          "category": "crawlability",
+          "impact": 4,
+          "effort": 1,
+          "observed": "X-Robots-Tag: noindex",
+          "fix": "Remove the noindex directive from the HTTP response header if this page should appear in search results (check CDN/server config)."
+        },
+        {
+          "severity": "LOW",
+          "title": "Meta description lacks a CTA verb",
+          "category": "on page",
+          "impact": 2,
+          "effort": 1,
+          "observed": "Check your eligibility for a Centurion Award in one five-minute flow. Selection is never p\u2026",
+          "fix": "Add a verb like 'Learn', 'Explore', 'Get', or 'Compare' to invite the click."
+        },
+        {
+          "severity": "LOW",
+          "title": "No structured data (JSON-LD)",
+          "category": "schema",
+          "impact": 2,
+          "effort": 2,
+          "observed": "No JSON-LD found",
+          "fix": "Add schema.org JSON-LD (Organization, WebSite, BreadcrumbList, and page-appropriate types) to the server-rendered HTML."
+        },
+        {
+          "severity": "LOW",
+          "title": "Heading levels skip",
+          "category": "on page",
+          "impact": 1,
+          "effort": 1,
+          "observed": "h1 followed directly by h3",
+          "fix": "Keep a sequential heading outline (H1 \u2192 H2 \u2192 H3) \u2014 a clean structure helps search engines and AI answer engines parse and cite sections."
+        }
+      ],
+      "source": "include"
+    },
+    {
+      "url": "https://centurionawards.com/faq",
+      "status": 200,
+      "final_url": "https://centurionawards.com/faq",
+      "error": null,
+      "elapsed_ms": 35,
+      "title": "FAQ | The Centurion Awards",
+      "description": "Learn how Centurion Award selection works, what winners receive, how long awards last, and why this is never pay-to-play.",
+      "word_count": 1362,
+      "h1": [
+        "Ask us anything.Especially \u201cis this real?\u201d"
+      ],
+      "canonical": "https://centurionawards.com/faq",
+      "lang": "en",
+      "robots": "",
+      "chain_hops": 0,
+      "client_rendered": false,
+      "internal_links": 30,
+      "schema_types": [
+        "Answer",
+        "BreadcrumbList",
+        "FAQPage",
+        "ListItem",
+        "Question"
+      ],
+      "findings": [
+        {
+          "severity": "HIGH",
+          "title": "Noindexed via X-Robots-Tag header",
+          "category": "crawlability",
+          "impact": 4,
+          "effort": 1,
+          "observed": "X-Robots-Tag: noindex",
+          "fix": "Remove the noindex directive from the HTTP response header if this page should appear in search results (check CDN/server config)."
+        },
+        {
+          "severity": "LOW",
+          "title": "Heading levels skip",
+          "category": "on page",
+          "impact": 1,
+          "effort": 1,
+          "observed": "h2 followed directly by h4",
+          "fix": "Keep a sequential heading outline (H1 \u2192 H2 \u2192 H3) \u2014 a clean structure helps search engines and AI answer engines parse and cite sections."
+        }
+      ],
+      "source": "include"
+    },
+    {
+      "url": "https://centurionawards.com/winners",
+      "status": 200,
+      "final_url": "https://centurionawards.com/winners",
+      "error": null,
+      "elapsed_ms": 293,
+      "title": "Winners | The Centurion Awards",
+      "description": "Explore Centurion Award winners across America \u2014 verified best of their town, in their category, for the year. Browse by city, closest to you first.",
+      "word_count": 682,
+      "h1": [
+        "Verified bestof their town."
+      ],
+      "canonical": "https://centurionawards.com/winners",
+      "lang": "en",
+      "robots": "",
+      "chain_hops": 0,
+      "client_rendered": false,
+      "internal_links": 66,
+      "schema_types": [
+        "BreadcrumbList",
+        "CollectionPage",
+        "ItemList",
+        "ListItem"
+      ],
+      "findings": [
+        {
+          "severity": "HIGH",
+          "title": "Noindexed via X-Robots-Tag header",
+          "category": "crawlability",
+          "impact": 4,
+          "effort": 1,
+          "observed": "X-Robots-Tag: noindex",
+          "fix": "Remove the noindex directive from the HTTP response header if this page should appear in search results (check CDN/server config)."
+        },
+        {
+          "severity": "LOW",
+          "title": "Heading levels skip",
+          "category": "on page",
+          "impact": 1,
+          "effort": 1,
+          "observed": "h2 followed directly by h4",
+          "fix": "Keep a sequential heading outline (H1 \u2192 H2 \u2192 H3) \u2014 a clean structure helps search engines and AI answer engines parse and cite sections."
+        }
+      ],
+      "source": "include"
+    },
+    {
+      "url": "https://centurionawards.com/nominate",
+      "status": 200,
+      "final_url": "https://centurionawards.com/nominate",
+      "error": null,
+      "elapsed_ms": 29,
+      "title": "Nominate a Business | The Centurion Awards",
+      "description": "Love a local business? Get it the recognition it deserves. Nominating is free and takes about a minute.",
+      "word_count": 476,
+      "h1": [
+        "You already tell your friends.Tell the whole town."
+      ],
+      "canonical": "https://centurionawards.com/nominate",
+      "lang": "en",
+      "robots": "",
+      "chain_hops": 0,
+      "client_rendered": false,
+      "internal_links": 24,
+      "schema_types": [
+        "BreadcrumbList",
+        "ListItem",
+        "WebPage"
+      ],
+      "findings": [
+        {
+          "severity": "HIGH",
+          "title": "Noindexed via X-Robots-Tag header",
+          "category": "crawlability",
+          "impact": 4,
+          "effort": 1,
+          "observed": "X-Robots-Tag: noindex",
+          "fix": "Remove the noindex directive from the HTTP response header if this page should appear in search results (check CDN/server config)."
+        }
+      ],
+      "source": "include"
+    },
+    {
+      "url": "https://centurionawards.com/2025/us/az/flagstaff/tours/freaky-foot-tours",
+      "status": 200,
+      "final_url": "https://centurionawards.com/2025/us/az/flagstaff/tours/freaky-foot-tours",
+      "error": null,
+      "elapsed_ms": 516,
+      "title": "Freaky Foot Tours \u2014 Flagstaff Ghost Tours & Haunted History | 2025 Centurion Award Winner",
+      "description": "Freaky Foot Tours is Flagstaff's original ghost tour \u2014 locally owned since 2015, 1,000+ five-star reviews, and the verified 2025 Centurion Award winner for Best Walking & Ghost Tour in Flagstaff, AZ. Tours from $25 at 212 W Aspen Ave.",
+      "word_count": 1058,
+      "h1": [
+        "Freaky Foot Tours"
+      ],
+      "canonical": "https://centurionawards.com/us/az/flagstaff/tours/freaky-foot-tours",
+      "lang": "en",
+      "robots": "",
+      "chain_hops": 0,
+      "client_rendered": false,
+      "internal_links": 32,
+      "schema_types": [
+        "Answer",
+        "BreadcrumbList",
+        "FAQPage",
+        "GeoCoordinates",
+        "ListItem",
+        "LocalBusiness",
+        "Organization",
+        "Person",
+        "PostalAddress",
+        "Question",
+        "TouristAttraction",
+        "WebPage"
+      ],
+      "findings": [
+        {
+          "severity": "HIGH",
+          "title": "Noindexed via X-Robots-Tag header",
+          "category": "crawlability",
+          "impact": 4,
+          "effort": 1,
+          "observed": "X-Robots-Tag: noindex",
+          "fix": "Remove the noindex directive from the HTTP response header if this page should appear in search results (check CDN/server config)."
+        },
+        {
+          "severity": "MEDIUM",
+          "title": "Canonicalized to a different URL",
+          "category": "crawlability",
+          "impact": 3,
+          "effort": 1,
+          "observed": "/2025/us/az/flagstaff/tours/freaky-foot-tours \u2192 canonical /us/az/flagstaff/tours/freaky-foot-tours",
+          "fix": "This page tells search engines to index a different URL instead of itself. If that's not intentional, set the canonical to this page's own URL."
+        },
+        {
+          "severity": "LOW",
+          "title": "Title too long",
+          "category": "on page",
+          "impact": 2,
+          "effort": 1,
+          "observed": "89 chars",
+          "fix": "Trim to \u224860 chars so it isn't truncated in search results."
+        },
+        {
+          "severity": "LOW",
+          "title": "Meta description too long",
+          "category": "on page",
+          "impact": 2,
+          "effort": 1,
+          "observed": "234 chars",
+          "fix": "Trim to \u2248155 chars to avoid truncation."
+        },
+        {
+          "severity": "LOW",
+          "title": "Meta description lacks a CTA verb",
+          "category": "on page",
+          "impact": 2,
+          "effort": 1,
+          "observed": "Freaky Foot Tours is Flagstaff's original ghost tour \u2014 locally owned since 2015, 1,000+ fi\u2026",
+          "fix": "Add a verb like 'Learn', 'Explore', 'Get', or 'Compare' to invite the click."
+        },
+        {
+          "severity": "LOW",
+          "title": "Heading levels skip",
+          "category": "on page",
+          "impact": 1,
+          "effort": 1,
+          "observed": "h2 followed directly by h4",
+          "fix": "Keep a sequential heading outline (H1 \u2192 H2 \u2192 H3) \u2014 a clean structure helps search engines and AI answer engines parse and cite sections."
+        }
+      ],
+      "source": "include"
+    },
+    {
+      "url": "https://centurionawards.com/us/az/flagstaff/bars/beaver-street-brewery",
+      "status": 200,
+      "final_url": "https://centurionawards.com/us/az/flagstaff/bars/beaver-street-brewery",
+      "error": null,
+      "elapsed_ms": 384,
+      "title": "Beaver Street Brewery \u2014 Centurion Award Winner, Best Brewpub in Flagstaff, AZ",
+      "description": "Beaver Street Brewery of Flagstaff, AZ is a verified Centurion Award winner for Best Brewpub in Flagstaff (2025). Business overview plus the complete award record, with a dated page for every award year.",
+      "word_count": 428,
+      "h1": [
+        "Beaver Street Brewery"
+      ],
+      "canonical": "https://centurionawards.com/us/az/flagstaff/bars/beaver-street-brewery",
+      "lang": "en",
+      "robots": "",
+      "chain_hops": 0,
+      "client_rendered": false,
+      "internal_links": 30,
+      "schema_types": [
+        "BreadcrumbList",
+        "ItemList",
+        "ListItem",
+        "LocalBusiness",
+        "Organization",
+        "PostalAddress",
+        "ProfilePage"
+      ],
+      "findings": [
+        {
+          "severity": "HIGH",
+          "title": "Noindexed via X-Robots-Tag header",
+          "category": "crawlability",
+          "impact": 4,
+          "effort": 1,
+          "observed": "X-Robots-Tag: noindex",
+          "fix": "Remove the noindex directive from the HTTP response header if this page should appear in search results (check CDN/server config)."
+        },
+        {
+          "severity": "LOW",
+          "title": "Title too long",
+          "category": "on page",
+          "impact": 2,
+          "effort": 1,
+          "observed": "77 chars",
+          "fix": "Trim to \u224860 chars so it isn't truncated in search results."
+        },
+        {
+          "severity": "LOW",
+          "title": "Meta description too long",
+          "category": "on page",
+          "impact": 2,
+          "effort": 1,
+          "observed": "203 chars",
+          "fix": "Trim to \u2248155 chars to avoid truncation."
+        },
+        {
+          "severity": "LOW",
+          "title": "Meta description lacks a CTA verb",
+          "category": "on page",
+          "impact": 2,
+          "effort": 1,
+          "observed": "Beaver Street Brewery of Flagstaff, AZ is a verified Centurion Award winner for Best Brewp\u2026",
+          "fix": "Add a verb like 'Learn', 'Explore', 'Get', or 'Compare' to invite the click."
+        },
+        {
+          "severity": "LOW",
+          "title": "Heading levels skip",
+          "category": "on page",
+          "impact": 1,
+          "effort": 1,
+          "observed": "h2 followed directly by h4",
+          "fix": "Keep a sequential heading outline (H1 \u2192 H2 \u2192 H3) \u2014 a clean structure helps search engines and AI answer engines parse and cite sections."
+        }
+      ],
+      "source": "include"
+    },
+    {
+      "url": "https://centurionawards.com/2025/us/az/flagstaff/",
+      "status": 200,
+      "final_url": "https://centurionawards.com/2025/us/az/flagstaff/",
+      "error": null,
+      "elapsed_ms": 558,
+      "title": "Best of Flagstaff, Arizona \u2014 2025 Centurion Award Winners",
+      "description": "Explore the 2025 Centurion Award winners in Flagstaff, AZ \u2014 independently verified, merit-based, and never for sale. 7 verified winners across 5 categories.",
+      "word_count": 542,
+      "h1": [
+        "Best of Flagstaff."
+      ],
+      "canonical": "https://centurionawards.com/2025/us/az/flagstaff/",
+      "lang": "en",
+      "robots": "",
+      "chain_hops": 0,
+      "client_rendered": false,
+      "internal_links": 62,
+      "schema_types": [
+        "BreadcrumbList",
+        "CollectionPage",
+        "ItemList",
+        "ListItem",
+        "Organization"
+      ],
+      "findings": [
+        {
+          "severity": "HIGH",
+          "title": "Noindexed via X-Robots-Tag header",
+          "category": "crawlability",
+          "impact": 4,
+          "effort": 1,
+          "observed": "X-Robots-Tag: noindex",
+          "fix": "Remove the noindex directive from the HTTP response header if this page should appear in search results (check CDN/server config)."
+        },
+        {
+          "severity": "LOW",
+          "title": "No modern image formats detected",
+          "category": "performance",
+          "impact": 2,
+          "effort": 2,
+          "observed": "5 JPEG/PNG <img> sources, no WebP/AVIF (srcset/CDN content negotiation not counted)",
+          "fix": "Serve WebP or AVIF via <picture>, srcset, or a CDN that auto-negotiates \u2014 typically 30\u201360% smaller than JPEG/PNG at the same quality."
+        },
+        {
+          "severity": "LOW",
+          "title": "Heading levels skip",
+          "category": "on page",
+          "impact": 1,
+          "effort": 1,
+          "observed": "h2 followed directly by h4",
+          "fix": "Keep a sequential heading outline (H1 \u2192 H2 \u2192 H3) \u2014 a clean structure helps search engines and AI answer engines parse and cite sections."
+        }
+      ],
+      "source": "include"
+    },
+    {
+      "url": "https://centurionawards.com/blog/",
+      "status": 200,
+      "final_url": "https://centurionawards.com/blog/",
+      "error": null,
+      "elapsed_ms": 133,
+      "title": "The Centurion Journal \u2014 Local Business, Done Right",
+      "description": "Get practical guides on local SEO, reviews, and websites for owners \u2014 plus honest writing about the businesses that make your city worth living in.",
+      "word_count": 380,
+      "h1": [
+        "Local business, done right."
+      ],
+      "canonical": "https://centurionawards.com/blog/",
+      "lang": "en",
+      "robots": "",
+      "chain_hops": 0,
+      "client_rendered": false,
+      "internal_links": 30,
+      "schema_types": [
+        "Blog",
+        "BreadcrumbList",
+        "CollectionPage",
+        "ImageObject",
+        "ItemList",
+        "ListItem",
+        "Organization"
+      ],
+      "findings": [
+        {
+          "severity": "HIGH",
+          "title": "Noindexed via X-Robots-Tag header",
+          "category": "crawlability",
+          "impact": 4,
+          "effort": 1,
+          "observed": "X-Robots-Tag: noindex",
+          "fix": "Remove the noindex directive from the HTTP response header if this page should appear in search results (check CDN/server config)."
+        },
+        {
+          "severity": "LOW",
+          "title": "Heading levels skip",
+          "category": "on page",
+          "impact": 1,
+          "effort": 1,
+          "observed": "h2 followed directly by h4",
+          "fix": "Keep a sequential heading outline (H1 \u2192 H2 \u2192 H3) \u2014 a clean structure helps search engines and AI answer engines parse and cite sections."
+        }
+      ],
+      "source": "include"
+    },
+    {
+      "url": "https://centurionawards.com/blog/how-centurion-winners-are-verified",
+      "status": 200,
+      "final_url": "https://centurionawards.com/blog/how-centurion-winners-are-verified",
+      "error": null,
+      "elapsed_ms": 364,
+      "title": "How a Centurion winner is verified, in plain English",
+      "description": "See what happens between a nomination and a published award: five criteria, the public evidence behind each, and why only winners are ever published.",
+      "word_count": 1076,
+      "h1": [
+        "How a Centurion winner is verified, in plain English"
+      ],
+      "canonical": "https://centurionawards.com/blog/how-centurion-winners-are-verified",
+      "lang": "en",
+      "robots": "",
+      "chain_hops": 0,
+      "client_rendered": false,
+      "internal_links": 32,
+      "schema_types": [
+        "Answer",
+        "BlogPosting",
+        "BreadcrumbList",
+        "FAQPage",
+        "ImageObject",
+        "ListItem",
+        "Organization",
+        "Person",
+        "Question",
+        "WebPage"
+      ],
+      "findings": [
+        {
+          "severity": "HIGH",
+          "title": "Noindexed via X-Robots-Tag header",
+          "category": "crawlability",
+          "impact": 4,
+          "effort": 1,
+          "observed": "X-Robots-Tag: noindex",
+          "fix": "Remove the noindex directive from the HTTP response header if this page should appear in search results (check CDN/server config)."
+        },
+        {
+          "severity": "LOW",
+          "title": "Heading levels skip",
+          "category": "on page",
+          "impact": 1,
+          "effort": 1,
+          "observed": "h2 followed directly by h4",
+          "fix": "Keep a sequential heading outline (H1 \u2192 H2 \u2192 H3) \u2014 a clean structure helps search engines and AI answer engines parse and cite sections."
+        }
+      ],
+      "source": "include"
+    },
+    {
+      "url": "https://centurionawards.com/about",
+      "status": 200,
+      "final_url": "https://centurionawards.com/about",
+      "error": null,
+      "elapsed_ms": 25,
+      "title": "About Us \u2014 The Two People Behind the Awards | The Centurion Awards",
+      "description": "The two people behind the Centurion Awards: a Flagstaff tour operator who built a 4.9-rated local business, and a fraud engineer who tells real from fake for a living.",
+      "word_count": 1641,
+      "h1": [
+        "Who standsbehind the seal."
+      ],
+      "canonical": "https://centurionawards.com/about",
+      "lang": "en",
+      "robots": "",
+      "chain_hops": 0,
+      "client_rendered": false,
+      "internal_links": 29,
+      "schema_types": [
+        "AboutPage",
+        "BreadcrumbList",
+        "ListItem",
+        "Organization",
+        "Person"
+      ],
+      "findings": [
+        {
+          "severity": "HIGH",
+          "title": "Noindexed via X-Robots-Tag header",
+          "category": "crawlability",
+          "impact": 4,
+          "effort": 1,
+          "observed": "X-Robots-Tag: noindex",
+          "fix": "Remove the noindex directive from the HTTP response header if this page should appear in search results (check CDN/server config)."
+        },
+        {
+          "severity": "LOW",
+          "title": "Title too long",
+          "category": "on page",
+          "impact": 2,
+          "effort": 1,
+          "observed": "66 chars",
+          "fix": "Trim to \u224860 chars so it isn't truncated in search results."
+        },
+        {
+          "severity": "LOW",
+          "title": "Meta description lacks a CTA verb",
+          "category": "on page",
+          "impact": 2,
+          "effort": 1,
+          "observed": "The two people behind the Centurion Awards: a Flagstaff tour operator who built a 4.9-rate\u2026",
+          "fix": "Add a verb like 'Learn', 'Explore', 'Get', or 'Compare' to invite the click."
+        },
+        {
+          "severity": "LOW",
+          "title": "Heading levels skip",
+          "category": "on page",
+          "impact": 1,
+          "effort": 1,
+          "observed": "h2 followed directly by h4",
+          "fix": "Keep a sequential heading outline (H1 \u2192 H2 \u2192 H3) \u2014 a clean structure helps search engines and AI answer engines parse and cite sections."
+        }
+      ],
+      "source": "include"
+    },
+    {
+      "url": "https://centurionawards.com/methodology",
+      "status": 200,
+      "final_url": "https://centurionawards.com/methodology",
+      "error": null,
+      "elapsed_ms": 34,
+      "title": "Methodology \u2014 How Winners Are Selected | The Centurion Awards",
+      "description": "How Centurion winners are selected: published criteria, evaluated on public data, no panels, no votes, no paid placements. Read what we look for.",
+      "word_count": 1045,
+      "h1": [
+        "Read the barbefore you trust it."
+      ],
+      "canonical": "https://centurionawards.com/methodology",
+      "lang": "en",
+      "robots": "",
+      "chain_hops": 0,
+      "client_rendered": false,
+      "internal_links": 27,
+      "schema_types": [
+        "BreadcrumbList",
+        "ListItem",
+        "WebPage"
+      ],
+      "findings": [
+        {
+          "severity": "HIGH",
+          "title": "Noindexed via X-Robots-Tag header",
+          "category": "crawlability",
+          "impact": 4,
+          "effort": 1,
+          "observed": "X-Robots-Tag: noindex",
+          "fix": "Remove the noindex directive from the HTTP response header if this page should appear in search results (check CDN/server config)."
+        },
+        {
+          "severity": "LOW",
+          "title": "Heading levels skip",
+          "category": "on page",
+          "impact": 1,
+          "effort": 1,
+          "observed": "h2 followed directly by h4",
+          "fix": "Keep a sequential heading outline (H1 \u2192 H2 \u2192 H3) \u2014 a clean structure helps search engines and AI answer engines parse and cite sections."
+        }
+      ],
+      "source": "include"
+    },
+    {
+      "url": "https://centurionawards.com/terms",
+      "status": 200,
+      "final_url": "https://centurionawards.com/terms",
+      "error": null,
+      "elapsed_ms": 48,
+      "title": "Terms of Service | The Centurion Awards",
+      "description": "Read the Terms of Service for The Centurion Awards website, evaluations, awards program, and winner portal.",
+      "word_count": 3446,
+      "h1": [
+        "Terms of Service"
+      ],
+      "canonical": "https://centurionawards.com/terms",
+      "lang": "en",
+      "robots": "",
+      "chain_hops": 0,
+      "client_rendered": false,
+      "internal_links": 25,
+      "schema_types": [
+        "BreadcrumbList",
+        "ListItem",
+        "WebPage"
+      ],
+      "findings": [
+        {
+          "severity": "HIGH",
+          "title": "Noindexed via X-Robots-Tag header",
+          "category": "crawlability",
+          "impact": 4,
+          "effort": 1,
+          "observed": "X-Robots-Tag: noindex",
+          "fix": "Remove the noindex directive from the HTTP response header if this page should appear in search results (check CDN/server config)."
+        },
+        {
+          "severity": "LOW",
+          "title": "Heading levels skip",
+          "category": "on page",
+          "impact": 1,
+          "effort": 1,
+          "observed": "h2 followed directly by h4",
+          "fix": "Keep a sequential heading outline (H1 \u2192 H2 \u2192 H3) \u2014 a clean structure helps search engines and AI answer engines parse and cite sections."
+        }
+      ],
+      "source": "sitemap"
+    }
+  ]
+}

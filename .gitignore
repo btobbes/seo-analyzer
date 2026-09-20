@@ -5,7 +5,10 @@ __pycache__/
 # Local, machine-specific Claude Code settings (permissions allowlist)
 .claude/settings.local.json
 
-# Generated audit reports
+# Generated audit reports (root-level runs). Briefings and seeded
+# artifacts under reports/ are kept so an audit can be replayed.
 seo-report-*.html
 seo-report-*.pdf
 seo-report-*.json
+!reports/
+!reports/**

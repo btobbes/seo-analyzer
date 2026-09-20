@@ -1,0 +1,26 @@
+AI crawler HTTP probes (GET /) on 2026-09-20:
+
+200  Googlebot
+200  bingbot
+200  Google-Extended
+200  OAI-SearchBot
+200  ChatGPT-User
+200  PerplexityBot
+200  Applebot-Extended
+200  meta-externalagent
+403  GPTBot
+403  ClaudeBot
+403  CCBot
+403  Bytespider
+403  Amazonbot
+
+Googlebot and the 200 AI UAs still received X-Robots-Tag: noindex.
+GPTBot fetch of /robots.txt was HTTP 200 and returned the repo file (no extra Cloudflare prefix visible on that request). The 403 is the HTML fetch.
+
+Host variants: http://, http://www, https://www all 301 to https://centurionawards.com/.
+/contact = 404. /apply and /nominate both 200. /blog 301 to /blog/.
+/2025/us/az/flagstaff (no slash) = 200, canonical to .../flagstaff/.
+/us/az/flagstaff/bars/beaver-street-brewery/ = 200, canonical to no-slash evergreen.
+Sitemap: 480 locs, 258 lastmods, 0 dated award pages, /apply absent. 27 sampled locs = 200.
+TLS: Google Trust Services WE1, notAfter 2026-11-13.
+Public email on crawled HTML: info@centurionawards.com. No mr-centurion.com string.
