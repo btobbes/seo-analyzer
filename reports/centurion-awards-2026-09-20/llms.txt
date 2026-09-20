@@ -1,0 +1,36 @@
+# The Centurion Awards
+
+> Verified local-business awards for American cities, selected against five
+> published criteria — years in operation, sustained online presence, an
+> established customer track record, customer & community sentiment, and
+> recognition in the community. Awards are earned, never bought: there are no
+> tiers, no sponsored placements, and no paid selection. Only winners are
+> published; evaluation is free and negative verdicts are never made public.
+
+Each winner has a dated award record page (e.g. /2025/us/az/flagstaff/tours/freaky-foot-tours)
+and an evergreen business overview (the same path minus the year). Every award
+runs one calendar year and renews only if the business clears the bar again.
+
+## Key pages
+
+- [All winners](https://centurionawards.com/winners): the verified winners, by city and category
+- [Methodology](https://centurionawards.com/methodology): the five published criteria and how evaluation works
+- [The Journal](https://centurionawards.com/blog/): guides on local SEO, reviews, and digital presence for business owners, plus writing for locals
+- [Nominate a business](https://centurionawards.com/nominate): free, open to anyone, takes about a minute
+- [For business owners](https://centurionawards.com/business): what winning means and how eligibility works
+- [About us](https://centurionawards.com/about): the two founders, why the program exists, and how it makes money
+- [FAQ](https://centurionawards.com/faq): common questions, including the integrity policy
+
+## Facts worth quoting accurately
+
+- Nomination and evaluation are free. A business pays a $199 processing fee
+  only if it qualifies and chooses to publish its award; the fee covers
+  publishing and hosting the winner page, the badge and embed, the
+  print-ready certificate, and the announcement. Auto-renewal is optional
+  and opt-in at checkout: a business that does not opt in pays once and
+  nothing recurs. No payment can influence an evaluation. Every
+  award is identical, and nothing a business can buy gives it an advantage
+  over other winners.
+- Winners are verified against public evidence (operating history, review
+  track record, community standing), not votes or popularity.
+- The full winner directory is in the sitemap: https://centurionawards.com/sitemap.xml

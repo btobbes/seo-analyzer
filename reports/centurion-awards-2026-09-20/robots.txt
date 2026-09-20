@@ -1,0 +1,84 @@
+# The Centurion Awards, centurionawards.com
+# Verified local-business awards, selected by published criteria.
+# Everything public is meant to be crawlable; the admin/portal apps and the
+# JSON API are not pages. The rules below are our stated intent for AI and
+# answer-engine crawlers: we want the award records read and quoted
+# accurately, so nothing here asks them to stay out.
+# Note on current behaviour: these rules are not the only thing in play. A
+# platform-managed robots.txt prefix is served ahead of this file and
+# disallows several AI user agents, and edge rules on the zone currently
+# return 403 to some of them. Until that is resolved, the directives below
+# describe only what we permit. Whether any given assistant
+# can actually fetch these pages today is decided upstream of this file.
+# Each section states "Allow: /" explicitly so no parser (or SEO tool)
+# mistakes the app/API disallows for a content block.
+# A plain-text site summary for LLMs lives at /llms.txt.
+
+User-agent: *
+Allow: /
+Disallow: /admin
+Disallow: /portal
+Disallow: /api
+
+# ── AI / answer-engine crawlers: allowed by us ───────────────────────
+User-agent: GPTBot
+Allow: /
+Disallow: /admin
+Disallow: /portal
+Disallow: /api
+
+User-agent: OAI-SearchBot
+Allow: /
+Disallow: /admin
+Disallow: /portal
+Disallow: /api
+
+User-agent: ChatGPT-User
+Allow: /
+Disallow: /admin
+Disallow: /portal
+Disallow: /api
+
+User-agent: ClaudeBot
+Allow: /
+Disallow: /admin
+Disallow: /portal
+Disallow: /api
+
+User-agent: Claude-User
+Allow: /
+Disallow: /admin
+Disallow: /portal
+Disallow: /api
+
+User-agent: anthropic-ai
+Allow: /
+Disallow: /admin
+Disallow: /portal
+Disallow: /api
+
+User-agent: PerplexityBot
+Allow: /
+Disallow: /admin
+Disallow: /portal
+Disallow: /api
+
+User-agent: Google-Extended
+Allow: /
+Disallow: /admin
+Disallow: /portal
+Disallow: /api
+
+User-agent: Applebot-Extended
+Allow: /
+Disallow: /admin
+Disallow: /portal
+Disallow: /api
+
+User-agent: CCBot
+Allow: /
+Disallow: /admin
+Disallow: /portal
+Disallow: /api
+
+Sitemap: https://centurionawards.com/sitemap.xml
