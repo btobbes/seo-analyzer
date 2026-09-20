@@ -138,11 +138,20 @@ those need a real rendering browser, which PSI provides.
 lang (LOW); robots.txt blocks named AI crawlers — one aggregated finding (LOW; the list
 covers GPTBot, OAI-SearchBot, ChatGPT-User, ClaudeBot, Claude-Web, anthropic-ai,
 PerplexityBot, Perplexity-User, Google-Extended, Applebot-Extended, Amazonbot,
-meta-externalagent, Bytespider, CCBot, cohere-ai, DuckAssistBot); no llms.txt (INFO —
+meta-externalagent, Bytespider, CCBot, cohere-ai, DuckAssistBot); **HTTP-layer AI
+crawler probe** (HIGH when GPTBot / ClaudeBot / PerplexityBot / OAI-SearchBot /
+CCBot / Bytespider / Amazonbot / Google-Extended receive 4xx/5xx at the edge —
+robots `Allow` is never treated as access); no llms.txt (INFO —
 emerging convention, no measured citation benefit, so it never moves the score).
 Robots evaluation follows RFC 9309: groups for the same agent are merged across the file
 and `Allow` wins a specificity tie — so a Cloudflare-managed `Disallow: /` that the
-operator re-allows below is correctly read as allowed.
+operator re-allows below is correctly read as allowed. The Site health "AI crawler
+access" row reports the HTTP probe first.
+
+**crawlability (sitemap):** sitemap served with `X-Robots-Tag: noindex` (HIGH) — Google
+can still fetch the file, but a first Search Console submit of noindexed URLs just
+creates "Excluded by noindex" rows. Flip the header on the sitemap and on the pages
+you want indexed in the same change.
 
 **performance (page-observable, no PSI needed):** HTML served without compression (MEDIUM);
 large/heavy HTML document (MEDIUM/LOW); render-blocking scripts in head (MEDIUM/LOW); many

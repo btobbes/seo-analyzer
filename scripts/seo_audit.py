@@ -14,6 +14,7 @@ Design goals:
 
 Usage:
     python3 seo_audit.py https://example.com [--max-pages N] [--out DIR]
+                                             [--include-pages URL,URL]
                                              [--no-pdf] [--pagespeed]
 
 The companion module report.py renders the HTML/PDF; this file does the analysis and
@@ -142,12 +143,17 @@ def _decode_body(raw, enc):
     return raw
 
 
-def fetch(url, method="GET", max_bytes=None, max_redirects=10):
+def fetch(url, method="GET", max_bytes=None, max_redirects=10, user_agent=None):
     """Fetch a URL, following redirects manually so the hop chain is recorded
-    (Response.chain). Decodes gzip/deflate. Never raises."""
+    (Response.chain). Decodes gzip/deflate. Never raises.
+
+    user_agent overrides the default auditor UA — used to probe named AI
+    crawlers at the HTTP layer, because robots.txt Allow is not the same as
+    the edge actually serving them a 200.
+    """
     start = _dt.datetime.now()
     headers = {
-        "User-Agent": USER_AGENT,
+        "User-Agent": user_agent or USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Encoding": "gzip, deflate",
         "Accept-Language": "en-US,en;q=0.9",
@@ -553,12 +559,26 @@ def collect_sitemap_urls(url, seen=None, depth=0):
     return out
 
 
-def discover_pages(base_url, max_pages, sm_urls):
+def discover_pages(base_url, max_pages, sm_urls, include_pages=None):
     """Return an ordered list of (url, source) to audit, homepage first. Sources:
-    'homepage', 'sitemap', 'link' — the report shows how each page was discovered."""
+    'homepage', 'include', 'sitemap', 'link' — the report shows how each page
+    was discovered. include_pages are operator-forced URLs/paths and are
+    inserted right after the homepage so a template set (apply, winners,
+    a market hub, …) is audited even when the sitemap order would skip them."""
     home = base_url
     pages = [(home, "homepage")]
     seen = {home.rstrip("/")}
+    for raw in include_pages or []:
+        if len(pages) >= max_pages:
+            break
+        raw = (raw or "").strip()
+        if not raw:
+            continue
+        u = raw if raw.startswith("http") else normalize(base_url, raw)
+        if not u or not same_site(base_url, u) or u.rstrip("/") in seen:
+            continue
+        seen.add(u.rstrip("/"))
+        pages.append((u, "include"))
     # Prefer the sitemap — it's the site's own statement of what matters.
     for u in sm_urls:
         u = u.strip()
@@ -1372,6 +1392,48 @@ def _local_fields(n):
 # Site-wide checks: host variants, 404 handling, TLS, trust pages, broken links,
 # asset caching, analytics — the checks a professional audit runs once per site.
 # =================================================================================
+
+# Honest UAs for a small HTTP-layer probe. robots.txt Allow is not access —
+# Cloudflare Bot Fight / AI-scraper rules often 403 these while the operator's
+# robots file still says Allow: /.
+AI_CRAWLER_PROBE_UAS = [
+    ("GPTBot", "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GPTBot/1.3; +https://openai.com/gptbot)"),
+    ("ClaudeBot", "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ClaudeBot/1.0; +claudebot@anthropic.com)"),
+    ("PerplexityBot", "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; PerplexityBot/1.0; +https://perplexity.ai/perplexitybot)"),
+    ("OAI-SearchBot", "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; OAI-SearchBot/1.3; +https://openai.com/searchbot)"),
+    ("CCBot", "Mozilla/5.0 (compatible; CCBot/2.0; +https://commoncrawl.org/faq/)"),
+    ("Bytespider", "Mozilla/5.0 (compatible; Bytespider; https://zhanzhang.toutiao.com/)"),
+    ("Amazonbot", "Mozilla/5.0 (compatible; Amazonbot/0.1; +https://developer.amazon.com/support/amazonbot)"),
+    ("Google-Extended", "Mozilla/5.0 (compatible; Google-Extended)"),
+]
+
+
+def check_ai_crawler_http(url):
+    """Fetch the homepage as named AI crawlers. Returns (findings, blocked, allowed).
+
+    A robots.txt Allow for GPTBot/ClaudeBot is meaningless if the edge returns 403.
+    This probe is what we report as 'AI crawler access' — never the robots file alone.
+    """
+    findings, blocked, allowed = [], [], []
+    for name, ua in AI_CRAWLER_PROBE_UAS:
+        r = fetch(url, max_bytes=2048, user_agent=ua)
+        if r.status == 0:
+            blocked.append(f"{name} unreachable ({r.error or 'no response'})")
+        elif r.status >= 400:
+            blocked.append(f"{name} HTTP {r.status}")
+        else:
+            allowed.append(name)
+    if blocked:
+        findings.append(f(
+            "HIGH", "AI crawlers blocked at the HTTP edge", "ai search", 4, 2,
+            "; ".join(blocked),
+            "robots.txt Allow is not access. An edge/WAF/bot-fight rule is refusing "
+            "named AI crawlers. Lift those blocks before claiming AI visibility, and "
+            "do not treat a robots Allow as proof a crawler can read the page.",
+        ))
+    return findings, blocked, allowed
+
+
 _SKIP_LINK_RE = re.compile(
     r"\.(pdf|jpe?g|png|gif|svg|webp|avif|ico|css|js|mjs|zip|gz|mp3|mp4|webm|woff2?|xml)(\?|$)"
     r"|add-to-cart|logout|wp-login|/cart(/|$|\?)|/checkout(/|$|\?)|replytocom=", re.I)
@@ -1917,7 +1979,7 @@ def confidence_level(psi, pages, ai_blocked):
 # =================================================================================
 # Orchestration
 # =================================================================================
-def run_audit(start_url, max_pages=5, use_pagespeed=False):
+def run_audit(start_url, max_pages=5, use_pagespeed=False, include_pages=None):
     if not start_url.startswith("http"):
         start_url = "https://" + start_url
     parsed = urllib.parse.urlparse(start_url)
@@ -1930,7 +1992,11 @@ def run_audit(start_url, max_pages=5, use_pagespeed=False):
     robots_info = parse_robots(robots_resp.text) if robots_found else {"sitemaps": [], "ai_blocked": [], "blocks_all": False}
 
     sm_urls = []
+    sitemap_xrobots = ""
     for sm in robots_info["sitemaps"]:
+        r_listed = fetch(sm, max_bytes=200_000)
+        if r_listed.status == 200 and not sitemap_xrobots:
+            sitemap_xrobots = r_listed.header("x-robots-tag", "")
         sm_urls.extend(collect_sitemap_urls(sm))
     sitemap_exists = bool(robots_info["sitemaps"])
     if not sm_urls:
@@ -1939,6 +2005,7 @@ def run_audit(start_url, max_pages=5, use_pagespeed=False):
         head = r_sm.body[:4096].lower()
         if r_sm.status == 200 and (b"<urlset" in head or b"<sitemapindex" in head):
             sitemap_exists = True
+            sitemap_xrobots = sitemap_xrobots or r_sm.header("x-robots-tag", "")
             sm_urls = collect_sitemap_urls(default_sm)
     sitemap_found = sitemap_exists and bool(sm_urls)
 
@@ -1949,7 +2016,7 @@ def run_audit(start_url, max_pages=5, use_pagespeed=False):
     llms_found = (llms_resp.status == 200 and bool(llms_resp.body)
                   and b"<html" not in llms_resp.body[:2000].lower())
 
-    page_specs = discover_pages(base, max_pages, sm_urls)
+    page_specs = discover_pages(base, max_pages, sm_urls, include_pages)
     pages_urls = [u for u, _ in page_specs]
 
     site_findings = []
@@ -1983,6 +2050,15 @@ def run_audit(start_url, max_pages=5, use_pagespeed=False):
                                "Optional/emerging: an llms.txt at the site root offers AI crawlers a curated "
                                "content index. Evidence that it affects AI citations is so far inconclusive, so "
                                "treat it as low priority — server-rendered content and schema matter far more."))
+    if sitemap_exists and "noindex" in sitemap_xrobots.lower():
+        site_findings.append(f("HIGH", "Sitemap served with X-Robots-Tag: noindex",
+                               "crawlability", 4, 1,
+                               f"{(robots_info['sitemaps'][0] if robots_info.get('sitemaps') else '/sitemap.xml')} "
+                               f"X-Robots-Tag: {sitemap_xrobots}",
+                               "Remove noindex from the sitemap response before a Search Console upload. "
+                               "Google can fetch a noindexed sitemap, but every listed URL that also "
+                               "sends noindex will be discovered and then excluded. Flip the header on "
+                               "the sitemap and on the pages you want indexed in the same change."))
 
     # Analyze pages concurrently — each is mostly network wait, so a small thread pool
     # cuts wall-clock roughly linearly. ThreadPoolExecutor.map preserves input order, so
@@ -2073,9 +2149,20 @@ def run_audit(start_url, max_pages=5, use_pagespeed=False):
         site_findings.extend(an_f)
         health.append(an_h)
     health.append(("llms.txt", "found" if llms_found else "not found (optional)"))
-    health.append(("AI crawler access",
-                   ("blocked: " + ", ".join(sorted(set(robots_info["ai_blocked"]))))
-                   if robots_info.get("ai_blocked") else "no AI crawlers blocked in robots.txt"))
+    ai_http_f, ai_http_blocked, ai_http_allowed = check_ai_crawler_http(base)
+    site_findings.extend(ai_http_f)
+    if ai_http_blocked:
+        ai_access = ("HTTP blocked: " + ", ".join(ai_http_blocked)
+                     + ("; HTTP 200: " + ", ".join(ai_http_allowed) if ai_http_allowed else "")
+                     + ". robots.txt Allow is not access.")
+    elif robots_info.get("ai_blocked"):
+        ai_access = ("robots.txt disallows " + ", ".join(sorted(set(robots_info["ai_blocked"])))
+                     + "; HTTP probe of others returned 200")
+    else:
+        ai_access = ("HTTP 200 for probed AI crawlers"
+                     + (f" ({', '.join(ai_http_allowed)})" if ai_http_allowed else "")
+                     + "; none blocked in robots.txt")
+    health.append(("AI crawler access", ai_access))
 
     # PageSpeed on the homepage
     psi = pagespeed(pages[0]["final_url"] if pages else base, use_pagespeed)
@@ -2151,14 +2238,24 @@ def main():
     ap = argparse.ArgumentParser(description="Audit a website's SEO and write an HTML+PDF report.")
     ap.add_argument("url", help="Site URL, e.g. https://example.com")
     ap.add_argument("--max-pages", type=int, default=5)
+    ap.add_argument("--include-pages", action="append", default=[],
+                    help="Force-include URLs or paths (repeatable; comma-separated OK). "
+                         "Inserted after the homepage so a named template set is audited "
+                         "even when sitemap order would skip it.")
     ap.add_argument("--out", default=".", help="Output directory")
     ap.add_argument("--no-pdf", action="store_true", help="Skip PDF rendering")
     ap.add_argument("--pagespeed", action="store_true", help="Query PageSpeed Insights (best effort)")
     ap.add_argument("--json", action="store_true", help="Also write the raw report JSON")
     args = ap.parse_args()
 
+    include_pages = []
+    for item in args.include_pages:
+        include_pages.extend(p.strip() for p in item.split(",") if p.strip())
+    if include_pages:
+        args.max_pages = max(args.max_pages, 1 + len(include_pages))
+
     print(f"Auditing {args.url} (up to {args.max_pages} pages)…", file=sys.stderr)
-    report = run_audit(args.url, args.max_pages, args.pagespeed)
+    report = run_audit(args.url, args.max_pages, args.pagespeed, include_pages)
 
     # import the renderer (sibling module)
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
