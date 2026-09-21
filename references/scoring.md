@@ -24,22 +24,25 @@ do first. It's advisory; it does not affect the score.
 
 The overall score is a weighted average of the eight category scores:
 
-Weights were rebalanced in 2.0.0. AI search went from 0.07 to 0.12 because answer engines
-are now a primary discovery channel and the category gained real checks (edge access,
-snippet controls, Content-Signal) instead of one robots.txt scan. Mobile and social gave
-up the difference: a viewport tag and an Open Graph set are table stakes that almost every
-site passes, so they separated good sites from bad ones less than their weight implied.
+Weights were rebalanced in 2.0.0. AI search went from 0.07 to 0.10: the category gained
+real checks (edge access, snippet controls, AI-preference signals) instead of one
+robots.txt scan. It stays below crawlability and performance on purpose. The 2026 studies
+in `sources-2026.md` put AI referrals at roughly 1% of site traffic and find off-page
+signals predict AI citations far better than anything on the page, so an HTML audit must
+not let AI findings outrank crawlability or Core Web Vitals. Mobile and social gave up the
+difference: a viewport tag and an Open Graph set are table stakes that nearly every site
+passes.
 
 | category | weight | what it covers |
 |----------|--------|----------------|
 | crawlability | 0.20 | link architecture (links to non-canonical / noindexed / redirecting URLs, canonical pointing at a thinner page, sitemap-only templates), sitemap hygiene and lastmod, HEAD/GET parity, robots.txt 5xx and Content-Signal search=no, reachability, status codes, redirect chains, robots/sitemap quality, client-render, soft 404s, noindex (meta + header), canonicals, hreflang, host variants, 404 handling, broken internal links |
-| on page | 0.17 | near-duplicate pages and boilerplate-heavy templates, repeated passages, title, meta description, H1, heading hierarchy, word count, duplicates, alt text, CTA, URL hygiene, internal linking, analytics presence |
+| on page | 0.18 | near-duplicate pages and boilerplate-heavy templates, repeated passages, title, meta description, H1, heading hierarchy, word count, duplicates, alt text, CTA, URL hygiene, internal linking, analytics presence |
 | performance | 0.15 | the likely LCP image (hotlinked, redirected, heavy, lazy), oversized thumbnails, web-font payload, CSP blocking the page's own scripts, third-party script ahead of CSS, no-store HTML, plus page-observable signals (compression, render-blocking JS, page weight, DOM size, image dimensions/lazy-loading/formats, asset caching, TTFB) plus PageSpeed Insights — lab LCP/INP/CLS/TBT/FCP and real-user CrUX field data (LCP, INP, CLS at the 75th percentile) when available |
 | schema | 0.10 | homepage Organization completeness, Article recommended properties, self-serving review markup, retired rich-result types (INFO), JSON-LD presence/validity, schema/content mismatches (e.g. FAQPage without FAQ), entity schema (Organization/WebSite, sameAs), breadcrumbs, LocalBusiness completeness |
 | trust | 0.10 | domain registration expiry (RDAP), contact domains that can't receive mail, SPF/DMARC, security.txt, exposed private files, postal address / legal entity, HTTPS enforcement (incl. the plain-http variant), TLS certificate expiry, security headers, mixed content, contact route & trust pages (E-E-A-T) |
 | social | 0.08 | share image present, loading and landscape on every audited template, Open Graph / Twitter tags & completeness, share image dimensions & weight, favicon |
-| mobile | 0.08 | viewport meta, responsive scaling, zoom; Lighthouse font-size / tap-targets when PSI runs |
-| ai search | 0.12 | AI crawler access tested at the network edge by user-agent, robots.txt AI rules (RFC 9309 group merging) and Content-Signal ai-input, snippet controls (nosnippet / max-snippet, which also govern AI Overviews and AI Mode), visible dates on articles, llms.txt link quality, content visible to non-JS crawlers, html lang |
+| mobile | 0.09 | viewport meta, responsive scaling, zoom; Lighthouse font-size / tap-targets when PSI runs |
+| ai search | 0.10 | AI crawler access tested at the network edge by user-agent, robots.txt AI rules (RFC 9309 group merging) and Content-Signal ai-input, snippet controls (nosnippet / max-snippet, which also govern AI Overviews and AI Mode), visible dates on articles, llms.txt link quality, content visible to non-JS crawlers, html lang |
 
 To change weights, edit `CATEGORY_WEIGHTS` in `seo_audit.py` (they don't need to sum to
 1; the overall is normalized by the weights actually used).
@@ -94,7 +97,9 @@ are analyzed with `analyze_page()` and the no-extra-request checks, then aggrega
 site-wide finding per issue type that the deep pages didn't already show, with a count,
 the templates affected, and an example. They score like any other finding (once per
 `(category, title)`), so the score still doesn't swing with crawl size; it just reflects
-more of the site. The report's **Coverage by URL template** table shows URLs vs audited
+more of the site. **Prevalence scaling:** an issue found on fewer than 10% of swept pages
+(and not on any deep page) scores one severity step lower, because it is a page problem
+rather than a template problem; CRITICAL is never softened. The report's **Coverage by URL template** table shows URLs vs audited
 per template, and `coverage_gaps` lists templates with ≥5 URLs that were never sampled.
 
 ## Confidence level
@@ -198,16 +203,24 @@ listed), *internal links lead to noindexed pages* (LOW; MEDIUM at ≥40% of the 
 share of the sitemap). Sitemap: lists error URLs (HIGH at ≥10%, else MEDIUM; 404/410/5xx
 only), noindexed URLs (MEDIUM), non-canonical URLs (MEDIUM), redirecting URLs (LOW),
 lastmod on <80% of URLs / all identical / in the future (LOW each). robots.txt answers 5xx
-(CRITICAL). Content-Signal `search=no` (HIGH). HEAD fails where GET succeeds (MEDIUM).
+(CRITICAL), is an HTML page (HIGH), exceeds 500 KiB (MEDIUM). AI-preference `search=no`
+(HIGH). HTML over Googlebot's 2 MB uncompressed fetch limit (HIGH). Server answers br/zstd
+when only gzip was offered (MEDIUM). HEAD fails where GET succeeds (LOW: it breaks link
+checkers and monitors, not crawlers; no social platform documents using HEAD).
 Site refuses non-browser user-agents, audited via browser-UA fallback (INFO).
 
-**ai search** — `probe_ai_agents`: search/user agents refused at the edge (HIGH);
-training agents refused (MEDIUM, HIGH if robots.txt names them); every non-browser UA
-refused (MEDIUM, generic bot protection, spoof test inconclusive). Content-Signal
-`ai-input=no` (MEDIUM). `check_answer_readiness`: snippets disabled (HIGH), max-snippet
+**ai search** — `probe_ai_agents` requests the homepage and one inner page as 17
+documented agents (bot rules can vary page by page): search/user agents refused at the
+edge (HIGH); only training agents refused (MEDIUM; the fix text notes when robots.txt
+names them, since then the file and the edge disagree); every non-browser UA refused
+(MEDIUM, generic bot protection, test inconclusive). Every finding says it is a
+differential response by User-Agent from an ordinary IP, not proof the real bot is
+blocked. robots.txt: search/user tokens disallowed (MEDIUM), only training/opt-out tokens
+(LOW). AI-preference signals: Content-Signal `ai-input=no` or IETF Content-Usage
+`ai-use=n`, in robots.txt or as a response header (MEDIUM). `noarchive`/`nocache` (LOW:
+dead at Google, but Bing maps them to Chat/Copilot behavior). `check_answer_readiness`: snippets disabled (HIGH), max-snippet
 under 50 (LOW), ≥5 `data-nosnippet` elements (LOW), article with no visible date (LOW).
-`check_llms_txt`: dead links (LOW), non-canonical/redirecting/noindexed links (LOW),
-format deviations (INFO).
+`check_llms_txt`: everything INFO. A missing llms.txt is never a finding.
 
 **performance** — `check_hero_and_thumbs`: priority image lazy-loaded (MEDIUM), hero
 hotlinked cross-origin through redirects (MEDIUM), hero on a third-party origin (LOW),
@@ -222,12 +235,17 @@ Organization, two or more of logo/sameAs/legalName/address/foundingDate/contact 
 (LOW), retired rich-result types (INFO).
 
 **trust** — domain registration ≤30 days (HIGH) / ≤60 days (MEDIUM), contact address on a
-domain with no MX (MEDIUM), SPF or DMARC missing on the site's own mail domain (LOW),
-security.txt expired or without Expires (LOW), private files downloadable (CRITICAL), no
+domain that cannot receive mail, meaning Null MX or no MX/A/AAAA at all (MEDIUM; no MX
+alone is not a failure, RFC 5321 falls back to A), SPF or DMARC missing on the site's own
+mail domain (LOW), DMARC without `rua` (LOW), DKIM never reported (selectors can't be
+enumerated),
+security.txt expired or without Expires (LOW), private files downloadable (CRITICAL;
+four gates: 200, non-HTML type, format signature, differs from a random-path control), no
 postal address on the crawled or about/contact/legal pages (LOW).
 
 **social** — per-template share image: missing (LOW), does not load (MEDIUM), under 600px
-wide or far from landscape (LOW). Always fetched with GET.
+wide or far from landscape (LOW). Always fetched with GET. Homepage: og:image over 600 KB
+(WhatsApp's documented ceiling), `</head>` beyond the first 300 KB (LOW each).
 
 **on page** — near-duplicate pages within a template, ≥80% shared 6-word shingles
 (MEDIUM); template median under 120 unique words (LOW); a ≥12-word sentence repeated on

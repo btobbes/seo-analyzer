@@ -90,14 +90,16 @@ Two rules follow from that, and they matter more than anything else in this file
   sitemap entries) audited the same corner of a site on every run.
 - **AI crawler access is tested, not inferred.** robots.txt states intent; CDNs and
   firewalls decide. The homepage is requested with each crawler's documented user-agent
-  (training, answer-engine index, and live user-fetch agents from OpenAI, Anthropic,
-  Perplexity, Apple, Meta, Amazon, Common Crawl, DuckDuckGo, Mistral, ByteDance) and
-  compared with a browser. Refused search/user agents are HIGH; refused training agents
-  are MEDIUM, or HIGH when robots.txt names them in its own rules (the file and the edge
-  disagree). The probe runs from an ordinary IP, so a firewall that verifies crawler IPs
+  (17 training, answer-engine index, and live user-fetch agents from OpenAI, Anthropic,
+  Perplexity, Apple, Meta, Amazon, Common Crawl, DuckDuckGo, Mistral, ByteDance), on the
+  homepage and one inner page, and compared with a browser. Refused search/user agents are
+  HIGH; refused training agents are MEDIUM, with a note when robots.txt names them (the
+  file and the edge disagree). The probe runs from an ordinary IP, so a firewall that verifies crawler IPs
   can refuse the test yet admit the real bot: every finding says so, and a site that
   refuses *every* non-browser UA gets a softer, separate finding. robots.txt is also
-  scanned for CDN-managed blocks and `Content-Signal` lines (`search=no`, `ai-input=no`).
+  scanned for a CDN-managed block (the file crawlers get is then not the origin's),
+  Cloudflare `Content-Signal` lines and IETF `Content-Usage` lines (`search`, `ai-input` /
+  `ai-use`), an HTML body, and the 500 KiB parse limit.
 - **Link architecture.** Up to 40 internal link targets are sampled across templates and
   classified: broken, 5xx, redirecting, URL-variant 301s, canonicalized elsewhere,
   noindexed. From that: *internal links point at non-canonical URLs* (HIGH when none of
@@ -119,8 +121,9 @@ Two rules follow from that, and they matter more than anything else in this file
   ships (typically a CDN-injected RUM beacon), third-party scripts ahead of the stylesheet,
   and `Cache-Control: no-store` HTML are flagged. Image checks run once per template.
 - **HEAD/GET parity.** The homepage, share image, sitemap, and one image per top-level
-  directory are requested with HEAD; a 4xx/5xx where GET gives 200 is flagged. The
-  analyzer itself never trusts HEAD for image or link status.
+  directory are requested with HEAD; a 4xx/5xx where GET gives 200 is flagged LOW. It
+  breaks link checkers and monitors (and fooled a previous audit into reporting 220 broken
+  images), not search crawlers. The analyzer never trusts HEAD for status or bytes.
 - **Trust and launch hygiene.** Domain expiry via RDAP, mail-capable contact domains and
   SPF/DMARC via DNS-over-HTTPS, `security.txt` (RFC 9116 fields, expiry), exposed
   `.git/HEAD`/`.env`/`.DS_Store`, HSTS quality, and entity transparency (a postal address
@@ -132,9 +135,11 @@ Two rules follow from that, and they matter more than anything else in this file
 - **Answer-engine readiness.** Snippet restrictions (`nosnippet`, `max-snippet:0`) are
   scored because Google documents that they also govern AI Overviews and AI Mode.
   Everything else (question headings, lists, tables, visible dates) is shown in an
-  informational table and not scored: the evidence is correlational. `llms.txt` is
-  validated and its links checked (dead, redirecting, non-canonical) at LOW/INFO only,
-  because no major answer engine has confirmed it reads the file.
+  informational table and not scored: end-to-end studies find most on-page "GEO" tactics
+  ineffective or negative, and off-page signals dominate. A missing `llms.txt` is never a
+  finding (server logs show AI crawlers don't request it; Google says it doesn't use it);
+  an existing one is validated and its links checked, INFO only. Schema is scored for
+  rich-result correctness and entity clarity, never as "AI visibility".
 - **Duplicate and boilerplate content.** Within each template, 6-word shingles give the
   median unique words per page and any near-duplicate pairs (≥80% shared). A sentence
   repeated on one page (a partial rendered twice) is flagged.
@@ -153,8 +158,9 @@ Two rules follow from that, and they matter more than anything else in this file
 Each category starts at 100 and loses points per distinct finding by severity (CRITICAL
 −40, HIGH −20, MEDIUM −10, LOW −4, INFO 0), with diminishing returns inside a category
 (two heaviest in full, next two at 75%, the rest at 50%) and a floor of 0. The overall
-score is a weighted average: crawlability 0.20, on page 0.17, performance 0.15, AI search
-0.12, schema 0.10, trust 0.10, mobile 0.08, social 0.08. Findings from swept pages count
+score is a weighted average: crawlability 0.20, on page 0.18, performance 0.15, AI search
+0.10, schema 0.10, trust 0.10, mobile 0.09, social 0.08. AI search is deliberately
+weighted below crawlability and performance (see `references/sources-2026.md`). Findings from swept pages count
 once per issue type, like everything else. Details and the full check list are in
 `references/scoring.md`; sources for the 2026 checks are in `references/sources-2026.md`.
 
