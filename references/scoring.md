@@ -24,16 +24,22 @@ do first. It's advisory; it does not affect the score.
 
 The overall score is a weighted average of the eight category scores:
 
+Weights were rebalanced in 2.0.0. AI search went from 0.07 to 0.12 because answer engines
+are now a primary discovery channel and the category gained real checks (edge access,
+snippet controls, Content-Signal) instead of one robots.txt scan. Mobile and social gave
+up the difference: a viewport tag and an Open Graph set are table stakes that almost every
+site passes, so they separated good sites from bad ones less than their weight implied.
+
 | category | weight | what it covers |
 |----------|--------|----------------|
-| crawlability | 0.20 | reachability, status codes, redirect chains, robots/sitemap quality, client-render, soft 404s, noindex (meta + header), canonicals, hreflang, host variants, 404 handling, broken internal links |
-| on page | 0.18 | title, meta description, H1, heading hierarchy, word count, duplicates, alt text, CTA, URL hygiene, internal linking, analytics presence |
-| performance | 0.15 | page-observable signals (compression, render-blocking JS, page weight, DOM size, image dimensions/lazy-loading/formats, asset caching, TTFB) plus PageSpeed Insights — lab LCP/INP/CLS/TBT/FCP and real-user CrUX field data (LCP, INP, CLS at the 75th percentile) when available |
-| schema | 0.10 | JSON-LD presence/validity, schema/content mismatches (e.g. FAQPage without FAQ), entity schema (Organization/WebSite, sameAs), breadcrumbs, LocalBusiness completeness |
-| trust | 0.10 | HTTPS enforcement (incl. the plain-http variant), TLS certificate expiry, security headers, mixed content, contact route & trust pages (E-E-A-T) |
-| social | 0.10 | Open Graph / Twitter tags & completeness, share image dimensions & weight, favicon |
-| mobile | 0.10 | viewport meta, responsive scaling, zoom; Lighthouse font-size / tap-targets when PSI runs |
-| ai search | 0.07 | content visible to non-JS AI crawlers, html lang, AI-crawler robots rules (RFC 9309 group merging) |
+| crawlability | 0.20 | link architecture (links to non-canonical / noindexed / redirecting URLs, canonical pointing at a thinner page, sitemap-only templates), sitemap hygiene and lastmod, HEAD/GET parity, robots.txt 5xx and Content-Signal search=no, reachability, status codes, redirect chains, robots/sitemap quality, client-render, soft 404s, noindex (meta + header), canonicals, hreflang, host variants, 404 handling, broken internal links |
+| on page | 0.17 | near-duplicate pages and boilerplate-heavy templates, repeated passages, title, meta description, H1, heading hierarchy, word count, duplicates, alt text, CTA, URL hygiene, internal linking, analytics presence |
+| performance | 0.15 | the likely LCP image (hotlinked, redirected, heavy, lazy), oversized thumbnails, web-font payload, CSP blocking the page's own scripts, third-party script ahead of CSS, no-store HTML, plus page-observable signals (compression, render-blocking JS, page weight, DOM size, image dimensions/lazy-loading/formats, asset caching, TTFB) plus PageSpeed Insights — lab LCP/INP/CLS/TBT/FCP and real-user CrUX field data (LCP, INP, CLS at the 75th percentile) when available |
+| schema | 0.10 | homepage Organization completeness, Article recommended properties, self-serving review markup, retired rich-result types (INFO), JSON-LD presence/validity, schema/content mismatches (e.g. FAQPage without FAQ), entity schema (Organization/WebSite, sameAs), breadcrumbs, LocalBusiness completeness |
+| trust | 0.10 | domain registration expiry (RDAP), contact domains that can't receive mail, SPF/DMARC, security.txt, exposed private files, postal address / legal entity, HTTPS enforcement (incl. the plain-http variant), TLS certificate expiry, security headers, mixed content, contact route & trust pages (E-E-A-T) |
+| social | 0.08 | share image present, loading and landscape on every audited template, Open Graph / Twitter tags & completeness, share image dimensions & weight, favicon |
+| mobile | 0.08 | viewport meta, responsive scaling, zoom; Lighthouse font-size / tap-targets when PSI runs |
+| ai search | 0.12 | AI crawler access tested at the network edge by user-agent, robots.txt AI rules (RFC 9309 group merging) and Content-Signal ai-input, snippet controls (nosnippet / max-snippet, which also govern AI Overviews and AI Mode), visible dates on articles, llms.txt link quality, content visible to non-JS crawlers, html lang |
 
 To change weights, edit `CATEGORY_WEIGHTS` in `seo_audit.py` (they don't need to sum to
 1; the overall is normalized by the weights actually used).
@@ -44,8 +50,11 @@ To change weights, edit `CATEGORY_WEIGHTS` in `seo_audit.py` (they don't need to
 
 `category_score = max(0, 100 - sum(weight of each DISTINCT finding in that category))`
 
-So one CRITICAL alone drops a category to 60; three MEDIUMs drop it to 70. INFO findings
-are informational and never reduce the score.
+**Diminishing returns (2.0.0).** Within a category the distinct findings are sorted by
+weight; the two heaviest count in full, the next two at 75%, the rest at 50%. The check
+list roughly doubled in 2.0.0, and with straight addition a category hit the floor on a
+pile of LOWs and stopped telling a mediocre site from a terrible one. One CRITICAL alone
+still drops a category to 60; three MEDIUMs drop it to 72.5 → 73; INFO never counts.
 
 **Findings are deduplicated by `(category, title)` before scoring.** A site-wide issue
 (missing security headers, client-rendering, a shared duplicate title) appears on every
@@ -71,13 +80,31 @@ loop in `score_categories()`.)
   actually uses for page experience. Low-traffic sites have no field data; the report says
   so rather than guessing, and lab metrics still display.
 
+## Sampling, the sweep, and coverage
+
+`discover_pages()` no longer takes the first N sitemap entries. `stratified_sample()`
+clusters URLs by path shape (`url_template()`: first segment kept, years collapsed to
+`{year}`, deeper segments wildcarded, trailing slash preserved), gives every template one
+slot before any template gets a second (largest first), and spreads picks evenly inside
+each cluster. The homepage is always first.
+
+`--max-pages` pages ("deep") get per-page tables plus the checks that cost extra requests
+(hero image, thumbnails, share image), which run once per template. `--sweep` more pages
+are analyzed with `analyze_page()` and the no-extra-request checks, then aggregated: one
+site-wide finding per issue type that the deep pages didn't already show, with a count,
+the templates affected, and an example. They score like any other finding (once per
+`(category, title)`), so the score still doesn't swing with crawl size; it just reflects
+more of the site. The report's **Coverage by URL template** table shows URLs vs audited
+per template, and `coverage_gaps` lists templates with ≥5 URLs that were never sampled.
+
 ## Confidence level
 
 Shown in the report header (low / medium / high):
 
 - **low** — the site was largely unreachable (no pages returned content).
 - **medium** — pages were analyzed but PageSpeed/CWV data was not available.
-- **high** — pages analyzed and PageSpeed data obtained.
+- **high** — pages analyzed, PageSpeed data obtained, and every sitemap template with ≥5
+  URLs was sampled at least once. A coverage gap caps confidence at medium.
 
 ## The checks (by category)
 
@@ -157,12 +184,70 @@ Cache-Control, sampled from the homepage's first CSS/JS/image (LOW).
 PSI rate-limited/unavailable (INFO). PSI is queried with all four Lighthouse categories,
 so the report also shows Lighthouse SEO / Accessibility / Best-practices scores.
 
+## Checks added in 2.0.0
+
+These sit alongside the lists above. Function names are in `scripts/seo_audit.py`.
+
+**crawlability** — `check_link_architecture`: broken internal links (HIGH), links to 5xx
+(MEDIUM), links at redirects ≥5 (LOW), links using slash/scheme/www variants that 301 ≥3
+(LOW), *internal links point at non-canonical URLs* (MEDIUM; HIGH when no canonical target
+is linked from any crawled page), *canonical points at a thinner page than the one
+carrying it* (HIGH; ≥150 fewer words and <75% of the source, schema types lost are
+listed), *internal links lead to noindexed pages* (LOW; MEDIUM at ≥40% of the sample),
+*a sitemap template gets no internal links* (MEDIUM; only when the crawl saw a meaningful
+share of the sitemap). Sitemap: lists error URLs (HIGH at ≥10%, else MEDIUM; 404/410/5xx
+only), noindexed URLs (MEDIUM), non-canonical URLs (MEDIUM), redirecting URLs (LOW),
+lastmod on <80% of URLs / all identical / in the future (LOW each). robots.txt answers 5xx
+(CRITICAL). Content-Signal `search=no` (HIGH). HEAD fails where GET succeeds (MEDIUM).
+Site refuses non-browser user-agents, audited via browser-UA fallback (INFO).
+
+**ai search** — `probe_ai_agents`: search/user agents refused at the edge (HIGH);
+training agents refused (MEDIUM, HIGH if robots.txt names them); every non-browser UA
+refused (MEDIUM, generic bot protection, spoof test inconclusive). Content-Signal
+`ai-input=no` (MEDIUM). `check_answer_readiness`: snippets disabled (HIGH), max-snippet
+under 50 (LOW), ≥5 `data-nosnippet` elements (LOW), article with no visible date (LOW).
+`check_llms_txt`: dead links (LOW), non-canonical/redirecting/noindexed links (LOW),
+format deviations (INFO).
+
+**performance** — `check_hero_and_thumbs`: priority image lazy-loaded (MEDIUM), hero
+hotlinked cross-origin through redirects (MEDIUM), hero on a third-party origin (LOW),
+hero >300 KB (MEDIUM) or >150 KB without srcset (LOW), small images served from large
+files (MEDIUM with ≥12 such images, else LOW). `check_fonts`: Google Fonts payload
+>150 KB (LOW) / >250 KB (MEDIUM), no preconnect (LOW), no `display=` (LOW).
+`check_csp_blocks` (MEDIUM), `check_head_order` (LOW), `check_html_caching` no-store (LOW).
+
+**schema** — `check_schema_depth`: Article missing image/dates/author/author.url (LOW),
+self-serving review markup on the site's own business entity (MEDIUM), thin homepage
+Organization, two or more of logo/sameAs/legalName/address/foundingDate/contact missing
+(LOW), retired rich-result types (INFO).
+
+**trust** — domain registration ≤30 days (HIGH) / ≤60 days (MEDIUM), contact address on a
+domain with no MX (MEDIUM), SPF or DMARC missing on the site's own mail domain (LOW),
+security.txt expired or without Expires (LOW), private files downloadable (CRITICAL), no
+postal address on the crawled or about/contact/legal pages (LOW).
+
+**social** — per-template share image: missing (LOW), does not load (MEDIUM), under 600px
+wide or far from landscape (LOW). Always fetched with GET.
+
+**on page** — near-duplicate pages within a template, ≥80% shared 6-word shingles
+(MEDIUM); template median under 120 unique words (LOW); a ≥12-word sentence repeated on
+one page (LOW).
+
+### Deliberately not scored
+
+Question headings, lists, tables, llms.txt presence, markdown content negotiation,
+webmaster verification tags, HSTS sub-options, and retired schema types are shown but
+never move the score. The evidence that they change rankings or AI citations is
+correlational or absent, and a score should only punish what we can defend.
+
 ## Site health checks (report table)
 
 `run_audit()` assembles a `health` list rendered as the **Site health checks** table:
 host-variant behavior (http/https × www/non-www), 404 handling, TLS certificate expiry
-and issuer, contact & trust pages, the internal-link sample result, detected analytics,
-llms.txt, and AI-crawler access. The scored findings above are derived from these same
+and issuer, domain registration expiry, contact & trust pages, entity transparency, the
+internal-link classification, detected analytics, HSTS, markdown negotiation, robots.txt
+platform signals, llms.txt, AI-crawler robots rules and edge access, security.txt, email
+authentication, and webmaster verification tags. The scored findings above are derived from these same
 probes; the table gives the reader the raw observations.
 
 ## Social & local footprint (mostly non-scoring)
@@ -213,5 +298,10 @@ crawlable text (fully client-rendered), the section says so instead of inventing
    effort, observed, fix)` to the `findings` list when the condition holds.
 2. Use an existing category string so it rolls into a category score.
 3. Keep `observed` factual (the measurement) and `fix` imperative and specific.
-4. Re-run against a known site and confirm the finding appears and the score moves as
-   expected.
+4. Add a defect to `tests/fixture_site.py`'s broken site and an assertion in
+   `tests/test_fixture_audit.py`, and make sure the clean site stays silent. A check
+   without a false-positive guard is a liability.
+5. Run it against two or three unrelated real sites. Most false positives only show up on
+   sites built differently from the one that motivated the check (bot-protected
+   publishers, 50,000-URL sitemaps, sites with no sitemap).
+6. Bump `VERSION` in `seo_audit.py`.
