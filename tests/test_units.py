@@ -2,8 +2,8 @@
 
 Run with:  python3 -m unittest discover -s tests -v   (from the repo root)
 
-Tests marked @unittest.expectedFailure document a defect in scripts/seo_audit.py
-rather than in the test; each carries a comment naming the responsible lines.
+Several tests here were written as regression tests for real defects (malformed @type,
+truncated images, text glued across elements, CSP ports); keep them.
 """
 
 import os
@@ -241,29 +241,73 @@ class TestRobotsPlatformSignals(unittest.TestCase):
         txt = ("User-agent: *\nAllow: /\n"
                "Content-Signal: search=no, ai-input=no, ai-train=yes\n")
         findings, row = SA.robots_platform_signals(txt)
-        got = {(f["severity"], f["title"]) for f in findings}
-        self.assertIn(("HIGH", "robots.txt Content-Signal says search=no"), got)
-        self.assertIn(("MEDIUM", "robots.txt Content-Signal says ai-input=no"), got)
-        self.assertEqual(findings[0]["category"], "crawlability")
-        self.assertEqual(findings[1]["category"], "ai search")
+        got = {(f["severity"], f["category"], f["title"]) for f in findings}
+        self.assertIn(("HIGH", "crawlability",
+                       "robots.txt AI-preference signal says search=no"), got)
+        self.assertIn(("MEDIUM", "ai search",
+                       "robots.txt AI-preference signal opts out of AI answers"), got)
         self.assertIn("search=no", row[1])
+
+    def test_ietf_content_usage_line(self):
+        findings, row = SA.robots_platform_signals("Content-Usage: ai-use=n\n")
+        self.assertEqual(titles(findings),
+                         ["robots.txt AI-preference signal opts out of AI answers"])
+        self.assertIn("ai-use=n", row[1])
+
+    def test_content_usage_response_header(self):
+        resp = SA.Response("u", "u", 200, {"Content-Usage": "ai-use=n"}, b"", 1.0)
+        findings, row = SA.robots_platform_signals("User-agent: *\nAllow: /\n", resp)
+        self.assertEqual(titles(findings),
+                         ["robots.txt AI-preference signal opts out of AI answers"])
 
     def test_content_signal_yes_produces_nothing(self):
         findings, row = SA.robots_platform_signals(
             "Content-Signal: search=yes, ai-input=yes\n")
         self.assertEqual(findings, [])
-        self.assertIn("Content-Signal", row[1])
+        self.assertIn("search=yes", row[1])
 
     def test_cloudflare_managed_marker(self):
         findings, row = SA.robots_platform_signals(
-            "# Cloudflare managed robots.txt for example.com\nUser-agent: *\nAllow: /\n")
-        self.assertEqual(findings, [])
+            "# BEGIN Cloudflare Managed content\nUser-agent: *\nAllow: /\n"
+            "# END Cloudflare Managed content\n")
+        self.assertEqual(titles(findings), ["robots.txt is partly written by the CDN"])
+        self.assertEqual(findings[0]["severity"], "INFO")
         self.assertTrue(row[1].startswith("CDN-managed block present"))
+
+    def test_a_mere_mention_of_cloudflare_is_not_the_marker(self):
+        findings, row = SA.robots_platform_signals(
+            "# hosted behind cloudflare\nUser-agent: *\nAllow: /\n")
+        self.assertEqual(findings, [])
+        self.assertFalse(row[1].startswith("CDN-managed"))
 
     def test_no_signals_at_all(self):
         findings, row = SA.robots_platform_signals("User-agent: *\nAllow: /\n")
         self.assertEqual(findings, [])
-        self.assertEqual(row[1], "no Content-Signal line")
+        self.assertEqual(row[1], "no Content-Signal / Content-Usage line")
+
+
+class TestAiCrawlerRoster(unittest.TestCase):
+    def test_every_probed_agent_has_a_declared_role(self):
+        for token, role, _operator, _ua in SA.AI_AGENT_PROBES:
+            with self.subTest(agent=token):
+                self.assertIn(role, ("search", "user", "train"))
+                declared = SA.AI_CRAWLER_ROLES.get(token)
+                # Applebot is probed as a search crawler but is a classic search bot,
+                # so it is not in the AI opt-out roster; everything else must agree.
+                if declared is not None:
+                    self.assertEqual(declared, role)
+
+    def test_the_robots_roster_is_the_roles_dict(self):
+        self.assertEqual(SA.AI_CRAWLERS, list(SA.AI_CRAWLER_ROLES))
+
+    def test_agents_are_probed_with_their_own_token_in_the_user_agent(self):
+        for token, _role, _operator, ua in SA.AI_AGENT_PROBES:
+            with self.subTest(agent=token):
+                self.assertIn(token.lower(), ua.lower())
+
+    def test_retired_tokens_are_gone(self):
+        for token in ("cohere-ai", "anthropic-ai", "Claude-Web"):
+            self.assertNotIn(token, SA.AI_CRAWLERS)
 
 
 # =====================================================================================
@@ -314,11 +358,10 @@ class TestCspAllows(unittest.TestCase):
                                         "https://cdn.example.net/a.js", PAGE_URL))
 
     # ---- BUG -----------------------------------------------------------------------
-    @unittest.expectedFailure
     def test_port_in_a_csp_source_is_honoured(self):
         """ANALYZER BUG: _csp_allows strips the port from a host-source.
 
-        scripts/seo_audit.py line ~2247:
+        scripts/seo_audit.py line 2279:
             th = re.sub(r"^[a-z]+://", "", t).split("/")[0].split(":")[0]
         `.split(":")[0]` throws away the port, so `script-src https://cdn.example:8443`
         is treated as allowing a script on ANY port of cdn.example. CSP compares the
@@ -576,11 +619,10 @@ class TestCheckSchemaDepth(unittest.TestCase):
                                  "Self-serving review markup"))
 
     # ---- BUG -----------------------------------------------------------------------
-    @unittest.expectedFailure
     def test_numeric_type_does_not_crash(self):
         """ANALYZER BUG: _types() raises TypeError on a non-string, non-iterable @type.
 
-        scripts/seo_audit.py line ~2537:
+        scripts/seo_audit.py lines 2588-2590:
             def _types(node):
                 t = node.get("@type")
                 return set([t] if isinstance(t, str) else [str(x) for x in (t or [])])
@@ -609,7 +651,6 @@ class TestTypesHelper(unittest.TestCase):
         self.assertEqual(SA._types({}), set())
         self.assertEqual(SA._types({"@type": None}), set())
 
-    @unittest.expectedFailure
     def test_boolean_type_does_not_crash(self):
         # Same root cause as TestCheckSchemaDepth.test_numeric_type_does_not_crash.
         self.assertEqual(SA._types({"@type": True}), set())
@@ -649,14 +690,13 @@ class TestCheckRepeatedPassages(unittest.TestCase):
         self.assertEqual(SA.check_repeated_passages(self._page(text)), [])
 
     # ---- BUG -----------------------------------------------------------------------
-    @unittest.expectedFailure
     def test_repeated_passage_across_block_elements_is_detected(self):
         """ANALYZER BUG: PageParser.visible_text glues adjacent text nodes together.
 
         scripts/seo_audit.py:
-            line ~301  if self._skip_depth == 0 and data.strip():
+            line 334  if self._skip_depth == 0 and data.strip():
                            self.text_parts.append(data)
-            line ~397  return " ".join("".join(self.text_parts).split())
+            line 401  return " ".join("".join(self.text_parts).split())
 
         Whitespace-only text nodes are dropped and the surviving parts are joined with
         the EMPTY string, so `<p>...pebble.</p><p>Harbor...` becomes
@@ -688,7 +728,6 @@ class TestVisibleText(unittest.TestCase):
         p.feed("<p>one two</p><script>var hidden = 1;</script><style>a{b:c}</style>")
         self.assertEqual(p.visible_text, "one two")
 
-    @unittest.expectedFailure
     def test_words_across_block_elements_are_counted(self):
         # Same root cause as
         # TestCheckRepeatedPassages.test_repeated_passage_across_block_elements_is_detected
@@ -767,6 +806,9 @@ def finding(sev, title, cat):
 
 class TestScoreCategories(unittest.TestCase):
     NO_PSI = {"status": "skipped"}
+
+    def test_category_weights_sum_to_one(self):
+        self.assertAlmostEqual(sum(SA.CATEGORY_WEIGHTS.values()), 1.0, places=6)
 
     def test_perfect_site(self):
         scores, overall = SA.score_categories([], self.NO_PSI, {})
@@ -875,11 +917,10 @@ class TestImageInfo(unittest.TestCase):
         self.assertEqual(info["size"], 23)
 
     # ---- BUG -----------------------------------------------------------------------
-    @unittest.expectedFailure
     def test_truncated_png_does_not_crash(self):
         """ANALYZER BUG: _manual_dims() raises struct.error on a short image body.
 
-        scripts/seo_audit.py lines ~452-466:
+        scripts/seo_audit.py lines 463-466 and 470-477:
             except Exception:
                 dims = _manual_dims(resp.body)
         ...
@@ -893,7 +934,7 @@ class TestImageInfo(unittest.TestCase):
         unguarded from analyze_social (og:image AND favicon) and
         check_page_share_image, so one malformed image aborts the whole audit.
 
-        Patch: guard the fallback —
+        Patch (line 463): guard the fallback —
             except Exception:
                 try:
                     dims = _manual_dims(resp.body)
@@ -904,7 +945,6 @@ class TestImageInfo(unittest.TestCase):
         info = SA.image_info(self._resp(b"\x89PNG\r\n\x1a\n" + b"short"))
         self.assertIsNone(info["width"])
 
-    @unittest.expectedFailure
     def test_truncated_gif_does_not_crash(self):
         # Same root cause as test_truncated_png_does_not_crash: b[6:10] is too short.
         info = SA.image_info(self._resp(b"GIF89a", ctype="image/gif"))
@@ -937,7 +977,9 @@ class TestParserRobustness(unittest.TestCase):
         self.assertEqual(p.imgs[0]["fetchpriority"], "high")
 
     def test_non_numeric_width_does_not_crash_the_image_checks(self):
-        page = make_page(self.UPPER)
+        # width="100%" / height="AUTO" must not reach int(). The hero fetch is pointed
+        # at a closed local port so this test never touches the network.
+        page = make_page(self.UPPER, url="http://127.0.0.1:9/")
         page["status"] = 200
         self.assertEqual(SA.check_hero_and_thumbs(page), [])
 

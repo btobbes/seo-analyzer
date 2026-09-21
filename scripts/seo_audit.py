@@ -189,6 +189,7 @@ def fetch(url, method="GET", max_bytes=None, max_redirects=10, ua=None, extra_he
             loc = e.headers.get("Location") if e.headers else None
             if 300 <= e.code < 400 and loc and len(chain) < max_redirects:
                 chain.append((current, e.code))
+                e.close()
                 nxt = urllib.parse.urljoin(current, loc.strip())
                 if nxt == current:  # self-redirect loop
                     return Response(url, current, 0, {}, b"", elapsed(),
@@ -200,6 +201,8 @@ def fetch(url, method="GET", max_bytes=None, max_redirects=10, ua=None, extra_he
                 body = e.read()
             except Exception:
                 pass
+            finally:
+                e.close()
             return Response(url, current, e.code, dict(e.headers or {}), body, elapsed(),
                             chain=chain)
         except (urllib.error.URLError, ssl.SSLError, socket.timeout, ConnectionError,
@@ -398,7 +401,9 @@ class PageParser(HTMLParser):
 
     @property
     def visible_text(self):
-        return " ".join("".join(self.text_parts).split())
+        # join text nodes with a space: "<p>one.</p><p>two.</p>" is two words, and sentence
+        # and shingle boundaries must survive element boundaries
+        return " ".join(" ".join(self.text_parts).split())
 
     @property
     def word_count(self):
@@ -461,7 +466,10 @@ def image_info(resp):
             if not mime:
                 mime = Image.MIME.get(im.format, "")
     except Exception:
-        dims = _manual_dims(resp.body)
+        try:
+            dims = _manual_dims(resp.body)
+        except Exception:      # truncated or malformed image: report bytes, not dimensions
+            dims = None
         if dims:
             w, h = dims
     return {"width": w, "height": h, "size": size, "mime": mime}
@@ -2276,7 +2284,11 @@ def _csp_allows(src_list, script_url, page_url):
             return True
         if t.startswith("'"):
             continue
-        th = re.sub(r"^[a-z]+://", "", t).split("/")[0].split(":")[0]
+        authority = re.sub(r"^[a-z]+://", "", t).split("/")[0]
+        th, _, tport = authority.partition(":")
+        if tport and tport != "*" and tport != (str(su.port) if su.port else
+                                                {"https": "443", "http": "80"}.get(scheme, "")):
+            continue
         if th.startswith("*."):
             if host.endswith(th[1:]) and host != th[2:]:
                 return True
@@ -2377,6 +2389,8 @@ def _doh(name, rtype):
 
 
 def _registrable_candidates(host):
+    if re.fullmatch(r"[\d.]+", host or "") or ":" in (host or ""):
+        return []                                        # IP literal: nothing to look up
     parts = host.lower().lstrip(".").split(".")
     if parts and parts[0] == "www":
         parts = parts[1:]
@@ -2587,7 +2601,11 @@ def _jsonld_nodes(parser):
 
 def _types(node):
     t = node.get("@type")
-    return set([t] if isinstance(t, str) else [str(x) for x in (t or [])])
+    if isinstance(t, str):
+        return {t}
+    if isinstance(t, (list, tuple, set)):
+        return {str(x) for x in t}
+    return set()          # numeric / boolean / missing @type: unusable, never fatal
 
 
 def check_schema_depth(page, is_home):
@@ -2954,7 +2972,7 @@ def analyze_social(home_page):
                                  "Add og:image (1200x630) so shared links show a rich preview."))
 
     if r is not None:
-        head_end = r.text.lower().find("</head>")
+        head_end = r.body.lower().find(b"</head>")      # bytes, not characters
         if head_end > 300 * 1024:
             out["findings"].append(f("LOW", "<head> ends beyond the first 300 KB of HTML", "social", 2, 2,
                                      f"</head> at byte ~{head_end // 1024} KB",
@@ -3280,6 +3298,12 @@ def run_audit(start_url, max_pages=15, use_pagespeed=False, sweep=100, probe_ai=
     for pg, (_, src) in zip(pages, page_specs):
         pg["source"] = src
 
+    if pages and (pages[0].get("status") or 0) >= 400:
+        site_findings.append(f("CRITICAL", "The homepage does not load", "crawlability", 5, 2,
+                               f"GET {pages[0]['url']} → HTTP {pages[0]['status']}",
+                               "Everything else in this report is secondary: the site's front door "
+                               "returns an error to crawlers and visitors."))
+
     # ---- sweep: a wider stratified sample of the sitemap, analyzed the same way but
     # reported in aggregate. This is what catches a problem that lives on the 250-page
     # template rather than on the dozen pages that get a full table. ----
@@ -3552,6 +3576,8 @@ def run_audit(start_url, max_pages=15, use_pagespeed=False, sweep=100, probe_ai=
 
     scores, overall = score_categories(all_findings, psi, robots_info)
     conf = confidence_level(psi, pages, robots_info.get("ai_blocked"))
+    if pages and sum(1 for p in all_pages if p.get("status") == 200) < max(1, len(all_pages) // 2):
+        conf = "low"          # most pages did not load: the score describes very little
     if conf == "high" and unseen:
         conf = "medium"
 

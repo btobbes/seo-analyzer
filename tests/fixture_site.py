@@ -366,12 +366,15 @@ def build_broken_site():
     cross_hero = make_png(1200, 600, pad_bytes=340 * 1024)
     thumb = make_png(80, 80, pad_bytes=30 * 1024)               # ~30 KB thumbnail
     square_social = make_png(200, 200)                          # small, not landscape
+    ok_social = make_png(1200, 630)                             # correct share image
+    huge_social = make_png(200, 200, pad_bytes=700 * 1024)      # square AND over 600 KB
 
     # /img/* answers HEAD with 404 while GET succeeds.
     for name in ("t1", "t2", "t3", "t4"):
         s.add("/img/%s.png" % name, route(thumb, ctype=PNG_CTYPE, head_status=404))
-    s.add("/img/social.png", route(square_social, ctype=PNG_CTYPE, head_status=404))
+    s.add("/img/social.png", route(ok_social, ctype=PNG_CTYPE, head_status=404))
     s.add("/img/small.png", route(square_social, ctype=PNG_CTYPE, head_status=404))
+    s.add("/img/social-big.png", route(huge_social, ctype=PNG_CTYPE, head_status=404))
     s.add("/hero-assets/big.png", route(heavy_hero, ctype=PNG_CTYPE))
     s.add("/favicon.ico", route(make_png(32, 32), ctype="image/x-icon"))
 
@@ -386,7 +389,9 @@ def build_broken_site():
     # ---- homepage ----------------------------------------------------------------
     home_head = (
         '<script src="%s/vendor/tag.js"></script>'          # cross-origin, before CSS
-        '<link rel="stylesheet" href="/assets/site.css">' % X
+        '<link rel="stylesheet" href="/assets/site.css">'
+        # 310 KB of inlined CSS pushes </head> past the 300 KB unfurlers read.
+        '<style>/*%s*/</style>' % (X, "A" * (310 * 1024))
     )
     hero_img = ('<img src="%s/cdn/hero-a.jpg" fetchpriority="high" loading="lazy" '
                 'width="1200" height="600" alt="Fixture hero image">' % X)
@@ -406,7 +411,7 @@ def build_broken_site():
         description=("Explore the deliberately broken fixture homepage used by the SEO "
                      "auditor regression suite to reproduce known defects."),
         canonical=B + "/",
-        og_image="/img/social.png",
+        og_image="/img/social-big.png",
         head_extra=home_head,
         jsonld='{"@context":"https://schema.org","@type":"Organization","name":"Broken Fixture"}',
     ), headers={
@@ -559,7 +564,7 @@ def build_broken_site():
         description=("Understand what nosnippet costs a page in search results and in "
                      "AI answers that honour the same control."),
         canonical=B + "/nosnippet/page",
-        robots="nosnippet",
+        robots="nosnippet, noarchive",
         og_image="/img/social.png",
     )))
     s.add("/article/undated", route(page_html(
@@ -592,6 +597,25 @@ def build_broken_site():
         og_image="/img/social.png",
     )))
 
+    # A document past Googlebot's 2 MB fetch limit (the bulk is one HTML comment).
+    s.add("/bigdoc/huge", route(page_html(
+        "Enormous document that exceeds the two megabyte fetch limit",
+        body("<p>" + prose(240, seed=809) + "</p><!--" + "B" * (2200 * 1024) + "-->"),
+        description=("Read the enormous fixture document whose markup runs well past the "
+                     "two megabyte limit a crawler will fetch."),
+        canonical=B + "/bigdoc/huge",
+        og_image="/img/social.png",
+    )))
+    # Answers with Brotli although the request only offered gzip/deflate.
+    s.add("/brotli/forced", route(page_html(
+        "Page returned with a content encoding nobody asked for",
+        body("<p>" + prose(240, seed=810) + "</p>"),
+        description=("See what happens when a server answers with Brotli although the "
+                     "client only offered gzip and deflate."),
+        canonical=B + "/brotli/forced",
+        og_image="/img/social.png",
+    ), headers={"Content-Encoding": "br"}))
+
     # ---- robots, sitemap, llms.txt, well-known ----------------------------------
     s.add("/robots.txt", route(
         "User-agent: *\nAllow: /\n\nSitemap: %s/sitemap.xml\n" % B, ctype=TEXT_CTYPE))
@@ -611,6 +635,8 @@ def build_broken_site():
                 (B + "/nosnippet/page", None),
                 (B + "/article/undated", None),
                 (B + "/repeat/twice", None),
+                (B + "/bigdoc/huge", None),
+                (B + "/brotli/forced", None),
                 (B + "/page", None)]
     s.add("/sitemap.xml", route(_sitemap(entries), ctype=XML_CTYPE))
 
@@ -799,7 +825,8 @@ def build_clean_site():
 # Small purpose-built sites
 # =====================================================================================
 def build_minimal_site(*, robots_text=None, robots_status=200, extra=None,
-                       homepage_headers=None):
+                       homepage_headers=None, robots_ctype=TEXT_CTYPE,
+                       robots_headers=None):
     """A one-page site used by the AI-crawler and robots.txt scenarios."""
     s = FixtureServer().start()
     B = s.base
@@ -828,7 +855,7 @@ def build_minimal_site(*, robots_text=None, robots_status=200, extra=None,
         s.add("/robots.txt", route(
             robots_text if robots_text is not None
             else "User-agent: *\nAllow: /\n\nSitemap: %s/sitemap.xml\n" % B,
-            ctype=TEXT_CTYPE))
+            ctype=robots_ctype, headers=robots_headers))
     s.add("/sitemap.xml", route(_sitemap([(B + "/", "2026-03-01"),
                                           (B + "/page", "2026-03-02")]), ctype=XML_CTYPE))
     for path, r in (extra or {}).items():
@@ -873,4 +900,12 @@ def build_address_site(with_address=True):
                      "email."),
         canonical=B + "/contact",
     )))
+    return s
+
+
+def build_catchall_site(body, ctype=TEXT_CTYPE):
+    """A server that answers EVERY path with the same 200 response — the Worker/SPA
+    catch-all that used to make check_exposed_files cry wolf."""
+    s = FixtureServer().start()
+    s.add_prefix("/", lambda path: route(body, ctype=ctype))
     return s
