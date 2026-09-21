@@ -272,7 +272,10 @@ def ai_block(r):
                 "<p class='status' style='margin:0 0 4px'>What an answer engine can extract, date and attribute "
                 "on each audited page. These are correlational signals, not ranking factors, so they are shown "
                 "rather than scored: self-contained sections under descriptive or question headings, lists and "
-                "tables for facts, a visible date, and schema naming the entity.</p>"
+                "tables for facts, a visible date, and schema naming the entity. Keep this in proportion: the "
+                "largest 2026 studies find off-page signals (brand search demand, referring domains, mentions) "
+                "predict AI citations far better than anything on the page, and AI referrals are about 1% of "
+                "site traffic. Crawler access and server-rendered text are the parts an audit can verify.</p>"
                 "<table class='kv'><thead><tr><th>Page</th><th>Words</th><th>H2/H3</th><th>Question headings</th>"
                 "<th>Lists</th><th>Tables</th><th>Date</th><th>Schema</th></tr></thead>"
                 f"<tbody>{rows}</tbody></table>")

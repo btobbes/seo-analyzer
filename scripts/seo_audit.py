@@ -55,12 +55,12 @@ SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 # Relative importance of each category in the overall score.
 CATEGORY_WEIGHTS = {
     "crawlability": 0.20,
-    "on page": 0.17,
+    "on page": 0.18,
     "performance": 0.15,
-    "ai search": 0.12,
+    "ai search": 0.10,   # AI referrals are ~1% of traffic (2026 studies): never above crawl/CWV
     "schema": 0.10,
     "trust": 0.10,
-    "mobile": 0.08,
+    "mobile": 0.09,
     "social": 0.08,
 }
 CATEGORIES = list(CATEGORY_WEIGHTS.keys())
@@ -75,15 +75,20 @@ CTA_VERBS = {
 
 # AI crawlers that do NOT execute JavaScript — content missing from raw HTML is invisible
 # to them, which increasingly matters for visibility in AI answers.
-AI_CRAWLERS = [
-    "GPTBot", "OAI-SearchBot", "ChatGPT-User",           # OpenAI (training / search / live browse)
-    "ClaudeBot", "Claude-Web", "anthropic-ai",           # Anthropic
-    "PerplexityBot", "Perplexity-User",                  # Perplexity
-    "Google-Extended",                                   # Gemini training opt-out token
-    "Applebot-Extended",                                 # Apple Intelligence
-    "Amazonbot", "meta-externalagent", "Bytespider",     # Amazon / Meta / ByteDance
-    "CCBot", "cohere-ai", "DuckAssistBot",               # Common Crawl / Cohere / DuckDuckGo
-]
+AI_CRAWLER_ROLES = {
+    # search = builds an answer engine's index · user = live fetch for a person ·
+    # train = model training · optout = robots.txt-only token (no crawler of its own)
+    "OAI-SearchBot": "search", "PerplexityBot": "search", "Claude-SearchBot": "search",
+    "MistralAI-Index": "search", "meta-webindexer": "search", "Amzn-SearchBot": "search",
+    "DuckAssistBot": "user", "ChatGPT-User": "user", "Claude-User": "user",
+    "Perplexity-User": "user", "MistralAI-User": "user", "Amzn-User": "user",
+    "GPTBot": "train", "ClaudeBot": "train", "CCBot": "train", "meta-externalagent": "train",
+    "Amazonbot": "train", "Bytespider": "train", "MistralAI-Training": "train",
+    "Google-Extended": "optout", "Applebot-Extended": "optout",
+}
+# Not listed on purpose: cohere-ai (Cohere documents that it runs no crawler), anthropic-ai
+# and Claude-Web (absent from Anthropic's current documentation). Blocking them is harmless.
+AI_CRAWLERS = list(AI_CRAWLER_ROLES)
 
 
 # =================================================================================
@@ -900,6 +905,15 @@ def analyze_page(url):
 
         enc = (r.header("content-encoding") or "").lower()
         ctype = r.header("content-type", "").lower()
+        if "br" in [e.strip() for e in enc.split(",")] or "zstd" in enc:
+            # we only offered gzip/deflate; a server that answers br/zstd anyway ignores
+            # Accept-Encoding, and clients that can't decode it (Facebook's crawler accepts
+            # only gzip and deflate) receive garbage.
+            findings.append(f("MEDIUM", "Server ignores Accept-Encoding", "crawlability", 3, 2,
+                              f"sent 'gzip, deflate', received content-encoding: {enc}",
+                              "Negotiate compression from the request's Accept-Encoding and send "
+                              "Vary: Accept-Encoding. Link-preview crawlers that only accept gzip cannot "
+                              "read a forced Brotli/zstd response."))
         if ("html" in ctype and len(r.body) > 30 * 1024
                 and not any(c in enc for c in ("gzip", "br", "deflate", "zstd"))):
             findings.append(f("MEDIUM", "HTML served without compression", "performance", 3, 1,
@@ -907,6 +921,12 @@ def analyze_page(url):
                               "Enable gzip or Brotli for text responses at your server/CDN — usually cuts "
                               "transfer size 60–80% and speeds first paint."))
 
+        if len(r.body) > 2 * 1024 * 1024:
+            findings.append(f("HIGH", "HTML exceeds Googlebot's 2 MB fetch limit", "crawlability", 5, 3,
+                              f"{len(r.body) / 1048576:.1f} MB uncompressed",
+                              "Googlebot fetches the first 2 MB of an HTML file (uncompressed) and ignores "
+                              "the rest: content, links and structured data past that point are not indexed. "
+                              "Move inlined data/scripts/SVG out of the document."))
         if html_kb > 300:
             findings.append(f("MEDIUM", "Large HTML document", "performance", 3, 3, f"{html_kb} KB of HTML",
                               "Trim inlined JSON/markup; heavy HTML slows parsing and delays LCP."))
@@ -1793,34 +1813,33 @@ def sitemap_meta_findings(meta):
 #   role: "search" = builds an answer engine's search index · "user" = fetches a page
 #   live when a person asks · "train" = collects model-training data.
 AI_AGENT_PROBES = [
-    ("GPTBot", "train", "OpenAI",
-     "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; GPTBot/1.2; +https://openai.com/gptbot"),
     ("OAI-SearchBot", "search", "OpenAI",
-     "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; OAI-SearchBot/1.0; +https://openai.com/searchbot"),
+     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36; compatible; OAI-SearchBot/1.4; +https://openai.com/searchbot"),
     ("ChatGPT-User", "user", "OpenAI",
      "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; ChatGPT-User/1.0; +https://openai.com/bot"),
+    ("GPTBot", "train", "OpenAI",
+     "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; GPTBot/1.4; +https://openai.com/gptbot"),
+    # Anthropic documents the tokens but publishes no full UA strings; WAF rules match the token.
+    ("Claude-SearchBot", "search", "Anthropic", "Mozilla/5.0 (compatible; Claude-SearchBot/1.0; +https://www.anthropic.com)"),
+    ("Claude-User", "user", "Anthropic", "Mozilla/5.0 (compatible; Claude-User/1.0; +Claude-User@anthropic.com)"),
     ("ClaudeBot", "train", "Anthropic",
      "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ClaudeBot/1.0; +claudebot@anthropic.com)"),
-    ("Claude-SearchBot", "search", "Anthropic",
-     "Mozilla/5.0 (compatible; Claude-SearchBot/1.0; +https://www.anthropic.com)"),
-    ("Claude-User", "user", "Anthropic",
-     "Mozilla/5.0 (compatible; Claude-User/1.0; +Claude-User@anthropic.com)"),
     ("PerplexityBot", "search", "Perplexity",
      "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; PerplexityBot/1.0; +https://perplexity.ai/perplexitybot)"),
     ("Perplexity-User", "user", "Perplexity",
      "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Perplexity-User/1.0; +https://perplexity.ai/perplexity-user)"),
     ("Applebot", "search", "Apple",
-     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.1.1 Safari/605.1.15 (Applebot/0.1; +http://www.apple.com/go/applebot)"),
-    ("meta-externalagent", "train", "Meta",
-     "meta-externalagent/1.1 (+https://developers.facebook.com/docs/sharing/webmasters/crawler)"),
-    ("Amazonbot", "search", "Amazon",
-     "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Amazonbot/0.1; +https://developer.amazon.com/support/amazonbot) Chrome/119.0.6045.214 Safari/537.36"),
-    ("CCBot", "train", "Common Crawl",
-     "CCBot/2.0 (https://commoncrawl.org/faq/)"),
-    ("DuckAssistBot", "user", "DuckDuckGo",
-     "DuckAssistBot/1.2; (+http://duckduckgo.com/duckassistbot.html)"),
+     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15 (Applebot/0.1; +http://www.apple.com/go/applebot)"),
+    ("meta-webindexer", "search", "Meta", "meta-webindexer/1.1"),
+    ("meta-externalagent", "train", "Meta", "meta-externalagent/1.1"),
+    ("MistralAI-Index", "search", "Mistral",
+     "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; MistralAI-Index/1.0; +https://docs.mistral.ai/robots)"),
     ("MistralAI-User", "user", "Mistral",
      "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; MistralAI-User/1.0; +https://docs.mistral.ai/robots)"),
+    ("DuckAssistBot", "user", "DuckDuckGo", "DuckAssistBot/1.2; (+http://duckduckgo.com/duckassistbot.html)"),
+    ("Amazonbot", "train", "Amazon",
+     "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Amazonbot/0.1) Chrome/119.0.6045.214 Safari/537.36"),
+    ("CCBot", "train", "Common Crawl", "CCBot/2.0 (https://commoncrawl.org/faq/)"),
     ("Bytespider", "train", "ByteDance",
      "Mozilla/5.0 (Linux; Android 5.0) AppleWebKit/537.36 (KHTML, like Gecko) Mobile Safari/537.36 (compatible; Bytespider; spider-feedback@bytedance.com)"),
 ]
@@ -1828,104 +1847,112 @@ _CHALLENGE_MARKERS = (b"just a moment", b"attention required", b"cf-chl", b"capt
                       b"request was blocked", b"access denied", b"bot detected")
 
 
-def probe_ai_agents(home_url, robots_text=""):
-    """Request the homepage as each AI crawler. Returns (findings, health_rows, matrix)."""
-    base = fetch(home_url, max_bytes=8192, ua=BROWSER_UA)
-    if base.status != 200:
+def probe_ai_agents(home_url, robots_text="", inner_url=None):
+    """Request the homepage (and one inner page) as each AI crawler. Bot rules can vary
+    page by page — Cloudflare can block AI bots only on pages that carry ads — so one URL
+    does not generalize. Returns (findings, health_rows, matrix)."""
+    targets = [home_url] + ([inner_url] if inner_url and inner_url != home_url else [])
+    targets = [t for t in targets if fetch(t, max_bytes=8192, ua=BROWSER_UA).status == 200]
+    if not targets:
         return [], [("AI crawler edge access", "not tested (browser baseline was not 200)")], []
+
+    def verdict_for(r):
+        body = (r.body or b"")[:4096].lower()
+        if r.status == 402:
+            return "pay-per-crawl (402)"
+        if r.header("cf-mitigated"):
+            return f"challenged ({r.status})"
+        if r.status == 200 and not any(m in body for m in _CHALLENGE_MARKERS[:3]):
+            return "ok"
+        if r.status in (401, 403, 406, 429, 503) or any(m in body for m in _CHALLENGE_MARKERS):
+            return f"refused ({r.status})"
+        return "no response" if r.status == 0 else f"HTTP {r.status}"
 
     def one(spec):
         token, role, op, ua = spec
-        r = fetch(home_url, max_bytes=8192, ua=ua)
-        body = (r.body or b"")[:4096].lower()
-        if r.status == 200 and not any(m in body for m in _CHALLENGE_MARKERS[:3]):
-            verdict = "ok"
-        elif r.status == 402:
-            verdict = "pay-per-crawl (402)"
-        elif r.status in (401, 403, 406, 429, 503) or any(m in body for m in _CHALLENGE_MARKERS):
-            verdict = f"refused ({r.status})"
-        elif r.status == 0:
-            verdict = "no response"
-        else:
-            verdict = f"HTTP {r.status}"
-        return {"agent": token, "role": role, "operator": op, "status": r.status,
-                "verdict": verdict, "mitigated": r.header("cf-mitigated", "")}
+        vs = [verdict_for(fetch(t, max_bytes=8192, ua=ua)) for t in targets]
+        bad = [v for v in vs if v != "ok"]
+        v = "ok" if not bad else (bad[0] if len(bad) == len(vs) else bad[0] + " on some pages")
+        return {"agent": token, "role": role, "operator": op, "verdict": v}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
         matrix = list(ex.map(one, AI_AGENT_PROBES))
 
     refused = [m for m in matrix if m["verdict"] != "ok"]
+    caveat = (" This is a differential response by User-Agent seen from an ordinary IP; a firewall "
+              "that verifies crawler IPs could still admit the real bot, so confirm in the CDN/WAF "
+              "dashboard.")
     findings = []
     if refused and len(refused) == len(matrix):
-        # Everything non-browser is refused — that is generic bot protection, and it
-        # almost certainly verifies crawler IPs, so a spoof test can't tell us more.
         findings.append(f("MEDIUM", "Site refuses every non-browser user-agent we tried", "ai search", 3, 2,
-                          f"all {len(matrix)} AI crawler user-agents refused; browser UA got 200",
+                          f"all {len(matrix)} AI crawler user-agents refused; a browser UA got 200",
                           "Generic bot protection is active. It may admit verified crawler IPs, which "
-                          "this test cannot imitate — check the CDN/WAF bot settings and confirm "
-                          "verified AI search crawlers are allowed."))
+                          "this test cannot imitate. Check the CDN/WAF bot settings and confirm "
+                          "verified search and AI-search crawlers are allowed."))
     elif refused:
         named = {a.lower() for a in re.findall(r"(?im)^\s*user-agent\s*:\s*([^\s#]+)", robots_text)}
         live = [m for m in refused if m["role"] in ("search", "user")]
-        train = [m for m in refused if m["role"] == "train"]
         invited = [m["agent"] for m in refused if m["agent"].lower() in named]
         obs = "; ".join(f"{m['agent']} ({m['role']}) → {m['verdict']}" for m in refused)
         obs += f" · {len(matrix) - len(refused)} other agents and a browser got 200"
         tail = (" robots.txt names " + ", ".join(invited) + " in its own rules, so the file and "
-                "the edge disagree." if invited else "")
+                "the edge disagree: make them say the same thing." if invited else "")
         if live:
             findings.append(f("HIGH", "AI search / assistant crawlers are refused at the edge", "ai search", 5, 1,
-                              trunc(obs, 260),
-                              "These agents fetch pages to answer people's questions and to build answer-engine "
-                              "indexes; refusing them removes the site from those answers. This is a CDN/WAF "
-                              "setting (e.g. Cloudflare Security → Bots → AI bots, or a custom rule), not "
-                              "robots.txt. Allow them, then re-run." + tail +
-                              " (Tested by user-agent from a non-crawler IP — confirm in the dashboard.)"))
-        elif train:
-            findings.append(f("HIGH" if invited else "MEDIUM",
-                              "AI training crawlers are refused at the edge", "ai search", 4, 1,
-                              trunc(obs, 260),
-                              "Blocking training crawlers is a legitimate policy choice, but make it a "
-                              "deliberate one: these crawls (and Common Crawl, which most open models "
-                              "train on) are how models come to know a brand exists without being "
-                              "prompted. Many CDNs now enable this block by default. If you want them in, "
-                              "lift the CDN/WAF block; if not, say so in robots.txt so the two agree." + tail +
-                              " (Tested by user-agent from a non-crawler IP — confirm in the dashboard.)"))
+                              trunc(obs, 300),
+                              "Search-index and user-fetch agents are how a page gets retrieved and cited "
+                              "in an AI answer; refusing them removes the site from those answers today. "
+                              "This is a CDN/WAF setting (for example Cloudflare AI Crawl Control or a custom "
+                              "rule), not robots.txt." + tail + caveat))
+        else:
+            findings.append(f("MEDIUM", "AI training crawlers are refused at the edge", "ai search", 3, 1,
+                              trunc(obs, 300),
+                              "Blocking training crawlers is a legitimate choice, and several CDNs now make "
+                              "it the default for new sites, so check that it is YOUR choice. Training crawls "
+                              "and Common Crawl are how models come to know a brand without being prompted; "
+                              "the effect on traffic is indirect. Search and user-fetch agents are being "
+                              "served, which matters more." + tail + caveat))
     ok_n = len(matrix) - len(refused)
     health = [("AI crawler edge access",
-               f"{ok_n}/{len(matrix)} agents served 200"
+               f"{ok_n}/{len(matrix)} agents served 200 on {len(targets)} URL(s)"
                + (" · refused: " + ", ".join(m["agent"] for m in refused) if refused else ""))]
     return findings, health, matrix
 
 
-def robots_platform_signals(text):
-    """Things in robots.txt that are not allow/disallow: CDN-managed blocks and
-    Content-Signal (AI usage preference) lines."""
-    low = text.lower()
-    managed = "cloudflare managed" in low
-    signals = re.findall(r"(?im)^\s*content-signal\s*:\s*(.+)$", text)
+def robots_platform_signals(text, resp=None):
+    """Things in robots.txt that are not allow/disallow: a CDN-managed block, Cloudflare
+    Content-Signal lines, and IETF AI-preference (Content-Usage, draft-ietf-aipref) lines.
+    An absent signal neither grants nor restricts anything, so only explicit 'no' is flagged."""
+    managed = bool(re.search(r"#\s*begin cloudflare managed content", text, re.I))
+    cs_lines = re.findall(r"(?im)^\s*content-signal\s*:\s*(.+)$", text)
+    cu_lines = re.findall(r"(?im)^\s*content-usage\s*:\s*(.+)$", text)
+    if resp is not None and resp.header("content-usage"):
+        cu_lines.append(resp.header("content-usage"))
     parsed = {}
-    for line in signals:
-        for part in line.split(","):
-            k, _, v = part.strip().partition("=")
-            if k and v:
-                parsed.setdefault(k.strip().lower(), set()).add(v.strip().lower())
+    for line in cs_lines + cu_lines:
+        for k, v in re.findall(r"([a-z-]+)\s*=\s*([a-z]+)", line.lower()):
+            parsed.setdefault(k, set()).add(v)
+    no = lambda key: bool(parsed.get(key, set()) & {"no", "n"})
+    shown = "; ".join((cs_lines + cu_lines))[:160]
     findings = []
-    if "no" in parsed.get("search", ()):
-        findings.append(f("HIGH", "robots.txt Content-Signal says search=no", "crawlability", 4, 1,
-                          "Content-Signal: " + "; ".join(signals)[:160],
+    if no("search"):
+        findings.append(f("HIGH", "robots.txt AI-preference signal says search=no", "crawlability", 4, 1, shown,
                           "search=no asks crawlers not to build a search index from the site. Unless "
-                          "that is intended, change it to search=yes (CDN-managed robots.txt settings "
-                          "often add this line)."))
-    if "no" in parsed.get("ai-input", ()):
-        findings.append(f("MEDIUM", "robots.txt Content-Signal says ai-input=no", "ai search", 3, 1,
-                          "Content-Signal: " + "; ".join(signals)[:160],
-                          "ai-input=no asks AI systems not to use the content in generated answers "
-                          "(retrieval / grounding). Set ai-input=yes if you want to be cited."))
+                          "that is intended, set it to yes (CDN-managed robots.txt settings can add it)."))
+    if no("ai-input") or no("ai-use"):
+        findings.append(f("MEDIUM", "robots.txt AI-preference signal opts out of AI answers", "ai search", 3, 1, shown,
+                          "ai-input=no (Content-Signal) / ai-use=n (Content-Usage) asks AI systems not to "
+                          "use the content when generating answers. Set it to yes if you want to be cited."))
+    if managed:
+        findings.append(f("INFO", "robots.txt is partly written by the CDN", "crawlability", 2, 1,
+                          "'# BEGIN Cloudflare Managed content' block is prepended to the origin's file",
+                          "The file crawlers receive is not the one in your repository. Review the managed "
+                          "block (it disallows several AI crawlers and sets Content-Signal) in the Cloudflare "
+                          "dashboard; RFC 9309 group merging means your own Allow rules can override it."))
     row = ("robots.txt platform signals",
            (("CDN-managed block present · " if managed else "")
-            + ("Content-Signal: " + "; ".join(f"{k}={'/'.join(sorted(v))}" for k, v in parsed.items())
-               if parsed else "no Content-Signal line")))
+            + ("; ".join(f"{k}={'/'.join(sorted(v))}" for k, v in parsed.items())
+               if parsed else "no Content-Signal / Content-Usage line")))
     return findings, row
 
 
@@ -2090,8 +2117,8 @@ def check_link_architecture(pages, crawled_urls, sm_urls, limit=40):
 
 
 def check_head_parity(home_page, extra_urls):
-    """Some frameworks route only GET. Link checkers, uptime monitors, several social
-    unfurlers and CDN validators send HEAD first and conclude the resource is gone."""
+    """Some frameworks route only GET. Link checkers, uptime monitors and audit tools send
+    HEAD and conclude the resource is gone. (No social platform documents using HEAD.)"""
     urls = [home_page["final_url"] or home_page["url"]] + [u for u in extra_urls if u]
     bad = []
     for u in list(dict.fromkeys(urls))[:8]:
@@ -2102,10 +2129,12 @@ def check_head_parity(home_page, extra_urls):
         if h.status >= 400:
             bad.append(f"{urllib.parse.urlparse(u).path or '/'} GET 200 / HEAD {h.status}")
     if bad:
-        return [f("MEDIUM", "HEAD requests fail where GET succeeds", "crawlability", 3, 1,
+        return [f("LOW", "HEAD requests fail where GET succeeds", "crawlability", 2, 1,
                   trunc("; ".join(bad), 220),
-                  "Answer HEAD exactly like GET minus the body. Link checkers, monitors and some "
-                  "preview bots send HEAD first and will report these URLs (often images) as broken.")]
+                  "Answer HEAD exactly like GET minus the body (RFC 9110). Link checkers, uptime "
+                  "monitors, `curl -I` and many audit tools send HEAD and will report these URLs "
+                  "(often every image on the site) as broken. Search crawlers and the documented "
+                  "social unfurlers use GET, so this is a tooling and monitoring problem, not a ranking one.")]
     return []
 
 
@@ -2334,7 +2363,14 @@ def _doh(name, rtype):
         if r.status == 200:
             try:
                 data = json.loads(r.text)
-                return [a.get("data", "") for a in data.get("Answer", []) or []]
+                out = []
+                for a in data.get("Answer", []) or []:
+                    d = a.get("data", "")
+                    if rtype == "TXT":      # long TXT = several quoted chunks; join with NO separator
+                        chunks = re.findall(r'"((?:[^"\\]|\\.)*)"', d)
+                        d = "".join(chunks) if chunks else d.strip('"')
+                    out.append(d)
+                return out
             except (json.JSONDecodeError, ValueError):
                 continue
     return None
@@ -2402,12 +2438,13 @@ def check_contact_domains(pages, site_host, security_txt=""):
         mx = _doh(dom, "MX")
         if mx is None:
             continue
-        if not mx:
-            a = _doh(dom, "A")
-            if a is not None and not a:
-                dead.append(f"{dom} (no MX or A record; used on {sorted(where)[0]})")
-            elif a is not None:
-                dead.append(f"{dom} (no MX record; used on {sorted(where)[0]})")
+        if any(re.match(r"^0\s+\.$", m.strip()) for m in mx):
+            dead.append(f"{dom} (Null MX: the domain declares it accepts no mail; used on {sorted(where)[0]})")
+        elif not mx:
+            # No MX is not undeliverable by itself: RFC 5321 falls back to the A/AAAA record.
+            a, aaaa = _doh(dom, "A"), _doh(dom, "AAAA")
+            if a is not None and aaaa is not None and not a and not aaaa:
+                dead.append(f"{dom} (no MX, A or AAAA record; used on {sorted(where)[0]})")
     findings = []
     if dead:
         findings.append(f("MEDIUM", "Published contact address uses a domain that cannot receive mail", "trust", 3, 1,
@@ -2425,16 +2462,24 @@ def check_email_auth(site_host, mail_domains):
     spf = _doh(dom, "TXT")
     if dmarc is None or spf is None:
         return [], ("Email authentication", "could not query DNS")
-    has_dmarc = any("v=dmarc1" in t.lower() for t in dmarc)
+    rec = next((t for t in dmarc if "v=dmarc1" in t.lower()), "")
+    has_dmarc = bool(rec)
     has_spf = any("v=spf1" in t.lower() for t in spf)
     findings = []
+    if rec and "rua=" not in rec.lower():
+        findings.append(f("LOW", "DMARC policy has no reporting address", "trust", 2, 1, trunc(rec, 120),
+                          "Add rua=mailto:… Without it receivers send no aggregate reports, so a "
+                          "misconfigured sender (a new CRM, a newsletter tool) fails silently."))
     if not has_dmarc or not has_spf:
         missing = [n for n, ok in (("SPF", has_spf), ("DMARC", has_dmarc)) if not ok]
         findings.append(f("LOW", "Sending domain lacks " + " and ".join(missing), "trust", 2, 1,
                           f"{dom}: " + ", ".join(missing) + " record not found",
                           "Publish SPF and a DMARC policy. Without them, mail from the address you "
                           "publish is easy to spoof and more likely to land in spam."))
-    return findings, ("Email authentication", f"{dom}: SPF {'✓' if has_spf else '✗'} · DMARC {'✓' if has_dmarc else '✗'}")
+    note = " · uses pct (historic since RFC 9989)" if re.search(r"\bpct\s*=", rec, re.I) else ""
+    return findings, ("Email authentication",
+                      f"{dom}: SPF {'✓' if has_spf else '✗'} · DMARC {'✓' if has_dmarc else '✗'}"
+                      f"{' (no rua)' if rec and 'rua=' not in rec.lower() else ''}{note} · DKIM not checkable")
 
 
 def check_security_txt(base):
@@ -2463,10 +2508,17 @@ _EXPOSED = [("/.git/HEAD", rb"^ref:\s|^[0-9a-f]{40}\s*$", "Git repository metada
 
 
 def check_exposed_files(base):
+    """Four gates before crying wolf: exactly 200, not HTML, a format-specific signature,
+    and a body that differs from a random-path control (catch-all routes and Worker 404
+    pages answer every path identically)."""
+    control = fetch(normalize(base, "/.seo-audit-control-7f3k9/HEAD"), max_bytes=2048)
     hits = []
     for path, sig, label in _EXPOSED:
         r = fetch(normalize(base, path), max_bytes=2048)
-        if r.status == 200 and b"<html" not in r.body[:300].lower() and re.search(sig, r.body[:2048]):
+        if control.status == 200 and control.body[:2048] == r.body[:2048]:
+            continue
+        if (r.status == 200 and "html" not in r.header("content-type", "").lower()
+                and b"<html" not in r.body[:300].lower() and re.search(sig, r.body[:2048])):
             hits.append(f"{path} ({label})")
     if hits:
         return [f("CRITICAL", "Private files are publicly downloadable", "trust", 5, 1, "; ".join(hits),
@@ -2498,16 +2550,18 @@ def check_hsts_quality(home_page):
 # Types whose Google rich results were withdrawn or restricted. Markup is harmless, but
 # nobody should expect a SERP feature from it. (Dates per Google Search Central.)
 RETIRED_RICH_RESULTS = {
-    "HowTo": "rich result removed (Sept 2023)",
-    "FAQPage": "rich result limited to well-known government and health sites (Aug 2023)",
-    "SpecialAnnouncement": "rich result retired (2025)",
-    "ClaimReview": "rich result retired (2025)",
-    "VehicleListing": "rich result retired (2025)",
-    "EstimatedSalary": "rich result retired (2025)",
-    "LearningVideo": "rich result retired (2025)",
-    "CourseInfo": "rich result retired (2025)",
-    "BookAction": "rich result retired (2025)",
+    "FAQPage": "FAQ rich results ended 2026-05-07",
+    "HowTo": "HowTo rich results ended 2023-09-13",
+    "SpecialAnnouncement": "rich result retired 2025",
+    "ClaimReview": "fact-check rich result retired 2025",
+    "VehicleListing": "rich result retired 2025",
+    "EstimatedSalary": "rich result retired 2025",
+    "LearningVideo": "rich result retired 2025",
+    "Quiz": "practice-problems rich result retired 2026",
+    "SearchAction": "sitelinks search box retired 2024-11-21",
 }
+# (Book actions and Course list survive; Course *info* did not. Dataset markup only feeds
+# Dataset Search. Markup for a retired feature is inert, never an error.)
 _SELF_SERVING = {"LocalBusiness", "Organization", "Restaurant", "Store", "Corporation",
                  "ProfessionalService", "MedicalBusiness", "LodgingBusiness", "TouristAttraction"}
 
@@ -2581,17 +2635,19 @@ def check_schema_depth(page, is_home):
             if len(missing) >= 2:
                 findings.append(f("LOW", "Homepage Organization schema is thin", "schema", 3, 1,
                                   "missing: " + ", ".join(missing),
-                                  "Put the full entity definition on the homepage node: legalName, logo, "
-                                  "sameAs, contact, address, foundingDate (and founder). For a new or "
-                                  "little-known brand this is the cheapest way to tell search and answer "
-                                  "engines who stands behind the site."))
+                                  "None of these is required by Google, so this is about disambiguation, not "
+                                  "eligibility: a new or little-known brand should state its legalName, logo, "
+                                  "sameAs, contact, address and foundingDate once, on the homepage node, and "
+                                  "show the same facts in visible text. Do not expect schema alone to raise "
+                                  "AI citations; controlled studies find no such lift."))
     all_types = set().union(*[_types(n) for n in nodes]) if nodes else set()
     retired = sorted(all_types & set(RETIRED_RICH_RESULTS))
     if retired:
         findings.append(f("INFO", "Schema types that no longer earn a Google rich result", "schema", 1, 1,
                           "; ".join(f"{t}: {RETIRED_RICH_RESULTS[t]}" for t in retired),
-                          "No action required — the markup still describes the page to machines. Just "
-                          "don't count on a SERP feature from it, and keep it matching visible content."))
+                          "No action required. The markup is inert, not an error, but it earns no SERP "
+                          "feature, and controlled studies find no lift in AI citations from adding "
+                          "schema either. Keep it only if it matches visible content."))
     return findings
 
 
@@ -2627,6 +2683,12 @@ def check_answer_readiness(page):
     elif (m := re.search(r"max-snippet\s*:\s*(\d+)", robots)) and 0 < int(m.group(1)) < 50:
         findings.append(f("LOW", "Snippet length is tightly capped", "ai search", 2, 1, m.group(0),
                           "A very small max-snippet limits how much of the page search and AI features can quote."))
+    if re.search(r"\b(noarchive|nocache)\b", robots):
+        findings.append(f("LOW", "noarchive / nocache limits Bing Chat and Copilot", "ai search", 2, 1,
+                          trunc(robots.strip(), 120),
+                          "Google ignores these directives now, but Bing gives them AI meaning: noarchive = "
+                          "do not link the page in Chat and Copilot, nocache = show only URL, title and "
+                          "snippet. Remove them unless that is the intent."))
     words = p.word_count
     if p.nosnippet_attrs and words and p.nosnippet_attrs >= 5:
         findings.append(f("LOW", "Many elements are marked data-nosnippet", "ai search", 2, 1,
@@ -2702,7 +2764,9 @@ def check_entity_transparency(pages, home_page):
 
 def check_llms_txt(base, llms_resp):
     """Validate llms.txt against the llmstxt.org shape and test the URLs it advertises.
-    Everything here is LOW/INFO: no answer engine has confirmed it reads the file."""
+    Everything here is INFO and never scored: a May 2026 log study of 137,210 domains found
+    97% of llms.txt files got zero requests and no AI bot probing for one; Google says it
+    does not use such files. The file is public, though, so wrong URLs in it are worth fixing."""
     text = llms_resp.text
     lines = [l for l in text.splitlines() if l.strip()]
     findings, notes = [], []
@@ -2731,10 +2795,10 @@ def check_llms_txt(base, llms_resp):
             elif can and can.rstrip("/") != r.final_url.rstrip("/"):
                 noncanon.append(u + " (canonical elsewhere)")
     if bad:
-        findings.append(f("LOW", "llms.txt lists URLs that don't resolve", "ai search", 2, 1,
+        findings.append(f("INFO", "llms.txt lists URLs that don't resolve", "ai search", 2, 1,
                           trunc("; ".join(bad[:4]), 200), "Fix or remove the dead links."))
     if noncanon:
-        findings.append(f("LOW", "llms.txt points AI agents at non-canonical URLs", "ai search", 2, 1,
+        findings.append(f("INFO", "llms.txt points at non-canonical URLs", "ai search", 2, 1,
                           trunc("; ".join(noncanon[:4]), 200),
                           "List the same canonical URLs you want search engines to index, so citations "
                           "and search results agree on one address per page."))
@@ -2880,14 +2944,23 @@ def analyze_social(home_page):
                         "Use a 1200x630 (1.91:1) image so it isn't cropped on Facebook/LinkedIn."))
             metrics.append(("Image size", f"{info['size'] // 1024} KB"))
             metrics.append(("Image type", info["mime"] or "unknown"))
-            if info["size"] > 1024 * 1024:
-                out["findings"].append(f("LOW", "Social image over 1 MB", "social", 2, 1,
+            if info["size"] > 600 * 1024:
+                out["findings"].append(f("LOW", "Share image is over 600 KB", "social", 2, 1,
                                          f"{info['size'] // 1024} KB",
-                                         "Compress the share image; large files slow link unfurling."))
+                                         "WhatsApp documents a 600 KB ceiling for og:image (LinkedIn allows 5 MB). "
+                                         "A 1200×630 JPEG under 600 KB satisfies every documented platform limit at once."))
     else:
         out["findings"].append(f("MEDIUM", "No Open Graph image", "social", 3, 2, "og:image missing",
                                  "Add og:image (1200x630) so shared links show a rich preview."))
 
+    if r is not None:
+        head_end = r.text.lower().find("</head>")
+        if head_end > 300 * 1024:
+            out["findings"].append(f("LOW", "<head> ends beyond the first 300 KB of HTML", "social", 2, 2,
+                                     f"</head> at byte ~{head_end // 1024} KB",
+                                     "WhatsApp only reads link-preview tags within the first 300 KB, and other "
+                                     "unfurlers fetch a limited byte range too. Move inlined CSS/JS/JSON below "
+                                     "the meta tags or out of the document."))
     if title:
         metrics.append(("Title length", f"{len(title)} chars"))
     if desc:
@@ -3145,6 +3218,13 @@ def run_audit(start_url, max_pages=15, use_pagespeed=False, sweep=100, probe_ai=
                                f"GET /robots.txt → HTTP {robots_resp.status}",
                                "Google treats a robots.txt that answers 5xx as 'disallow everything' and "
                                "stops crawling the site until it recovers. Serve 200 (or 404 if you have none)."))
+    elif robots_found and ("html" in robots_resp.header("content-type", "").lower()
+                           or robots_resp.body.lstrip()[:1] == b"<"):
+        site_findings.append(f("HIGH", "robots.txt is an HTML page", "crawlability", 4, 1,
+                               f"content-type: {robots_resp.header('content-type') or 'unknown'}",
+                               "A catch-all route is answering /robots.txt with the site shell. Crawlers "
+                               "cannot parse it, so none of your rules (or your Sitemap line) apply. Serve a "
+                               "real text/plain robots.txt."))
     elif not robots_found:
         site_findings.append(f("MEDIUM", "robots.txt not found", "crawlability", 3, 1, "/robots.txt missing",
                                "Add a robots.txt that allows crawling and points to your sitemap."))
@@ -3164,18 +3244,32 @@ def run_audit(start_url, max_pages=15, use_pagespeed=False, sweep=100, probe_ai=
         site_findings.append(f("CRITICAL", "robots.txt blocks all crawlers", "crawlability", 5, 1,
                                "User-agent: * Disallow: /",
                                "Remove the site-wide Disallow so search engines can index the site."))
+    if robots_found and len(robots_resp.body) > 500 * 1024:
+        site_findings.append(f("MEDIUM", "robots.txt exceeds 500 KiB", "crawlability", 3, 2,
+                               f"{len(robots_resp.body) // 1024} KiB",
+                               "Google and RFC 9309 parsers stop reading at 500 KiB; rules past that point are ignored."))
     if robots_info.get("ai_blocked"):
         agents = sorted(set(robots_info["ai_blocked"]))
-        site_findings.append(f("LOW", "robots.txt blocks AI crawlers", "ai search", 2, 1,
-                               ", ".join(agents) + " disallowed",
-                               "Allow these crawlers if you want this content cited in AI answers "
-                               "(ChatGPT, Claude, Perplexity…); keep the block only if it's deliberate policy."))
-    if not llms_found:
-        site_findings.append(f("INFO", "No llms.txt file", "ai search", 1, 1, "/llms.txt not found",
-                               "Optional/emerging: an llms.txt at the site root offers AI agents a curated "
-                               "content index. No major answer engine has confirmed it reads the file, so "
-                               "treat it as low priority — crawler access, server-rendered content and "
-                               "clear entity information matter far more."))
+        live = [a for a in agents if AI_CRAWLER_ROLES.get(a) in ("search", "user")]
+        if live:
+            site_findings.append(f("MEDIUM", "robots.txt blocks AI search crawlers", "ai search", 4, 1,
+                                   ", ".join(live) + " disallowed"
+                                   + (" (also: " + ", ".join(a for a in agents if a not in live) + ")" if len(agents) > len(live) else ""),
+                                   "These agents build answer-engine search indexes or fetch a page when a "
+                                   "person asks about it. Blocking them removes the site from those answers. "
+                                   "If the goal was to stay out of model training, block only the training "
+                                   "crawlers (GPTBot, ClaudeBot, CCBot, Google-Extended…) and allow these."))
+        else:
+            site_findings.append(f("LOW", "robots.txt blocks AI training crawlers", "ai search", 2, 1,
+                                   ", ".join(agents) + " disallowed",
+                                   "A legitimate policy choice; keep it if deliberate. Two things to know: "
+                                   "Google-Extended does not affect AI Overviews or AI Mode (Googlebot and "
+                                   "snippet controls do), though sites blocking it have been measured getting "
+                                   "no Gemini citations; and Applebot-Extended is an opt-out token, not a crawler."))
+    # A missing llms.txt is never a finding: 2026 server-log studies show AI crawlers do not
+    # request it, and Google documents that it does not use such files. We only validate
+    # one that exists (INFO), because a file that points at dead or non-canonical URLs is
+    # still a public mistake.
     if sitemap_found:
         site_findings.extend(sitemap_meta_findings(sm_meta))
 
@@ -3268,8 +3362,8 @@ def run_audit(start_url, max_pages=15, use_pagespeed=False, sweep=100, probe_ai=
             pages[0]["findings"].append(f(
                 "LOW", "No Organization/WebSite schema on homepage", "schema", 3, 2,
                 "Neither Organization nor WebSite JSON-LD found on the homepage",
-                "Add Organization (with logo and sameAs links to your social/profile URLs) and WebSite "
-                "JSON-LD so search and AI engines can identify and trust the entity behind the site."))
+                "Add Organization (with logo and sameAs links to your profile URLs) and WebSite "
+                "JSON-LD so search engines can tie the site to one entity (site name, logo, knowledge panel)."))
 
     any_rendered = any(p.get("word_count", 0) > 0 for p in pages)
     if (any_rendered and len(pages) >= 3
@@ -3350,7 +3444,7 @@ def run_audit(start_url, max_pages=15, use_pagespeed=False, sweep=100, probe_ai=
             health.append(check_markdown_negotiation(home_url))
 
     if robots_found:
-        rp_f, rp_h = robots_platform_signals(robots_resp.text)
+        rp_f, rp_h = robots_platform_signals(robots_resp.text, robots_resp)
         site_findings.extend(rp_f)
         health.append(rp_h)
     if llms_found:
@@ -3358,12 +3452,13 @@ def run_audit(start_url, max_pages=15, use_pagespeed=False, sweep=100, probe_ai=
         site_findings.extend(ll_f)
         health.append(ll_h)
     else:
-        health.append(("llms.txt", "not found (optional)"))
+        health.append(("llms.txt", "not present (no action needed; AI crawlers are not observed requesting it)"))
     health.append(("AI crawler robots.txt rules",
                    ("blocked: " + ", ".join(sorted(set(robots_info["ai_blocked"]))))
                    if robots_info.get("ai_blocked") else "no AI crawlers disallowed"))
     if probe_ai and pages and pages[0].get("status") == 200:
-        ai_f, ai_h, ai_matrix = probe_ai_agents(home_url, robots_resp.text if robots_found else "")
+        inner = next((p["url"] for p in pages[1:] if p.get("status") == 200), None)
+        ai_f, ai_h, ai_matrix = probe_ai_agents(home_url, robots_resp.text if robots_found else "", inner)
         site_findings.extend(ai_f)
         health.extend(ai_h)
 
@@ -3406,8 +3501,8 @@ def run_audit(start_url, max_pages=15, use_pagespeed=False, sweep=100, probe_ai=
         if missing_local:
             site_findings.append(f("LOW", "LocalBusiness schema incomplete", "schema", 2, 1,
                                    "missing: " + ", ".join(missing_local),
-                                   "Fill in telephone, full address, geo, and openingHours in the "
-                                   "LocalBusiness JSON-LD — complete data feeds the map pack and AI answers."))
+                                   "Google requires only name and address; telephone, geo and openingHours are "
+                                   "recommended and make the listing consistent with your Business Profile."))
     elif has_local_signals:
         site_findings.append(f("MEDIUM", "No LocalBusiness schema for a local business", "schema", 3, 2,
                                "Site shows local signals (phone / Google Maps links) but no "
@@ -3432,6 +3527,10 @@ def run_audit(start_url, max_pages=15, use_pagespeed=False, sweep=100, probe_ai=
                               "count": n_aff, "templates": tmpls, "example": v["urls"][0]})
         if (cat, title) not in deep_keys:
             fi = dict(v["f"])
+            # Prevalence: a problem on under 10% of swept pages is a page problem, not a
+            # template problem, so it scores one step lower (CRITICAL is never softened).
+            if n_aff < max(2, len(sweep_pages) * 0.1) and fi["severity"] in ("HIGH", "MEDIUM"):
+                fi["severity"] = {"HIGH": "MEDIUM", "MEDIUM": "LOW"}[fi["severity"]]
             fi["observed"] = (f"{n_aff} of {len(sweep_pages)} swept sitemap pages "
                               f"(templates: {', '.join(tmpls[:3])}) · e.g. {urllib.parse.urlparse(v['urls'][0]).path} "
                               f"· {trunc(str(v['f']['observed']), 90)}")
