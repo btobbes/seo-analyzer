@@ -21,7 +21,7 @@ SEV_BG = {
 SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 
 
-def top_priorities(r, limit=6):
+def top_priorities(r, limit=8):
     """The highest-leverage fixes across the whole audit: most severe first, then
     lowest effort. Deduplicated by title (site-wide issues repeat per page) and with
     INFO items excluded — this is the 'do these first' list."""
@@ -210,10 +210,87 @@ def health_block(r):
     trs = "".join(f"<tr><td>{esc(k)}</td><td>{esc(v)}</td></tr>" for k, v in rows)
     return ("<h2>Site health checks</h2>"
             "<p class='status' style='margin:0 0 4px'>One-shot infrastructure checks: host-variant "
-            "redirects (http/https, www/non-www), 404 handling, TLS certificate, contact/trust pages, "
-            "a sample of internal links, and the measurement stack.</p>"
+            "redirects, 404 handling, TLS certificate and domain registration, contact/trust pages, where "
+            "internal links really point, robots.txt platform signals, email authentication, and the "
+            "measurement stack.</p>"
             "<table class='kv'><thead><tr><th>Check</th><th>Result</th></tr></thead><tbody>"
             + trs + "</tbody></table>")
+
+
+def coverage_block(r):
+    cov = r.get("coverage") or []
+    if not cov:
+        return ""
+    trs = "".join(
+        f"<tr><td><code>{esc(c['template'])}</code></td><td>{c['urls']}</td>"
+        f"<td style='color:{'#b91c1c' if not c['audited'] and c['urls'] >= 5 else 'inherit'}'>{c['audited']}</td></tr>"
+        for c in cov[:12])
+    gaps = r.get("coverage_gaps") or []
+    note = (f"<p class='status' style='color:#b91c1c'>Not sampled at all: {esc(', '.join(gaps))} — raise "
+            "--max-pages / --sweep before trusting the score for those sections.</p>") if gaps else ""
+    dup = {d["template"]: d for d in (r.get("duplication") or [])}
+    extra = ""
+    if dup:
+        rows = "".join(f"<tr><td><code>{esc(t)}</code></td><td>{d['pages']}</td>"
+                       f"<td>{d['median_unique_words']}</td><td>{d['near_duplicate_pairs']}</td></tr>"
+                       for t, d in dup.items())
+        extra = ("<table class='kv'><thead><tr><th>Template</th><th>Pages compared</th>"
+                 "<th>Median unique words / page</th><th>Near-duplicate pairs</th></tr></thead>"
+                 f"<tbody>{rows}</tbody></table>")
+    return ("<h2>Coverage by URL template</h2>"
+            f"<p class='status' style='margin:0 0 4px'>The sitemap lists {r.get('sitemap_url_count', 0)} URLs. "
+            f"{r.get('page_count', 0)} pages got a full per-page table and {r.get('sweep_count', 0)} more were "
+            "analyzed and reported in aggregate, sampled across URL templates so a large section can't hide "
+            "behind the first few sitemap entries. A score only describes the templates it looked at.</p>"
+            "<table class='kv'><thead><tr><th>Template (path shape)</th><th>URLs in sitemap</th>"
+            f"<th>Audited</th></tr></thead><tbody>{trs}</tbody></table>{note}{extra}")
+
+
+def ai_block(r):
+    m = r.get("ai_matrix") or []
+    if not m:
+        return ""
+    role = {"search": "answer-engine index", "user": "live fetch for a user", "train": "model training"}
+    trs = "".join(
+        f"<tr><td>{esc(a['agent'])}</td><td>{esc(a['operator'])}</td><td>{esc(role.get(a['role'], a['role']))}</td>"
+        f"<td style='color:{'#15803d' if a['verdict'] == 'ok' else '#b91c1c'};font-weight:600'>"
+        f"{'served 200' if a['verdict'] == 'ok' else esc(a['verdict'])}</td></tr>" for a in m)
+    out = ("<h2>AI crawler access (tested at the edge)</h2>"
+           "<p class='status' style='margin:0 0 4px'>robots.txt states intent; CDNs and firewalls decide. "
+           "The homepage was requested with each crawler's documented user-agent and compared with a "
+           "browser. Tested from a non-crawler IP: a firewall that verifies crawler IPs can refuse this "
+           "test yet admit the real bot, so confirm any block in the CDN/WAF dashboard.</p>"
+           "<table class='kv'><thead><tr><th>Agent</th><th>Operator</th><th>Purpose</th><th>Result</th></tr>"
+           f"</thead><tbody>{trs}</tbody></table>")
+    rd = r.get("readiness") or []
+    if rd:
+        rows = "".join(
+            f"<tr><td>{esc(x['url'].split('//', 1)[-1].split('/', 1)[-1] or '/')}</td><td>{x['words']}</td>"
+            f"<td>{x['subheadings']}</td><td>{x['question_headings']}</td><td>{x['lists']}</td>"
+            f"<td>{x['tables']}</td><td>{esc(x['dated'])}</td><td>{esc(x['schema'])}</td></tr>" for x in rd)
+        out += ("<h2>Answer-engine readiness (informational)</h2>"
+                "<p class='status' style='margin:0 0 4px'>What an answer engine can extract, date and attribute "
+                "on each audited page. These are correlational signals, not ranking factors, so they are shown "
+                "rather than scored: self-contained sections under descriptive or question headings, lists and "
+                "tables for facts, a visible date, and schema naming the entity.</p>"
+                "<table class='kv'><thead><tr><th>Page</th><th>Words</th><th>H2/H3</th><th>Question headings</th>"
+                "<th>Lists</th><th>Tables</th><th>Date</th><th>Schema</th></tr></thead>"
+                f"<tbody>{rows}</tbody></table>")
+    return out
+
+
+def sweep_block(r):
+    sw = r.get("sweep_summary") or []
+    if not sw:
+        return ""
+    trs = "".join(
+        f"<tr><td>{sev_badge(x['severity'])}</td><td>{esc(x['title'])}</td><td>{x['count']}</td>"
+        f"<td><code>{esc(', '.join(x['templates'][:3]))}</code></td><td>{esc(x['example'])}</td></tr>" for x in sw[:25])
+    return ("<h2>Sitemap sweep — issues by frequency</h2>"
+            f"<p class='status' style='margin:0 0 4px'>Across the {r.get('sweep_count', 0)} additional pages: "
+            "how many carry each issue and in which templates. A template-level count is the thing to fix.</p>"
+            "<table class='kv'><thead><tr><th></th><th>Issue</th><th>Pages</th><th>Templates</th>"
+            f"<th>Example</th></tr></thead><tbody>{trs}</tbody></table>")
 
 
 def render_html(r):
@@ -351,6 +428,7 @@ def render_html(r):
   .top .ie {{ color:var(--muted); font-size:11.5px; font-weight:400; }}
   .purl {{ color:var(--muted); font-size:12px; margin:-4px 0 6px; }}
   .ok {{ color:#15803d; font-size:13px; }}
+  code {{ font:12px ui-monospace,Menlo,monospace; background:#f1f5f9; padding:1px 4px; border-radius:4px; }}
   .page {{ break-inside:avoid; }}
   .legend {{ color:var(--muted); font-size:11px; margin-top:36px; padding-top:10px;
              border-top:1px solid var(--line); }}
@@ -363,20 +441,24 @@ def render_html(r):
     <div class="scorebadge" style="background:{score_color(overall)}">{overall}<span style="font-size:18px">/100</span></div>
     <div>{cat_table}</div>
   </div>
-  <div class="sub" style="margin-top:14px">Generated {esc(gen)} · {r['page_count']} page{'s' if r['page_count']!=1 else ''} · {esc(r['confidence'])} confidence</div>
+  <div class="sub" style="margin-top:14px">Generated {esc(gen)} · {r['page_count']} page{'s' if r['page_count']!=1 else ''} in depth + {r.get('sweep_count', 0)} swept of {r.get('sitemap_url_count', 0)} sitemap URLs · {esc(r['confidence'])} confidence · seo-audit {esc(r.get('version', ''))}</div>
   <div class="status">{esc(status)}</div>
   {tp_block}
+  {coverage_block(r)}
   {health_block(r)}
+  {ai_block(r)}
   {psi_block}
   {kw_block}
   {soc_block}
   {fp_block}
   {site_block}
+  {sweep_block(r)}
   {''.join(page_blocks)}
   <div class="legend">
     <b>Cat</b> = category · <b>I/E</b> = impact / effort, each 1–5 (high impact, low effort = do first).
     Category score = 100 minus severity deductions (CRITICAL −40, HIGH −20, MEDIUM −10, LOW −4),
-    counting each distinct issue type once so the score doesn't swing with the number of pages crawled.
+    counting each distinct issue type once so the score doesn't swing with the number of pages crawled,
+    with diminishing returns inside a category (two heaviest findings in full, next two at 75%, the rest at 50%).
     Overall = weighted average across categories. The Performance category combines signals
     observed directly from the HTML &amp; headers (compression, render-blocking scripts, page
     weight, DOM size, image dimensions, response time) with Google's real-user Core Web Vitals

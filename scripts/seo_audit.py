@@ -161,6 +161,10 @@ def fetch(url, method="GET", max_bytes=None, max_redirects=10, ua=None, extra_he
         headers.update(extra_headers)
     chain = []
     current = url
+    if not str(url).lower().startswith(("http://", "https://")):
+        # data:, mailto:, javascript:, file: — urllib would "open" some of these and hand
+        # back a response with no status. They are never fetchable web resources.
+        return Response(url, url, 0, {}, b"", 0, error="not an http(s) URL")
 
     def elapsed():
         return (_dt.datetime.now() - start).total_seconds() * 1000
@@ -561,33 +565,6 @@ def parse_robots(text):
     return {"sitemaps": sitemaps, "ai_blocked": ai_blocked, "blocks_all": blocks_all}
 
 
-def collect_sitemap_urls(url, seen=None, depth=0):
-    """Recursively pull <loc> URLs from a sitemap or sitemap index."""
-    if seen is None:
-        seen = set()
-    if depth > 3 or url in seen:
-        return []
-    seen.add(url)
-    r = fetch(url)
-    if r.status >= 400 or not r.body:
-        return []
-    body = r.body
-    if url.endswith(".gz") or r.header("content-type", "").endswith("gzip"):
-        try:
-            body = gzip.decompress(body)
-        except OSError:
-            pass
-    text = body.decode("utf-8", errors="replace")
-    locs = re.findall(r"<loc>\s*(.*?)\s*</loc>", text, re.I | re.S)
-    out = []
-    if "<sitemapindex" in text.lower():
-        for loc in locs:
-            out.extend(collect_sitemap_urls(loc.strip(), seen, depth + 1))
-    else:
-        out = [l.strip() for l in locs]
-    return out
-
-
 def discover_pages(base_url, max_pages, sm_urls):
     """Return an ordered list of (url, source) to audit, homepage first. Sources:
     'homepage', 'sitemap', 'link' — the report shows how each page was discovered."""
@@ -638,8 +615,15 @@ def analyze_page(url):
     """Fetch and analyze a single page. Returns (page_dict, findings_list)."""
     findings = []
     r = fetch(url)
+    ua_fallback = False
+    if r.status in (401, 403, 406, 429):
+        # Bot protection often refuses an honest auditor UA. Retry as a browser so we can
+        # still audit the page; run_audit reports that this happened.
+        r2 = fetch(url, ua=BROWSER_UA)
+        if r2.status == 200:
+            r, ua_fallback = r2, True
     page = {
-        "url": url, "status": r.status, "final_url": r.final_url,
+        "url": url, "status": r.status, "final_url": r.final_url, "ua_fallback": ua_fallback,
         "error": r.error, "elapsed_ms": round(r.elapsed_ms),
         "title": "", "description": "", "word_count": 0, "h1": [],
     }
@@ -1676,6 +1660,8 @@ def cluster_urls(urls):
 
 def _spread(items, k):
     """k items evenly spaced through the list (not the first k)."""
+    if k <= 0:
+        return []
     if k >= len(items):
         return list(items)
     step = len(items) / k
@@ -1707,46 +1693,67 @@ def stratified_sample(urls, n, exclude=()):
     return out
 
 
-def sitemap_meta(sitemap_urls_to_fetch):
-    """Second, cheap pass over the sitemap XML for metadata the <loc> scrape drops:
-    lastmod coverage/plausibility and image-extension use."""
-    total = with_lastmod = 0
-    lastmods = []
-    has_images = False
+MAX_SITEMAP_FILES = 20        # sub-sitemaps fetched per audit (spread across the index)
+MAX_SITEMAP_URLS = 50_000
+
+
+def read_sitemaps(sitemap_files):
+    """One capped pass over the sitemap(s): URLs plus the metadata a <loc> scrape drops
+    (lastmod coverage, image extension). Large publishers expose an index of thousands of
+    sub-sitemaps; we read an evenly spread subset rather than hang on all of them."""
+    meta = {"urls": [], "total": 0, "with_lastmod": 0, "lastmods": [], "has_images": False,
+            "files_read": 0, "files_listed": 0, "truncated": False}
     seen = set()
 
-    def walk(url, depth=0):
-        nonlocal total, with_lastmod, has_images
-        if depth > 3 or url in seen:
+    def parse(url, depth=0):
+        if url in seen or depth > 3 or meta["files_read"] >= MAX_SITEMAP_FILES:
             return
         seen.add(url)
-        r = fetch(url)
+        r = fetch(url, max_bytes=60_000_000)
         if r.status >= 400 or not r.body:
             return
+        meta["files_read"] += 1
         body = r.body
-        if url.endswith(".gz"):
+        if url.endswith(".gz") or body[:2] == b"\x1f\x8b":
             try:
                 body = gzip.decompress(body)
-            except OSError:
+            except (OSError, EOFError):
                 pass
         text = body.decode("utf-8", errors="replace")
-        if "<sitemapindex" in text.lower():
-            for loc in re.findall(r"<loc>\s*(.*?)\s*</loc>", text, re.I | re.S)[:50]:
-                walk(loc.strip(), depth + 1)
+        if "<sitemapindex" in text[:4000].lower():
+            children = [c.strip() for c in re.findall(r"<loc>\s*(.*?)\s*</loc>", text, re.I | re.S)]
+            meta["files_listed"] += len(children)
+            budget = MAX_SITEMAP_FILES - meta["files_read"]
+            if len(children) > budget:
+                meta["truncated"] = True
+            for c in _spread(children, max(0, budget)):
+                parse(c, depth + 1)
             return
         if "image:image" in text:
-            has_images = True
+            meta["has_images"] = True
         for block in re.findall(r"<url\b.*?</url>", text, re.I | re.S):
-            total += 1
+            if len(meta["urls"]) >= MAX_SITEMAP_URLS:
+                meta["truncated"] = True
+                break
+            loc = re.search(r"<loc>\s*(.*?)\s*</loc>", block, re.I | re.S)
+            if not loc:
+                continue
+            meta["urls"].append(_html_unescape(loc.group(1).strip()))
+            meta["total"] += 1
             m = re.search(r"<lastmod>\s*(.*?)\s*</lastmod>", block, re.I | re.S)
             if m:
-                with_lastmod += 1
-                lastmods.append(m.group(1)[:10])
+                meta["with_lastmod"] += 1
+                meta["lastmods"].append(m.group(1)[:10])
 
-    for u in sitemap_urls_to_fetch:
-        walk(u)
-    return {"total": total, "with_lastmod": with_lastmod, "lastmods": lastmods,
-            "has_images": has_images}
+    for u in sitemap_files:
+        parse(u)
+    meta["urls"] = list(dict.fromkeys(meta["urls"]))
+    return meta
+
+
+def _html_unescape(u):
+    import html as _h
+    return _h.unescape(u)
 
 
 def sitemap_meta_findings(meta):
@@ -2061,7 +2068,9 @@ def check_link_architecture(pages, crawled_urls, sm_urls, limit=40):
     for tmpl, members in cluster_urls(sm_urls).items():
         if len(members) >= 10 and not any(m.rstrip("/") in link_set for m in members):
             orphan_templates.append((tmpl, len(members)))
-    if orphan_templates and len(pages) >= 8:
+    # Only meaningful when the crawl saw a real share of the site: on a 50,000-URL
+    # sitemap, "none of our 100 pages links to it" says nothing.
+    if orphan_templates and len(pages) >= 8 and len(sm_urls) <= 40 * len(pages):
         orphan_templates.sort(key=lambda x: -x[1])
         findings.append(f(
             "MEDIUM", "A sitemap template gets no internal links from any crawled page", "crawlability", 4, 3,
@@ -2589,6 +2598,10 @@ def check_schema_depth(page, is_home):
 # =================================================================================
 # Answer-engine readiness (what AI search can extract, date, and attribute)
 # =================================================================================
+# Plumbing types sort last so the table shows what the page is ABOUT first.
+_STRUCTURAL_TYPES = {"BreadcrumbList", "ListItem", "ItemList", "ImageObject", "WebSite", "WebPage",
+                     "SearchAction", "EntryPoint", "PostalAddress", "Answer", "Question",
+                     "ContactPoint", "GeoCoordinates", "OpeningHoursSpecification", "ReadAction"}
 _QUESTION_RE = re.compile(r"^(who|what|when|where|why|how|which|can|does|do|is|are|should|will)\b.*\?$|\?$", re.I)
 _DATE_TEXT_RE = re.compile(
     r"\b(updated|last reviewed|last updated|published|reviewed|as of)\b[^.]{0,40}\b(19|20)\d{2}\b", re.I)
@@ -2634,24 +2647,52 @@ def check_answer_readiness(page):
         "question_headings": sum(1 for h in heads if _QUESTION_RE.search(h.strip())),
         "subheadings": len(heads), "lists": p.list_count, "tables": p.table_count,
         "dated": "visible" if visible_date else ("schema only" if has_date_schema else "none"),
-        "schema": ", ".join(page.get("schema_types", [])[:4]) or "none",
+        "schema": ", ".join(sorted(page.get("schema_types", []),
+                                   key=lambda t: (t in _STRUCTURAL_TYPES, t))[:4]) or "none",
     }
     return findings, stats
 
 
 def check_entity_transparency(pages, home_page):
-    """Who is behind the site? Checked across all crawled pages."""
-    text = " ".join((pg.get("parser").visible_text[:30000] if pg.get("parser") else "") for pg in pages)
-    nodes = [n for pg in pages if pg.get("parser") for n in _jsonld_nodes(pg["parser"])]
+    """Who is behind the site? An address normally lives on the about/contact/legal
+    pages, so fetch those (they are rarely in a sample) before saying it is missing."""
+    have = {pg["url"].rstrip("/") for pg in pages}
+    wanted = {}
+    for pg in pages:
+        p = pg.get("parser")
+        for href in (p.links if p else []):
+            u = normalize(pg["url"], href)
+            if not u or not u.startswith("http") or not same_site(u, pg["url"]) or u.rstrip("/") in have:
+                continue
+            path = urllib.parse.urlparse(u).path
+            for kind, rx in _TRUST_PATTERNS.items():
+                if rx.search(path):
+                    wanted.setdefault(kind, u)
+    extra_text, extra_nodes, extra_addr = [], [], False
+    for u in list(wanted.values())[:4]:
+        r = fetch(u, max_bytes=400_000)
+        if r.status == 200:
+            _, _, ep = _head_signals(r)
+            extra_text.append(ep.visible_text[:30000])
+            extra_nodes.extend(_jsonld_nodes(ep))
+            extra_addr = extra_addr or bool(ep.address_tags)
+    saw_trust_page = bool(extra_text) or any(
+        rx.search(urllib.parse.urlparse(pg["url"]).path) for pg in pages for rx in _TRUST_PATTERNS.values())
+    text = " ".join([(pg.get("parser").visible_text[:30000] if pg.get("parser") else "") for pg in pages]
+                    + extra_text)
+    nodes = [n for pg in pages if pg.get("parser") for n in _jsonld_nodes(pg["parser"])] + extra_nodes
     has_postal = (any(isinstance(n.get("address"), (dict, str)) and n.get("address")
                       for n in nodes if _types(n) & {"Organization", "Corporation", "NGO"})
+                  or extra_addr
                   or any(pg.get("parser") and pg["parser"].address_tags for pg in pages)
-                  or bool(_STREET_RE.search(text)))
+                  or bool(_STREET_RE.search(text))
+                  or bool(re.search(r"\bP\.?\s?O\.?\s+Box\s+\d+", text, re.I)))
     legal = bool(re.search(r"\b(LLC|L\.L\.C\.|Inc\.?|Ltd\.?|GmbH|Corp\.?|PLC|Pty|S\.A\.|B\.V\.)\b", text))
     findings = []
-    if not has_postal and len(pages) >= 5:
+    if not has_postal and saw_trust_page:
         findings.append(f("LOW", "No postal address found anywhere on the crawled pages", "trust", 2, 1,
-                          "no PostalAddress in Organization schema, no <address>, no street-address text",
+                          "no PostalAddress in Organization schema, no <address>, no street-address text "
+                          "on the crawled pages or the about/contact/legal pages",
                           "Publish a real mailing address (footer, contact or about page, and Organization "
                           "schema). An organization reachable only by email is a classic low-trust pattern "
                           "for quality raters and for assistants asked 'is this company legitimate?'."))
@@ -3077,20 +3118,18 @@ def run_audit(start_url, max_pages=15, use_pagespeed=False, sweep=100, probe_ai=
     robots_found = robots_resp.status == 200 and robots_resp.body
     robots_info = parse_robots(robots_resp.text) if robots_found else {"sitemaps": [], "ai_blocked": [], "blocks_all": False}
 
-    sm_urls = []
     sm_files = list(robots_info["sitemaps"])
-    for sm in robots_info["sitemaps"]:
-        sm_urls.extend(collect_sitemap_urls(sm))
-    sitemap_exists = bool(robots_info["sitemaps"])
-    if not sm_urls:
+    sitemap_exists = bool(sm_files)
+    sm_meta = read_sitemaps(sm_files) if sm_files else None
+    if not sm_meta or not sm_meta["urls"]:
         default_sm = normalize(base, "/sitemap.xml")
         r_sm = fetch(default_sm, max_bytes=200_000)
         head = r_sm.body[:4096].lower()
         if r_sm.status == 200 and (b"<urlset" in head or b"<sitemapindex" in head):
             sitemap_exists = True
-            sm_urls = collect_sitemap_urls(default_sm)
             sm_files = [default_sm]
-    sm_urls = list(dict.fromkeys(u.strip() for u in sm_urls if u.strip()))
+            sm_meta = read_sitemaps(sm_files)
+    sm_urls = sm_meta["urls"] if sm_meta else []
     sitemap_found = sitemap_exists and bool(sm_urls)
 
     llms_resp = fetch(normalize(base, "/llms.txt"))
@@ -3137,8 +3176,8 @@ def run_audit(start_url, max_pages=15, use_pagespeed=False, sweep=100, probe_ai=
                                "content index. No major answer engine has confirmed it reads the file, so "
                                "treat it as low priority — crawler access, server-rendered content and "
                                "clear entity information matter far more."))
-    if sitemap_found and sm_files:
-        site_findings.extend(sitemap_meta_findings(sitemap_meta(sm_files)))
+    if sitemap_found:
+        site_findings.extend(sitemap_meta_findings(sm_meta))
 
     # ---- deep pages (full per-page tables) ----
     workers = min(8, max(1, len(pages_urls)))
@@ -3168,9 +3207,10 @@ def run_audit(start_url, max_pages=15, use_pagespeed=False, sweep=100, probe_ai=
                                "crawlability", 2, 1, trunc("; ".join(sm_redirects[:4]), 200),
                                "Regenerate the sitemap with final canonical URLs — redirecting entries "
                                "waste crawl budget."))
-    sm_dead = [p["url"] for p in from_sm if p.get("status", 0) >= 400]
+    sm_dead = [p["url"] for p in from_sm if p.get("status", 0) in (404, 410) or p.get("status", 0) >= 500]
     if sm_dead:
-        site_findings.append(f("HIGH", f"Sitemap lists URLs that return errors ({len(sm_dead)} of {len(from_sm)} checked)",
+        site_findings.append(f("HIGH" if len(sm_dead) >= max(2, len(from_sm) * 0.1) else "MEDIUM",
+                               f"Sitemap lists URLs that return errors ({len(sm_dead)} of {len(from_sm)} checked)",
                                "crawlability", 4, 1, trunc("; ".join(sm_dead[:4]), 200),
                                "Remove dead URLs from the sitemap or restore the pages."))
     sm_noindex = [p["url"] for p in from_sm if "noindex" in (p.get("robots") or "")]
@@ -3188,6 +3228,17 @@ def run_audit(start_url, max_pages=15, use_pagespeed=False, sweep=100, probe_ai=
                                "crawlability", 3, 1, trunc("; ".join(sm_noncanon[:4]), 200),
                                "List the canonical URL of each page only; a sitemap and a canonical tag "
                                "that disagree send search engines conflicting signals."))
+
+    fell_back = [p["url"] for p in all_pages if p.get("ua_fallback")]
+    still_blocked = [p["url"] for p in all_pages if p.get("status") in (401, 403, 406, 429)]
+    if fell_back or still_blocked:
+        site_findings.append(f(
+            "INFO", "Site refuses non-browser user-agents", "crawlability", 2, 2,
+            f"{len(fell_back)} page(s) were only readable with a browser user-agent; "
+            f"{len(still_blocked)} stayed blocked (401/403/429)",
+            "Bot protection is refusing automated clients. Make sure it admits verified search "
+            "and AI crawlers. Pages that stayed blocked could not be audited, so treat the score "
+            "as partial."))
 
     # cross-page duplicates — across deep AND swept pages
     descriptions, titles = {}, {}
@@ -3419,6 +3470,8 @@ def run_audit(start_url, max_pages=15, use_pagespeed=False, sweep=100, probe_ai=
         "page_count": len(pages),
         "sweep_count": len(sweep_pages),
         "sitemap_url_count": len(sm_urls),
+        "sitemap_truncated": bool(sm_meta and sm_meta["truncated"]),
+        "sitemap_files": (sm_meta or {}).get("files_read", 0),
         "confidence": conf,
         "overall": overall,
         "scores": scores,
