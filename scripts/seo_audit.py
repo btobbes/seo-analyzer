@@ -38,7 +38,12 @@ from html.parser import HTMLParser
 
 # A descriptive UA: honest about being an auditor, but browser-shaped so servers that
 # sniff for "Mozilla" still serve the real page.
-USER_AGENT = "Mozilla/5.0 (compatible; SEO-Audit-Skill/1.0; +https://claude.com/claude-code)"
+VERSION = "2.0.0"   # bump on every behavior change; shown in the report footer and --version
+USER_AGENT = "Mozilla/5.0 (compatible; SEO-Audit-Skill/2.0; +https://claude.com/claude-code)"
+# A plain desktop-browser UA: the baseline an AI-crawler probe is compared against, and
+# what font/CSS endpoints need to see before they serve woff2.
+BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 TIMEOUT = 20
 socket.setdefaulttimeout(TIMEOUT)
 
@@ -52,11 +57,11 @@ CATEGORY_WEIGHTS = {
     "crawlability": 0.20,
     "on page": 0.18,
     "performance": 0.15,
+    "ai search": 0.10,   # AI referrals are ~1% of traffic (2026 studies): never above crawl/CWV
     "schema": 0.10,
     "trust": 0.10,
-    "social": 0.10,
-    "mobile": 0.10,
-    "ai search": 0.07,
+    "mobile": 0.09,
+    "social": 0.08,
 }
 CATEGORIES = list(CATEGORY_WEIGHTS.keys())
 
@@ -70,15 +75,20 @@ CTA_VERBS = {
 
 # AI crawlers that do NOT execute JavaScript — content missing from raw HTML is invisible
 # to them, which increasingly matters for visibility in AI answers.
-AI_CRAWLERS = [
-    "GPTBot", "OAI-SearchBot", "ChatGPT-User",           # OpenAI (training / search / live browse)
-    "ClaudeBot", "Claude-Web", "anthropic-ai",           # Anthropic
-    "PerplexityBot", "Perplexity-User",                  # Perplexity
-    "Google-Extended",                                   # Gemini training opt-out token
-    "Applebot-Extended",                                 # Apple Intelligence
-    "Amazonbot", "meta-externalagent", "Bytespider",     # Amazon / Meta / ByteDance
-    "CCBot", "cohere-ai", "DuckAssistBot",               # Common Crawl / Cohere / DuckDuckGo
-]
+AI_CRAWLER_ROLES = {
+    # search = builds an answer engine's index · user = live fetch for a person ·
+    # train = model training · optout = robots.txt-only token (no crawler of its own)
+    "OAI-SearchBot": "search", "PerplexityBot": "search", "Claude-SearchBot": "search",
+    "MistralAI-Index": "search", "meta-webindexer": "search", "Amzn-SearchBot": "search",
+    "DuckAssistBot": "user", "ChatGPT-User": "user", "Claude-User": "user",
+    "Perplexity-User": "user", "MistralAI-User": "user", "Amzn-User": "user",
+    "GPTBot": "train", "ClaudeBot": "train", "CCBot": "train", "meta-externalagent": "train",
+    "Amazonbot": "train", "Bytespider": "train", "MistralAI-Training": "train",
+    "Google-Extended": "optout", "Applebot-Extended": "optout",
+}
+# Not listed on purpose: cohere-ai (Cohere documents that it runs no crawler), anthropic-ai
+# and Claude-Web (absent from Anthropic's current documentation). Blocking them is harmless.
+AI_CRAWLERS = list(AI_CRAWLER_ROLES)
 
 
 # =================================================================================
@@ -142,18 +152,24 @@ def _decode_body(raw, enc):
     return raw
 
 
-def fetch(url, method="GET", max_bytes=None, max_redirects=10):
+def fetch(url, method="GET", max_bytes=None, max_redirects=10, ua=None, extra_headers=None):
     """Fetch a URL, following redirects manually so the hop chain is recorded
     (Response.chain). Decodes gzip/deflate. Never raises."""
     start = _dt.datetime.now()
     headers = {
-        "User-Agent": USER_AGENT,
+        "User-Agent": ua or USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Encoding": "gzip, deflate",
         "Accept-Language": "en-US,en;q=0.9",
     }
+    if extra_headers:
+        headers.update(extra_headers)
     chain = []
     current = url
+    if not str(url).lower().startswith(("http://", "https://")):
+        # data:, mailto:, javascript:, file: — urllib would "open" some of these and hand
+        # back a response with no status. They are never fetchable web resources.
+        return Response(url, url, 0, {}, b"", 0, error="not an http(s) URL")
 
     def elapsed():
         return (_dt.datetime.now() - start).total_seconds() * 1000
@@ -173,6 +189,7 @@ def fetch(url, method="GET", max_bytes=None, max_redirects=10):
             loc = e.headers.get("Location") if e.headers else None
             if 300 <= e.code < 400 and loc and len(chain) < max_redirects:
                 chain.append((current, e.code))
+                e.close()
                 nxt = urllib.parse.urljoin(current, loc.strip())
                 if nxt == current:  # self-redirect loop
                     return Response(url, current, 0, {}, b"", elapsed(),
@@ -184,6 +201,8 @@ def fetch(url, method="GET", max_bytes=None, max_redirects=10):
                 body = e.read()
             except Exception:
                 pass
+            finally:
+                e.close()
             return Response(url, current, e.code, dict(e.headers or {}), body, elapsed(),
                             chain=chain)
         except (urllib.error.URLError, ssl.SSLError, socket.timeout, ConnectionError,
@@ -224,7 +243,15 @@ class PageParser(HTMLParser):
         self.scripts = []               # {src, async, defer, in_head}
         self._in_head = False
         self.heading_sequence = []      # heading tags in document order, e.g. ["h1","h2"]
-        self.imgs = []                  # {src, loading} per <img>
+        self.imgs = []                  # {src, loading, width, height, fetchpriority, srcset}
+        self._seq = 0                   # document-order counter for head resources
+        self.stylesheet_seq = []        # order index of each <link rel=stylesheet>
+        self.time_tags = 0              # <time datetime=…> elements (visible freshness signal)
+        self.nosnippet_attrs = 0        # elements carrying data-nosnippet
+        self.address_tags = 0           # <address> elements
+        self.table_count = 0
+        self.list_count = 0
+        self.iframes = []
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
@@ -232,11 +259,26 @@ class PageParser(HTMLParser):
             self._skip_depth += 1
             self._open_skip.append(tag)
         self.element_count += 1
+        self._seq += 1
+        if "data-nosnippet" in a:
+            self.nosnippet_attrs += 1
+        if tag == "time" and a.get("datetime"):
+            self.time_tags += 1
+        elif tag == "address":
+            self.address_tags += 1
+        elif tag == "table":
+            self.table_count += 1
+        elif tag in ("ul", "ol"):
+            self.list_count += 1
+        elif tag == "iframe" and a.get("src"):
+            self.iframes.append(a["src"].strip())
         if tag == "head":
             self._in_head = True
         elif tag == "script":
             self.scripts.append({"src": (a.get("src") or "").strip(), "async": "async" in a,
-                                 "defer": "defer" in a, "in_head": self._in_head})
+                                 "defer": "defer" in a, "in_head": self._in_head,
+                                 "seq": self._seq, "nonce": bool(a.get("nonce")),
+                                 "type": (a.get("type") or "").lower()})
         if tag == "title":
             self._in_title = True
         elif tag == "html" and a.get("lang"):
@@ -247,12 +289,17 @@ class PageParser(HTMLParser):
                 self.has_viewport_tag = True
         elif tag == "link":
             self.link_tags.append(a)
+            if "stylesheet" in (a.get("rel") or "").lower():
+                self.stylesheet_seq.append(self._seq)
         elif tag == "a" and a.get("href"):
             self.links.append(a["href"])
         elif tag == "img":
             self.img_total += 1
             self.imgs.append({"src": (a.get("src") or a.get("data-src") or "").strip(),
-                              "loading": (a.get("loading") or "").lower()})
+                              "loading": (a.get("loading") or "").lower(),
+                              "width": a.get("width") or "", "height": a.get("height") or "",
+                              "fetchpriority": (a.get("fetchpriority") or "").lower(),
+                              "srcset": bool(a.get("srcset"))})
             if not (a.get("alt") or "").strip():
                 self.img_missing_alt += 1
             if not (a.get("width") and a.get("height")):
@@ -354,7 +401,9 @@ class PageParser(HTMLParser):
 
     @property
     def visible_text(self):
-        return " ".join("".join(self.text_parts).split())
+        # join text nodes with a space: "<p>one.</p><p>two.</p>" is two words, and sentence
+        # and shingle boundaries must survive element boundaries
+        return " ".join(" ".join(self.text_parts).split())
 
     @property
     def word_count(self):
@@ -417,7 +466,10 @@ def image_info(resp):
             if not mime:
                 mime = Image.MIME.get(im.format, "")
     except Exception:
-        dims = _manual_dims(resp.body)
+        try:
+            dims = _manual_dims(resp.body)
+        except Exception:      # truncated or malformed image: report bytes, not dimensions
+            dims = None
         if dims:
             w, h = dims
     return {"width": w, "height": h, "size": size, "mime": mime}
@@ -526,46 +578,16 @@ def parse_robots(text):
     return {"sitemaps": sitemaps, "ai_blocked": ai_blocked, "blocks_all": blocks_all}
 
 
-def collect_sitemap_urls(url, seen=None, depth=0):
-    """Recursively pull <loc> URLs from a sitemap or sitemap index."""
-    if seen is None:
-        seen = set()
-    if depth > 3 or url in seen:
-        return []
-    seen.add(url)
-    r = fetch(url)
-    if r.status >= 400 or not r.body:
-        return []
-    body = r.body
-    if url.endswith(".gz") or r.header("content-type", "").endswith("gzip"):
-        try:
-            body = gzip.decompress(body)
-        except OSError:
-            pass
-    text = body.decode("utf-8", errors="replace")
-    locs = re.findall(r"<loc>\s*(.*?)\s*</loc>", text, re.I | re.S)
-    out = []
-    if "<sitemapindex" in text.lower():
-        for loc in locs:
-            out.extend(collect_sitemap_urls(loc.strip(), seen, depth + 1))
-    else:
-        out = [l.strip() for l in locs]
-    return out
-
-
 def discover_pages(base_url, max_pages, sm_urls):
     """Return an ordered list of (url, source) to audit, homepage first. Sources:
     'homepage', 'sitemap', 'link' — the report shows how each page was discovered."""
     home = base_url
     pages = [(home, "homepage")]
     seen = {home.rstrip("/")}
-    # Prefer the sitemap — it's the site's own statement of what matters.
-    for u in sm_urls:
-        u = u.strip()
-        if len(pages) >= max_pages:
-            break
-        if not u or not same_site(base_url, u) or u.rstrip("/") in seen:
-            continue
+    # Prefer the sitemap — it's the site's own statement of what matters — but sample
+    # ACROSS its templates instead of taking the first N entries (see stratified_sample).
+    sm_same = [u.strip() for u in sm_urls if u.strip() and same_site(base_url, u.strip())]
+    for u in stratified_sample(sm_same, max_pages - 1, exclude=[home]):
         seen.add(u.rstrip("/"))
         pages.append((u, "sitemap"))
     # Fall back to following homepage links if the sitemap was thin.
@@ -606,8 +628,15 @@ def analyze_page(url):
     """Fetch and analyze a single page. Returns (page_dict, findings_list)."""
     findings = []
     r = fetch(url)
+    ua_fallback = False
+    if r.status in (401, 403, 406, 429):
+        # Bot protection often refuses an honest auditor UA. Retry as a browser so we can
+        # still audit the page; run_audit reports that this happened.
+        r2 = fetch(url, ua=BROWSER_UA)
+        if r2.status == 200:
+            r, ua_fallback = r2, True
     page = {
-        "url": url, "status": r.status, "final_url": r.final_url,
+        "url": url, "status": r.status, "final_url": r.final_url, "ua_fallback": ua_fallback,
         "error": r.error, "elapsed_ms": round(r.elapsed_ms),
         "title": "", "description": "", "word_count": 0, "h1": [],
     }
@@ -884,6 +913,15 @@ def analyze_page(url):
 
         enc = (r.header("content-encoding") or "").lower()
         ctype = r.header("content-type", "").lower()
+        if "br" in [e.strip() for e in enc.split(",")] or "zstd" in enc:
+            # we only offered gzip/deflate; a server that answers br/zstd anyway ignores
+            # Accept-Encoding, and clients that can't decode it (Facebook's crawler accepts
+            # only gzip and deflate) receive garbage.
+            findings.append(f("MEDIUM", "Server ignores Accept-Encoding", "crawlability", 3, 2,
+                              f"sent 'gzip, deflate', received content-encoding: {enc}",
+                              "Negotiate compression from the request's Accept-Encoding and send "
+                              "Vary: Accept-Encoding. Link-preview crawlers that only accept gzip cannot "
+                              "read a forced Brotli/zstd response."))
         if ("html" in ctype and len(r.body) > 30 * 1024
                 and not any(c in enc for c in ("gzip", "br", "deflate", "zstd"))):
             findings.append(f("MEDIUM", "HTML served without compression", "performance", 3, 1,
@@ -891,6 +929,12 @@ def analyze_page(url):
                               "Enable gzip or Brotli for text responses at your server/CDN — usually cuts "
                               "transfer size 60–80% and speeds first paint."))
 
+        if len(r.body) > 2 * 1024 * 1024:
+            findings.append(f("HIGH", "HTML exceeds Googlebot's 2 MB fetch limit", "crawlability", 5, 3,
+                              f"{len(r.body) / 1048576:.1f} MB uncompressed",
+                              "Googlebot fetches the first 2 MB of an HTML file (uncompressed) and ignores "
+                              "the rest: content, links and structured data past that point are not indexed. "
+                              "Move inlined data/scripts/SVG out of the document."))
         if html_kb > 300:
             findings.append(f("MEDIUM", "Large HTML document", "performance", 3, 3, f"{html_kb} KB of HTML",
                               "Trim inlined JSON/markup; heavy HTML slows parsing and delays LCP."))
@@ -1532,59 +1576,6 @@ def check_trust_pages(pages):
     return findings, health, {"has_tel": has_tel, "has_mailto": has_mailto, "found": found}
 
 
-def check_broken_links(pages, crawled_urls, limit=30):
-    """Sample internal links beyond the crawled pages and verify they resolve.
-    Broken internal links are among the highest-confidence findings an audit can make."""
-    seen = {u.rstrip("/") for u in crawled_urls}
-    candidates = []
-    for page in pages:
-        p = page.get("parser")
-        if not p:
-            continue
-        for href in p.links:
-            u = normalize(page["url"], href)
-            if not u or not u.startswith("http") or not same_site(u, page["url"]):
-                continue
-            if _SKIP_LINK_RE.search(u):
-                continue
-            key = u.rstrip("/")
-            if key in seen:
-                continue
-            seen.add(key)
-            candidates.append(u)
-            if len(candidates) >= limit:
-                break
-        if len(candidates) >= limit:
-            break
-    findings = []
-    if not candidates:
-        return findings, ("Internal links checked", "no uncrawled internal links found")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-        results = list(ex.map(lambda u: fetch(u, max_bytes=1024), candidates))
-    broken = [(u, r.status) for u, r in zip(candidates, results) if r.status in (404, 410)]
-    errors5 = [(u, r.status) for u, r in zip(candidates, results) if r.status >= 500]
-    redirs = [u for u, r in zip(candidates, results)
-              if r.chain and not _trivial_redirect(u, r.final_url)]
-    if broken:
-        findings.append(f("HIGH", f"Broken internal links ({len(broken)} of {len(candidates)} sampled)",
-                          "crawlability", 4, 2,
-                          trunc("; ".join(u for u, _ in broken[:4]), 220),
-                          "Fix or remove links to these URLs (or 301 them to the right page) — broken "
-                          "links leak crawl budget, link equity, and user trust."))
-    if errors5:
-        findings.append(f("MEDIUM", f"Internal links hit server errors ({len(errors5)})",
-                          "crawlability", 3, 3,
-                          trunc("; ".join(f"{u} ({s})" for u, s in errors5[:4]), 220),
-                          "Investigate the 5xx responses on these linked URLs."))
-    if len(redirs) >= 5:
-        findings.append(f("LOW", f"Internal links point at redirects ({len(redirs)} of {len(candidates)})",
-                          "crawlability", 2, 2, trunc("; ".join(redirs[:4]), 200),
-                          "Update internal links to the final URLs so crawlers and users skip the extra hop."))
-    health = ("Internal links checked",
-              f"{len(candidates)} sampled · {len(broken)} broken · {len(redirs)} redirecting")
-    return findings, health
-
-
 def check_asset_caching(home_page):
     """Sample the first same-site stylesheet, script, and image and check for
     long-lived Cache-Control — repeat-visit speed and a cheap CWV win."""
@@ -1666,6 +1657,1280 @@ def detect_analytics(home_page):
 
 
 # =================================================================================
+# Template clustering & stratified sampling
+# =================================================================================
+# A sitemap lists URLs in whatever order the generator emits them — usually the static
+# pages first, then one section alphabetically. Auditing "the first N" therefore audits
+# the same corner of the site every time and can miss the template that holds most of
+# the pages (a 250-page directory hiding behind 11 static pages). So we cluster URLs by
+# path shape and sample across clusters, spreading picks evenly inside each one.
+_YEAR_RE = re.compile(r"^(19|20)\d{2}$")
+
+
+def url_template(u):
+    """A coarse path-shape signature: '/blog/*', '/{year}/*/*/*/', '/about' → '/*'."""
+    path = urllib.parse.urlparse(u).path or "/"
+    segs = [s for s in path.split("/") if s]
+    if not segs:
+        return "/"
+    first = "{year}" if _YEAR_RE.match(segs[0]) else segs[0]
+    if len(segs) == 1:
+        return "/*" + ("/" if path.endswith("/") else "")
+    return "/" + first + "/*" * (len(segs) - 1) + ("/" if path.endswith("/") else "")
+
+
+def cluster_urls(urls):
+    clusters = {}
+    for u in urls:
+        clusters.setdefault(url_template(u), []).append(u)
+    return clusters
+
+
+def _spread(items, k):
+    """k items evenly spaced through the list (not the first k)."""
+    if k <= 0:
+        return []
+    if k >= len(items):
+        return list(items)
+    step = len(items) / k
+    return [items[int(i * step)] for i in range(k)]
+
+
+def stratified_sample(urls, n, exclude=()):
+    """Pick up to n URLs across template clusters: every cluster gets one slot first
+    (largest clusters first), remaining slots go round-robin by cluster size."""
+    ex = {e.rstrip("/") for e in exclude}
+    pool = [u for u in dict.fromkeys(urls) if u.rstrip("/") not in ex]
+    if n <= 0 or not pool:
+        return []
+    clusters = sorted(cluster_urls(pool).items(), key=lambda kv: -len(kv[1]))
+    quota = {t: 0 for t, _ in clusters}
+    left = min(n, len(pool))
+    while left > 0:
+        progressed = False
+        for t, members in clusters:
+            if left and quota[t] < len(members):
+                quota[t] += 1
+                left -= 1
+                progressed = True
+        if not progressed:
+            break
+    out = []
+    for t, members in clusters:
+        out.extend(_spread(members, quota[t]))
+    return out
+
+
+MAX_SITEMAP_FILES = 20        # sub-sitemaps fetched per audit (spread across the index)
+MAX_SITEMAP_URLS = 50_000
+
+
+def read_sitemaps(sitemap_files):
+    """One capped pass over the sitemap(s): URLs plus the metadata a <loc> scrape drops
+    (lastmod coverage, image extension). Large publishers expose an index of thousands of
+    sub-sitemaps; we read an evenly spread subset rather than hang on all of them."""
+    meta = {"urls": [], "total": 0, "with_lastmod": 0, "lastmods": [], "has_images": False,
+            "files_read": 0, "files_listed": 0, "truncated": False}
+    seen = set()
+
+    def parse(url, depth=0):
+        if url in seen or depth > 3 or meta["files_read"] >= MAX_SITEMAP_FILES:
+            return
+        seen.add(url)
+        r = fetch(url, max_bytes=60_000_000)
+        if r.status >= 400 or not r.body:
+            return
+        meta["files_read"] += 1
+        body = r.body
+        if url.endswith(".gz") or body[:2] == b"\x1f\x8b":
+            try:
+                body = gzip.decompress(body)
+            except (OSError, EOFError):
+                pass
+        text = body.decode("utf-8", errors="replace")
+        if "<sitemapindex" in text[:4000].lower():
+            children = [c.strip() for c in re.findall(r"<loc>\s*(.*?)\s*</loc>", text, re.I | re.S)]
+            meta["files_listed"] += len(children)
+            budget = MAX_SITEMAP_FILES - meta["files_read"]
+            if len(children) > budget:
+                meta["truncated"] = True
+            for c in _spread(children, max(0, budget)):
+                parse(c, depth + 1)
+            return
+        if "image:image" in text:
+            meta["has_images"] = True
+        for block in re.findall(r"<url\b.*?</url>", text, re.I | re.S):
+            if len(meta["urls"]) >= MAX_SITEMAP_URLS:
+                meta["truncated"] = True
+                break
+            loc = re.search(r"<loc>\s*(.*?)\s*</loc>", block, re.I | re.S)
+            if not loc:
+                continue
+            meta["urls"].append(_html_unescape(loc.group(1).strip()))
+            meta["total"] += 1
+            m = re.search(r"<lastmod>\s*(.*?)\s*</lastmod>", block, re.I | re.S)
+            if m:
+                meta["with_lastmod"] += 1
+                meta["lastmods"].append(m.group(1)[:10])
+
+    for u in sitemap_files:
+        parse(u)
+    meta["urls"] = list(dict.fromkeys(meta["urls"]))
+    return meta
+
+
+def _html_unescape(u):
+    import html as _h
+    return _h.unescape(u)
+
+
+def sitemap_meta_findings(meta):
+    out = []
+    total, wl = meta["total"], meta["with_lastmod"]
+    if total >= 10 and wl < total * 0.8:
+        out.append(f("LOW", "Many sitemap URLs carry no <lastmod>", "crawlability", 2, 2,
+                     f"{wl} of {total} URLs have a lastmod",
+                     "Emit an accurate <lastmod> for every URL. Google and Bing both use it to "
+                     "schedule recrawls when it is consistently truthful; pages without one give "
+                     "crawlers no signal that they changed."))
+    if wl >= 20 and len(set(meta["lastmods"])) == 1:
+        out.append(f("LOW", "Every sitemap <lastmod> is the same date", "crawlability", 2, 2,
+                     f"all {wl} entries say {meta['lastmods'][0]}",
+                     "Set lastmod from each page's real last significant change. A sitemap that "
+                     "stamps every URL with the build date teaches crawlers to ignore the field."))
+    today = _dt.date.today().isoformat()
+    future = [d for d in meta["lastmods"] if d > today]
+    if future:
+        out.append(f("LOW", "Sitemap <lastmod> dates in the future", "crawlability", 1, 1,
+                     f"{len(future)} entries, e.g. {future[0]}",
+                     "Fix the date source — future lastmod values are ignored as untrustworthy."))
+    return out
+
+
+# =================================================================================
+# AI crawler access — what the EDGE does, not just what robots.txt says
+# =================================================================================
+# robots.txt is a statement of intent. CDNs and WAFs (Cloudflare's "Block AI bots", bot
+# fight modes, custom rules) refuse AI crawlers at the network edge regardless of it, and
+# some platforms rewrite robots.txt in flight. The only way to know is to ask: request the
+# homepage with each crawler's documented user-agent and compare with a browser.
+#
+# Caveat, stated in every finding: this probes from a non-crawler IP. A WAF that verifies
+# crawler IPs may refuse a spoofed UA while admitting the real bot, so a block here means
+# "refused for this UA from here" — confirm in the CDN/WAF dashboard.
+#   role: "search" = builds an answer engine's search index · "user" = fetches a page
+#   live when a person asks · "train" = collects model-training data.
+AI_AGENT_PROBES = [
+    ("OAI-SearchBot", "search", "OpenAI",
+     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36; compatible; OAI-SearchBot/1.4; +https://openai.com/searchbot"),
+    ("ChatGPT-User", "user", "OpenAI",
+     "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; ChatGPT-User/1.0; +https://openai.com/bot"),
+    ("GPTBot", "train", "OpenAI",
+     "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; GPTBot/1.4; +https://openai.com/gptbot"),
+    # Anthropic documents the tokens but publishes no full UA strings; WAF rules match the token.
+    ("Claude-SearchBot", "search", "Anthropic", "Mozilla/5.0 (compatible; Claude-SearchBot/1.0; +https://www.anthropic.com)"),
+    ("Claude-User", "user", "Anthropic", "Mozilla/5.0 (compatible; Claude-User/1.0; +Claude-User@anthropic.com)"),
+    ("ClaudeBot", "train", "Anthropic",
+     "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ClaudeBot/1.0; +claudebot@anthropic.com)"),
+    ("PerplexityBot", "search", "Perplexity",
+     "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; PerplexityBot/1.0; +https://perplexity.ai/perplexitybot)"),
+    ("Perplexity-User", "user", "Perplexity",
+     "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Perplexity-User/1.0; +https://perplexity.ai/perplexity-user)"),
+    ("Applebot", "search", "Apple",
+     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15 (Applebot/0.1; +http://www.apple.com/go/applebot)"),
+    ("meta-webindexer", "search", "Meta", "meta-webindexer/1.1"),
+    ("meta-externalagent", "train", "Meta", "meta-externalagent/1.1"),
+    ("MistralAI-Index", "search", "Mistral",
+     "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; MistralAI-Index/1.0; +https://docs.mistral.ai/robots)"),
+    ("MistralAI-User", "user", "Mistral",
+     "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; MistralAI-User/1.0; +https://docs.mistral.ai/robots)"),
+    ("DuckAssistBot", "user", "DuckDuckGo", "DuckAssistBot/1.2; (+http://duckduckgo.com/duckassistbot.html)"),
+    ("Amazonbot", "train", "Amazon",
+     "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Amazonbot/0.1) Chrome/119.0.6045.214 Safari/537.36"),
+    ("CCBot", "train", "Common Crawl", "CCBot/2.0 (https://commoncrawl.org/faq/)"),
+    ("Bytespider", "train", "ByteDance",
+     "Mozilla/5.0 (Linux; Android 5.0) AppleWebKit/537.36 (KHTML, like Gecko) Mobile Safari/537.36 (compatible; Bytespider; spider-feedback@bytedance.com)"),
+]
+_CHALLENGE_MARKERS = (b"just a moment", b"attention required", b"cf-chl", b"captcha",
+                      b"request was blocked", b"access denied", b"bot detected")
+
+
+def probe_ai_agents(home_url, robots_text="", inner_url=None):
+    """Request the homepage (and one inner page) as each AI crawler. Bot rules can vary
+    page by page — Cloudflare can block AI bots only on pages that carry ads — so one URL
+    does not generalize. Returns (findings, health_rows, matrix)."""
+    targets = [home_url] + ([inner_url] if inner_url and inner_url != home_url else [])
+    targets = [t for t in targets if fetch(t, max_bytes=8192, ua=BROWSER_UA).status == 200]
+    if not targets:
+        return [], [("AI crawler edge access", "not tested (browser baseline was not 200)")], []
+
+    def verdict_for(r):
+        body = (r.body or b"")[:4096].lower()
+        if r.status == 402:
+            return "pay-per-crawl (402)"
+        if r.header("cf-mitigated"):
+            return f"challenged ({r.status})"
+        if r.status == 200 and not any(m in body for m in _CHALLENGE_MARKERS[:3]):
+            return "ok"
+        if r.status in (401, 403, 406, 429, 503) or any(m in body for m in _CHALLENGE_MARKERS):
+            return f"refused ({r.status})"
+        return "no response" if r.status == 0 else f"HTTP {r.status}"
+
+    def one(spec):
+        token, role, op, ua = spec
+        vs = [verdict_for(fetch(t, max_bytes=8192, ua=ua)) for t in targets]
+        bad = [v for v in vs if v != "ok"]
+        v = "ok" if not bad else (bad[0] if len(bad) == len(vs) else bad[0] + " on some pages")
+        return {"agent": token, "role": role, "operator": op, "verdict": v}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        matrix = list(ex.map(one, AI_AGENT_PROBES))
+
+    refused = [m for m in matrix if m["verdict"] != "ok"]
+    caveat = (" This is a differential response by User-Agent seen from an ordinary IP; a firewall "
+              "that verifies crawler IPs could still admit the real bot, so confirm in the CDN/WAF "
+              "dashboard.")
+    findings = []
+    if refused and len(refused) == len(matrix):
+        findings.append(f("MEDIUM", "Site refuses every non-browser user-agent we tried", "ai search", 3, 2,
+                          f"all {len(matrix)} AI crawler user-agents refused; a browser UA got 200",
+                          "Generic bot protection is active. It may admit verified crawler IPs, which "
+                          "this test cannot imitate. Check the CDN/WAF bot settings and confirm "
+                          "verified search and AI-search crawlers are allowed."))
+    elif refused:
+        named = {a.lower() for a in re.findall(r"(?im)^\s*user-agent\s*:\s*([^\s#]+)", robots_text)}
+        live = [m for m in refused if m["role"] in ("search", "user")]
+        invited = [m["agent"] for m in refused if m["agent"].lower() in named]
+        obs = "; ".join(f"{m['agent']} ({m['role']}) → {m['verdict']}" for m in refused)
+        obs += f" · {len(matrix) - len(refused)} other agents and a browser got 200"
+        tail = (" robots.txt names " + ", ".join(invited) + " in its own rules, so the file and "
+                "the edge disagree: make them say the same thing." if invited else "")
+        if live:
+            findings.append(f("HIGH", "AI search / assistant crawlers are refused at the edge", "ai search", 5, 1,
+                              trunc(obs, 300),
+                              "Search-index and user-fetch agents are how a page gets retrieved and cited "
+                              "in an AI answer; refusing them removes the site from those answers today. "
+                              "This is a CDN/WAF setting (for example Cloudflare AI Crawl Control or a custom "
+                              "rule), not robots.txt." + tail + caveat))
+        else:
+            findings.append(f("MEDIUM", "AI training crawlers are refused at the edge", "ai search", 3, 1,
+                              trunc(obs, 300),
+                              "Blocking training crawlers is a legitimate choice, and several CDNs now make "
+                              "it the default for new sites, so check that it is YOUR choice. Training crawls "
+                              "and Common Crawl are how models come to know a brand without being prompted; "
+                              "the effect on traffic is indirect. Search and user-fetch agents are being "
+                              "served, which matters more." + tail + caveat))
+    ok_n = len(matrix) - len(refused)
+    health = [("AI crawler edge access",
+               f"{ok_n}/{len(matrix)} agents served 200 on {len(targets)} URL(s)"
+               + (" · refused: " + ", ".join(m["agent"] for m in refused) if refused else ""))]
+    return findings, health, matrix
+
+
+def robots_platform_signals(text, resp=None):
+    """Things in robots.txt that are not allow/disallow: a CDN-managed block, Cloudflare
+    Content-Signal lines, and IETF AI-preference (Content-Usage, draft-ietf-aipref) lines.
+    An absent signal neither grants nor restricts anything, so only explicit 'no' is flagged."""
+    managed = bool(re.search(r"#\s*begin cloudflare managed content", text, re.I))
+    cs_lines = re.findall(r"(?im)^\s*content-signal\s*:\s*(.+)$", text)
+    cu_lines = re.findall(r"(?im)^\s*content-usage\s*:\s*(.+)$", text)
+    if resp is not None and resp.header("content-usage"):
+        cu_lines.append(resp.header("content-usage"))
+    parsed = {}
+    for line in cs_lines + cu_lines:
+        for k, v in re.findall(r"([a-z-]+)\s*=\s*([a-z]+)", line.lower()):
+            parsed.setdefault(k, set()).add(v)
+    no = lambda key: bool(parsed.get(key, set()) & {"no", "n"})
+    shown = "; ".join((cs_lines + cu_lines))[:160]
+    findings = []
+    if no("search"):
+        findings.append(f("HIGH", "robots.txt AI-preference signal says search=no", "crawlability", 4, 1, shown,
+                          "search=no asks crawlers not to build a search index from the site. Unless "
+                          "that is intended, set it to yes (CDN-managed robots.txt settings can add it)."))
+    if no("ai-input") or no("ai-use"):
+        findings.append(f("MEDIUM", "robots.txt AI-preference signal opts out of AI answers", "ai search", 3, 1, shown,
+                          "ai-input=no (Content-Signal) / ai-use=n (Content-Usage) asks AI systems not to "
+                          "use the content when generating answers. Set it to yes if you want to be cited."))
+    if managed:
+        findings.append(f("INFO", "robots.txt is partly written by the CDN", "crawlability", 2, 1,
+                          "'# BEGIN Cloudflare Managed content' block is prepended to the origin's file",
+                          "The file crawlers receive is not the one in your repository. Review the managed "
+                          "block (it disallows several AI crawlers and sets Content-Signal) in the Cloudflare "
+                          "dashboard; RFC 9309 group merging means your own Allow rules can override it."))
+    row = ("robots.txt platform signals",
+           (("CDN-managed block present · " if managed else "")
+            + ("; ".join(f"{k}={'/'.join(sorted(v))}" for k, v in parsed.items())
+               if parsed else "no Content-Signal / Content-Usage line")))
+    return findings, row
+
+
+# =================================================================================
+# Link architecture — where internal links actually point
+# =================================================================================
+def _head_signals(resp):
+    """canonical / robots from a (possibly truncated) HTML response."""
+    p = PageParser()
+    try:
+        p.feed(resp.text[:200_000])
+    except Exception:
+        pass
+    noindex = ("noindex" in p.meta_robots or "noindex" in resp.header("x-robots-tag", "").lower())
+    can = normalize(resp.final_url, p.canonical) if p.canonical else ""
+    return can or "", noindex, p
+
+
+def check_link_architecture(pages, crawled_urls, sm_urls, limit=40):
+    """Sample internal link targets (stratified by template) and classify each:
+    broken · server error · redirecting · canonicalized elsewhere · noindexed.
+    Then ask the structural questions a page-by-page audit can't:
+      * do internal links point at the URLs the site wants indexed?
+      * does a canonical hand indexing to a thinner page than the one carrying it?
+      * is a whole sitemap template reachable only through the sitemap?"""
+    seen = {u.rstrip("/") for u in crawled_urls}
+    link_set, candidates = set(), []
+    for page in pages:
+        p = page.get("parser")
+        if not p:
+            continue
+        for href in p.links:
+            u = normalize(page["url"], href)
+            if not u or not u.startswith("http") or not same_site(u, page["url"]):
+                continue
+            if u.rstrip("/") != (page.get("final_url") or page["url"]).rstrip("/") \
+                    and u.rstrip("/") != page["url"].rstrip("/"):
+                link_set.add(u.rstrip("/"))      # self-links don't count as inlinks
+            if _SKIP_LINK_RE.search(u) or u.rstrip("/") in seen:
+                continue
+            seen.add(u.rstrip("/"))
+            candidates.append(u)
+    findings, summary = [], {}
+    if not candidates:
+        return findings, [("Internal links checked", "no uncrawled internal links found")], summary
+    sample = stratified_sample(candidates, limit)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(lambda u: fetch(u, max_bytes=200_000), sample))
+
+    broken, errors5, redirs, slash_redirs, noncanon, noindexed = [], [], [], [], [], []
+    for u, r in zip(sample, results):
+        if r.status in (404, 410):
+            broken.append(u)
+            continue
+        if r.status >= 500:
+            errors5.append((u, r.status))
+            continue
+        if r.chain:
+            (slash_redirs if _trivial_redirect(u, r.final_url) else redirs).append(u)
+        if r.status == 200 and "html" in r.header("content-type", "").lower():
+            can, noindex, _ = _head_signals(r)
+            if noindex:
+                noindexed.append(u)
+            elif can and same_site(can, u) and (urllib.parse.urlparse(can).path.rstrip("/")
+                                                != urllib.parse.urlparse(r.final_url).path.rstrip("/")):
+                # path differs (a ?query variant canonicalizing to its clean URL is fine)
+                noncanon.append((u, can))
+
+    n = len(sample)
+    if broken:
+        findings.append(f("HIGH", f"Broken internal links ({len(broken)} of {n} sampled)",
+                          "crawlability", 4, 2, trunc("; ".join(broken[:4]), 220),
+                          "Fix or remove links to these URLs (or 301 them to the right page) — broken "
+                          "links leak crawl budget, link equity, and user trust."))
+    if errors5:
+        findings.append(f("MEDIUM", f"Internal links hit server errors ({len(errors5)})",
+                          "crawlability", 3, 3,
+                          trunc("; ".join(f"{u} ({s})" for u, s in errors5[:4]), 220),
+                          "Investigate the 5xx responses on these linked URLs."))
+    if len(redirs) >= 5:
+        findings.append(f("LOW", f"Internal links point at redirects ({len(redirs)} of {n})",
+                          "crawlability", 2, 2, trunc("; ".join(redirs[:4]), 200),
+                          "Update internal links to the final URLs so crawlers and users skip the extra hop."))
+    if len(slash_redirs) >= 3:
+        findings.append(f("LOW", f"Internal links use URL variants that 301 ({len(slash_redirs)} of {n})",
+                          "crawlability", 2, 1, trunc("; ".join(slash_redirs[:4]), 200),
+                          "These links differ from the final URL only by trailing slash, scheme, or "
+                          "www, and each costs a redirect hop. Link the exact canonical form."))
+
+    if len(noncanon) >= 3 and len(noncanon) >= n * 0.15:
+        targets = {c.rstrip("/") for _, c in noncanon}
+        linked = [c for c in targets if c in link_set]
+        orphaned = not linked
+        findings.append(f(
+            "HIGH" if orphaned else "MEDIUM",
+            "Internal links point at non-canonical URLs", "crawlability", 4, 2,
+            f"{len(noncanon)} of {n} sampled link targets declare a different canonical, e.g. "
+            f"{urllib.parse.urlparse(noncanon[0][0]).path} → {urllib.parse.urlparse(noncanon[0][1]).path}"
+            + (". None of those canonical URLs is linked from any crawled page." if orphaned else ""),
+            "Point internal links (navigation, cards, breadcrumbs, llms.txt, feeds) at the canonical "
+            "URL itself. Links to a page that says 'index that other URL instead' pass their signals "
+            "through a hint Google may or may not honor, and leave the canonical pages with no "
+            "internal links of their own."))
+
+    # Does the canonical hand indexing to a thinner page? Compare up to 4 pairs in full.
+    thinner = []
+    for u, can in noncanon[:4]:
+        a, b = fetch(u), fetch(can)
+        if a.status != 200 or b.status != 200:
+            continue
+        _, _, pa = _head_signals(a)
+        _, _, pb = _head_signals(b)
+        ta, _, _ = parse_jsonld_types(pa.jsonld)
+        tb, _, _ = parse_jsonld_types(pb.jsonld)
+        if pa.word_count - pb.word_count >= 150 and pb.word_count < pa.word_count * 0.75:
+            thinner.append((u, can, pa.word_count, pb.word_count, sorted(ta - tb)))
+    if thinner:
+        u, can, wa, wb, lost = thinner[0]
+        findings.append(f(
+            "HIGH", "Canonical points at a thinner page than the one carrying it", "crawlability", 5, 3,
+            f"{urllib.parse.urlparse(u).path} ({wa} words) → canonical "
+            f"{urllib.parse.urlparse(can).path} ({wb} words)"
+            + (f"; schema only on the non-canonical page: {', '.join(lost)}" if lost else "")
+            + (f" · same pattern on {len(thinner)} of {min(4, len(noncanon))} pairs checked" if len(thinner) > 1 else ""),
+            "rel=canonical tells search engines to index the target and drop this page, so content "
+            "that exists only here is never indexed. Move the unique content and structured data "
+            "onto the canonical URL (or make this page the canonical one)."))
+
+    if len(noindexed) >= 5 or (n >= 10 and len(noindexed) >= n * 0.25):
+        findings.append(f("MEDIUM" if len(noindexed) >= n * 0.4 else "LOW",
+                          f"Internal links lead to noindexed pages ({len(noindexed)} of {n} sampled)",
+                          "crawlability", 3, 2, trunc("; ".join(noindexed[:4]), 220),
+                          "Every crawlable link to a noindex page spends crawl budget on a dead end. "
+                          "Render empty/utility destinations as plain text, remove the links, or give "
+                          "the pages real content and let them be indexed."))
+
+    # Sitemap templates that no crawled page links to (sitemap-only = weakly discoverable,
+    # no internal PageRank). Only meaningful for sizeable templates.
+    orphan_templates = []
+    for tmpl, members in cluster_urls(sm_urls).items():
+        if len(members) >= 10 and not any(m.rstrip("/") in link_set for m in members):
+            orphan_templates.append((tmpl, len(members)))
+    # Only meaningful when the crawl saw a real share of the site: on a 50,000-URL
+    # sitemap, "none of our 100 pages links to it" says nothing.
+    if orphan_templates and len(pages) >= 8 and len(sm_urls) <= 40 * len(pages):
+        orphan_templates.sort(key=lambda x: -x[1])
+        findings.append(f(
+            "MEDIUM", "A sitemap template gets no internal links from any crawled page", "crawlability", 4, 3,
+            "; ".join(f"{t} ({c} URLs)" for t, c in orphan_templates[:3])
+            + f" — 0 linked from the {len(pages)} pages crawled (hubs included)",
+            "Pages reachable only via the sitemap are crawled late, ranked weakly, and invisible to "
+            "crawlers that ignore sitemaps. Link them from hub, category, and related-item pages."))
+
+    summary = {"sampled": n, "broken": len(broken), "redirecting": len(redirs) + len(slash_redirs),
+               "non_canonical": len(noncanon), "noindexed": len(noindexed),
+               "orphan_templates": orphan_templates}
+    health = [("Internal links checked",
+               f"{n} sampled across templates · {len(broken)} broken · "
+               f"{len(redirs) + len(slash_redirs)} redirecting · {len(noncanon)} non-canonical · "
+               f"{len(noindexed)} noindexed")]
+    return findings, health, summary
+
+
+def check_head_parity(home_page, extra_urls):
+    """Some frameworks route only GET. Link checkers, uptime monitors and audit tools send
+    HEAD and conclude the resource is gone. (No social platform documents using HEAD.)"""
+    urls = [home_page["final_url"] or home_page["url"]] + [u for u in extra_urls if u]
+    bad = []
+    for u in list(dict.fromkeys(urls))[:8]:
+        g = fetch(u, max_bytes=512)
+        if g.status != 200:
+            continue
+        h = fetch(u, method="HEAD")
+        if h.status >= 400:
+            bad.append(f"{urllib.parse.urlparse(u).path or '/'} GET 200 / HEAD {h.status}")
+    if bad:
+        return [f("LOW", "HEAD requests fail where GET succeeds", "crawlability", 2, 1,
+                  trunc("; ".join(bad), 220),
+                  "Answer HEAD exactly like GET minus the body (RFC 9110). Link checkers, uptime "
+                  "monitors, `curl -I` and many audit tools send HEAD and will report these URLs "
+                  "(often every image on the site) as broken. Search crawlers and the documented "
+                  "social unfurlers use GET, so this is a tooling and monitoring problem, not a ranking one.")]
+    return []
+
+
+# =================================================================================
+# Static performance checks beyond the HTML document
+# =================================================================================
+def _content_length(resp):
+    try:
+        return int(resp.header("content-length") or 0) or len(resp.body)
+    except ValueError:
+        return len(resp.body)
+
+
+def check_hero_and_thumbs(page):
+    """The likely LCP image and the small images, judged by bytes on the wire."""
+    p, findings = page.get("parser"), []
+    if not p or page.get("status") != 200:
+        return findings
+    url = page["url"]
+    hero = next((im for im in p.imgs if im["fetchpriority"] == "high" and im["src"]), None)
+    if not hero:
+        for lt in p.link_tags:
+            if "preload" in (lt.get("rel") or "").lower() and (lt.get("as") or "").lower() == "image" and lt.get("href"):
+                hero = {"src": lt["href"], "loading": "", "srcset": bool(lt.get("imagesrcset"))}
+                break
+    if not hero:
+        for im in p.imgs[:6]:
+            w = int(im["width"]) if str(im["width"]).isdigit() else 0
+            if im["src"] and not im["src"].startswith("data:") and im["loading"] != "lazy" and w >= 600:
+                hero = im
+                break
+    if hero:
+        hu = normalize(url, hero["src"])
+        if hu and hu.startswith("http"):
+            r = fetch(hu, max_bytes=3_000_000, ua=BROWSER_UA)
+            if r.status == 200:
+                kb = _content_length(r) // 1024
+                cross = not same_site(hu, url)
+                if hero.get("loading") == "lazy":
+                    findings.append(f("MEDIUM", "Priority image is lazy-loaded", "performance", 3, 1,
+                                      trunc(hu, 120),
+                                      'Remove loading="lazy" from the hero/LCP image — lazy-loading the '
+                                      "largest above-the-fold image delays LCP."))
+                if cross and r.chain:
+                    findings.append(f("MEDIUM", "Hero image is hotlinked cross-origin through redirects", "performance", 4, 2,
+                                      f"{urllib.parse.urlparse(hu).hostname} · {len(r.chain)} redirect hop(s) · {kb} KB"
+                                      + (" — also far too heavy for an LCP image" if kb > 300 else ""),
+                                      "Host the hero image on your own origin/CDN at the displayed size (AVIF/WebP, srcset). A "
+                                      "third-party host adds DNS+TLS setup and redirect round trips before the "
+                                      "first image byte, can set third-party cookies, and can change or vanish."))
+                elif cross:
+                    findings.append(f("LOW", "Hero image is served from a third-party origin", "performance", 3, 2,
+                                      f"{urllib.parse.urlparse(hu).hostname} · {kb} KB",
+                                      "Self-host the LCP image (or preconnect to its origin) to cut connection setup from LCP."))
+                if kb > 300 and not (cross and r.chain):   # size already reported above
+                    findings.append(f("MEDIUM", "Hero image is very heavy", "performance", 4, 2,
+                                      f"{kb} KB · {trunc(hu, 100)}",
+                                      "Serve the LCP image as AVIF/WebP at the displayed width with srcset/sizes; "
+                                      "aim for well under 150 KB on mobile."))
+                elif kb > 150 and not hero.get("srcset"):
+                    findings.append(f("LOW", "Hero image is heavy and has no srcset", "performance", 3, 2,
+                                      f"{kb} KB · {trunc(hu, 100)}",
+                                      "Add srcset/sizes and a modern format so phones don't download the desktop file."))
+    # small displayed images that are large files
+    small = [im for im in p.imgs if str(im["width"]).isdigit() and 0 < int(im["width"]) <= 160
+             and im["src"] and not im["src"].startswith("data:")]
+    checked, heavy = 0, []
+    for im in _spread(small, 6):
+        iu = normalize(url, im["src"])
+        if not iu or not iu.startswith("http"):
+            continue
+        r = fetch(iu, max_bytes=400_000, ua=BROWSER_UA)
+        if r.status != 200:
+            continue
+        checked += 1
+        b = _content_length(r)
+        if b > 25 * 1024:
+            heavy.append((b, int(im["width"]), iu))
+    if checked >= 3 and len(heavy) >= max(2, checked // 2):
+        avg = sum(b for b, _, _ in heavy) // len(heavy) // 1024
+        findings.append(f("MEDIUM" if len(small) >= 12 else "LOW",
+                          "Small images are served from large files", "performance", 3, 2,
+                          f"{len(heavy)} of {checked} sampled ≤160px images average {avg} KB each; "
+                          f"{len(small)} such images on the page (≈{avg * len(small)} KB if typical)",
+                          "Generate thumbnails at 2× the displayed size (WebP/AVIF). A 60–160px logo "
+                          "should be a few KB, not tens."))
+    return findings
+
+
+def check_fonts(home_page):
+    p = home_page.get("parser")
+    if not p:
+        return []
+    findings = []
+    gf = [lt.get("href") for lt in p.link_tags
+          if "stylesheet" in (lt.get("rel") or "").lower() and "fonts.googleapis.com" in (lt.get("href") or "")]
+    if not gf:
+        return findings
+    preconnects = " ".join((lt.get("href") or "") for lt in p.link_tags if "preconnect" in (lt.get("rel") or "").lower())
+    if "fonts.gstatic.com" not in preconnects:
+        findings.append(f("LOW", "Google Fonts without preconnect to fonts.gstatic.com", "performance", 2, 1,
+                          "stylesheet from fonts.googleapis.com, no <link rel=preconnect href=https://fonts.gstatic.com crossorigin>",
+                          "Add the preconnect (with crossorigin), or self-host the fonts and preload them."))
+    if any("display=" not in (h or "") for h in gf):
+        findings.append(f("LOW", "Google Fonts requested without display=swap", "performance", 2, 1,
+                          trunc(gf[0], 120), "Append &display=swap so text renders immediately in a fallback font."))
+    total, files = 0, 0
+    for href in gf[:2]:
+        css = fetch(normalize(home_page["url"], href), ua=BROWSER_UA)
+        if css.status != 200:
+            continue
+        blocks = re.findall(r"/\*\s*([\w-]+)\s*\*/\s*@font-face\s*{[^}]*?url\((https:[^)]+)\)", css.text)
+        urls = [u for name, u in blocks if name == "latin"] or [u for _, u in blocks[:6]]
+        for fu in list(dict.fromkeys(urls))[:8]:
+            fr = fetch(fu, ua=BROWSER_UA)
+            if fr.status == 200:
+                total += len(fr.body)
+                files += 1
+    if files and total > 150 * 1024:
+        findings.append(f("MEDIUM" if total > 250 * 1024 else "LOW", "Web font payload is heavy", "performance", 3, 2,
+                          f"≈{total // 1024} KB across {files} Latin woff2 file(s) from Google Fonts",
+                          "Drop unused families/axes (italic variable axes are often the largest file), "
+                          "narrow weight/optical-size ranges, or self-host a subset with preload and "
+                          "immutable caching. On text-heavy pages fonts can be the largest download."))
+    return findings
+
+
+def _csp_allows(src_list, script_url, page_url):
+    su = urllib.parse.urlparse(script_url)
+    host, scheme = (su.hostname or "").lower(), su.scheme
+    for tok in src_list:
+        t = tok.strip().lower()
+        if t in ("*",):
+            return True
+        if t == "'self'" and same_site(script_url, page_url) and \
+                (su.hostname or "") == (urllib.parse.urlparse(page_url).hostname or ""):
+            return True
+        if t in ("https:", "http:") and scheme + ":" == t:
+            return True
+        if t.startswith("'"):
+            continue
+        authority = re.sub(r"^[a-z]+://", "", t).split("/")[0]
+        th, _, tport = authority.partition(":")
+        if tport and tport != "*" and tport != (str(su.port) if su.port else
+                                                {"https": "443", "http": "80"}.get(scheme, "")):
+            continue
+        if th.startswith("*."):
+            if host.endswith(th[1:]) and host != th[2:]:
+                return True
+        elif th == host:
+            return True
+    return False
+
+
+def check_csp_blocks(page):
+    """A CSP that forbids a script the page itself ships (classic: a CDN-injected RUM /
+    analytics beacon) means that script silently never runs."""
+    r, p = page.get("response"), page.get("parser")
+    if not r or not p:
+        return []
+    csp = r.header("content-security-policy")
+    if not csp:
+        return []
+    directives = {}
+    for part in csp.split(";"):
+        bits = part.strip().split()
+        if bits:
+            directives[bits[0].lower()] = bits[1:]
+    srcs = directives.get("script-src-elem") or directives.get("script-src") or directives.get("default-src")
+    if srcs is None or "'strict-dynamic'" in [s.lower() for s in srcs]:
+        return []
+    blocked = []
+    for s in p.scripts:
+        if not s["src"] or s["nonce"] or s["type"] == "application/ld+json":
+            continue
+        su = normalize(page["url"], s["src"])
+        if su and su.startswith("http") and not _csp_allows(srcs, su, page["final_url"] or page["url"]):
+            blocked.append(urllib.parse.urlparse(su).hostname or su)
+    blocked = sorted(set(blocked))
+    if blocked:
+        return [f("MEDIUM", "Content-Security-Policy blocks a script the page loads", "performance", 3, 1,
+                  "script-src does not allow: " + ", ".join(blocked[:4]),
+                  "Either add the host to script-src or stop loading the script. A blocked real-user "
+                  "monitoring/analytics beacon means no field Core Web Vitals or traffic data, plus a "
+                  "console error on every page view.")]
+    return []
+
+
+def check_head_order(page):
+    p = page.get("parser")
+    if not p or not p.stylesheet_seq:
+        return []
+    first_css = min(p.stylesheet_seq)
+    early = [s for s in p.scripts if s["src"] and s["in_head"] and s["seq"] < first_css
+             and not same_site(normalize(page["url"], s["src"]) or "", page["url"])]
+    if early:
+        host = urllib.parse.urlparse(normalize(page["url"], early[0]["src"])).hostname
+        return [f("LOW", "Third-party script is requested before the stylesheet", "performance", 2, 1,
+                  f"{host} <script> precedes the first stylesheet in <head>",
+                  "Put charset/viewport/title, preconnects and CSS first; move analytics and tag "
+                  "scripts after the stylesheet. Even async scripts compete for bandwidth with "
+                  "render-critical CSS and fonts on slow connections.")]
+    return []
+
+
+def check_html_caching(page):
+    r = page.get("response")
+    if not r or page.get("status") != 200:
+        return []
+    cc = r.header("cache-control", "").lower()
+    if "no-store" in cc:
+        return [f("LOW", "HTML is served Cache-Control: no-store", "performance", 2, 2,
+                  f"cache-control: {cc}",
+                  "no-store forbids every cache and can make the page ineligible for the browser's "
+                  "back/forward cache, so Back re-fetches it. For personalized pages prefer "
+                  "'private, max-age=0, must-revalidate'; if the page varies by visitor location, "
+                  "note that crawlers only ever see one variant.")]
+    return []
+
+
+# =================================================================================
+# Trust & launch hygiene beyond headers
+# =================================================================================
+def _doh(name, rtype):
+    """DNS-over-HTTPS JSON lookup (stdlib only). Returns list of answer strings, or None
+    when the lookup itself failed (so callers never report a false 'missing')."""
+    for ep in ("https://cloudflare-dns.com/dns-query", "https://dns.google/resolve"):
+        r = fetch(f"{ep}?name={urllib.parse.quote(name)}&type={rtype}",
+                  extra_headers={"Accept": "application/dns-json"})
+        if r.status == 200:
+            try:
+                data = json.loads(r.text)
+                out = []
+                for a in data.get("Answer", []) or []:
+                    d = a.get("data", "")
+                    if rtype == "TXT":      # long TXT = several quoted chunks; join with NO separator
+                        chunks = re.findall(r'"((?:[^"\\]|\\.)*)"', d)
+                        d = "".join(chunks) if chunks else d.strip('"')
+                    out.append(d)
+                return out
+            except (json.JSONDecodeError, ValueError):
+                continue
+    return None
+
+
+def _registrable_candidates(host):
+    if re.fullmatch(r"[\d.]+", host or "") or ":" in (host or ""):
+        return []                                        # IP literal: nothing to look up
+    parts = host.lower().lstrip(".").split(".")
+    if parts and parts[0] == "www":
+        parts = parts[1:]
+    return [".".join(parts[i:]) for i in range(0, max(1, len(parts) - 1))]
+
+
+def check_domain_expiry(host):
+    """Registration expiry via RDAP (rdap.org bootstrap redirector). A lapsed domain is
+    the one failure that takes every ranking with it."""
+    for cand in _registrable_candidates(host)[:3]:
+        r = fetch("https://rdap.org/domain/" + cand, extra_headers={"Accept": "application/rdap+json"})
+        if r.status != 200:
+            continue
+        try:
+            data = json.loads(r.text)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        exp = next((e.get("eventDate") for e in data.get("events", [])
+                    if e.get("eventAction") == "expiration"), None)
+        if not exp:
+            return [], ("Domain registration", f"{cand}: RDAP gives no expiry date")
+        try:
+            d = _dt.date.fromisoformat(exp[:10])
+        except ValueError:
+            return [], ("Domain registration", f"{cand}: unreadable expiry {exp}")
+        days = (d - _dt.date.today()).days
+        findings = []
+        if days <= 30:
+            findings.append(f("HIGH", "Domain registration expires within 30 days", "trust", 5, 1,
+                              f"{cand} expires {d.isoformat()} ({days} days)",
+                              "Renew now and turn on auto-renew with a valid payment method. An expired "
+                              "domain drops out of search and can be re-registered by someone else."))
+        elif days <= 60:
+            findings.append(f("MEDIUM", "Domain registration expires within 60 days", "trust", 4, 1,
+                              f"{cand} expires {d.isoformat()} ({days} days)",
+                              "Confirm auto-renew is on and the card on file is valid."))
+        return findings, ("Domain registration", f"{cand} expires {d.isoformat()} ({days} days)")
+    return [], ("Domain registration", "could not read RDAP record")
+
+
+def check_contact_domains(pages, site_host, security_txt=""):
+    """Every mailto: domain the site publishes (and security.txt's Contact) should
+    actually receive mail. Stale addresses on a retired domain are common after a rebrand."""
+    domains = {}
+    for page in pages:
+        p = page.get("parser")
+        if not p:
+            continue
+        for href in p.links:
+            if href.lower().startswith("mailto:"):
+                addr = urllib.parse.unquote(href[7:].split("?")[0]).strip()
+                if "@" in addr:
+                    domains.setdefault(addr.rsplit("@", 1)[1].lower(), set()).add(page["url"])
+    for m in re.findall(r"(?im)^contact:\s*mailto:([^\s]+)", security_txt or ""):
+        if "@" in m:
+            domains.setdefault(m.rsplit("@", 1)[1].lower(), set()).add("/.well-known/security.txt")
+    dead = []
+    for dom, where in list(domains.items())[:6]:
+        mx = _doh(dom, "MX")
+        if mx is None:
+            continue
+        if any(re.match(r"^0\s+\.$", m.strip()) for m in mx):
+            dead.append(f"{dom} (Null MX: the domain declares it accepts no mail; used on {sorted(where)[0]})")
+        elif not mx:
+            # No MX is not undeliverable by itself: RFC 5321 falls back to the A/AAAA record.
+            a, aaaa = _doh(dom, "A"), _doh(dom, "AAAA")
+            if a is not None and aaaa is not None and not a and not aaaa:
+                dead.append(f"{dom} (no MX, A or AAAA record; used on {sorted(where)[0]})")
+    findings = []
+    if dead:
+        findings.append(f("MEDIUM", "Published contact address uses a domain that cannot receive mail", "trust", 3, 1,
+                          trunc("; ".join(dead), 220),
+                          "Replace the address with one on a live mail domain. A contact route that "
+                          "bounces is a trust failure for customers, quality raters, and security researchers."))
+    return findings, sorted(domains)
+
+
+def check_email_auth(site_host, mail_domains):
+    dom = _registrable_candidates(site_host)[-1] if _registrable_candidates(site_host) else site_host
+    if dom not in mail_domains and not any(d.endswith(dom) for d in mail_domains):
+        return [], None
+    dmarc = _doh("_dmarc." + dom, "TXT")
+    spf = _doh(dom, "TXT")
+    if dmarc is None or spf is None:
+        return [], ("Email authentication", "could not query DNS")
+    rec = next((t for t in dmarc if "v=dmarc1" in t.lower()), "")
+    has_dmarc = bool(rec)
+    has_spf = any("v=spf1" in t.lower() for t in spf)
+    findings = []
+    if rec and "rua=" not in rec.lower():
+        findings.append(f("LOW", "DMARC policy has no reporting address", "trust", 2, 1, trunc(rec, 120),
+                          "Add rua=mailto:… Without it receivers send no aggregate reports, so a "
+                          "misconfigured sender (a new CRM, a newsletter tool) fails silently."))
+    if not has_dmarc or not has_spf:
+        missing = [n for n, ok in (("SPF", has_spf), ("DMARC", has_dmarc)) if not ok]
+        findings.append(f("LOW", "Sending domain lacks " + " and ".join(missing), "trust", 2, 1,
+                          f"{dom}: " + ", ".join(missing) + " record not found",
+                          "Publish SPF and a DMARC policy. Without them, mail from the address you "
+                          "publish is easy to spoof and more likely to land in spam."))
+    note = " · uses pct (historic since RFC 9989)" if re.search(r"\bpct\s*=", rec, re.I) else ""
+    return findings, ("Email authentication",
+                      f"{dom}: SPF {'✓' if has_spf else '✗'} · DMARC {'✓' if has_dmarc else '✗'}"
+                      f"{' (no rua)' if rec and 'rua=' not in rec.lower() else ''}{note} · DKIM not checkable")
+
+
+def check_security_txt(base):
+    r = fetch(normalize(base, "/.well-known/security.txt"), max_bytes=20_000)
+    if r.status != 200 or b"<html" in r.body[:500].lower() or b"contact:" not in r.body.lower():
+        return [], ("security.txt", "not published (optional)"), ""
+    text = r.text
+    findings = []
+    m = re.search(r"(?im)^expires:\s*(\S+)", text)
+    if m:
+        try:
+            if _dt.date.fromisoformat(m.group(1)[:10]) < _dt.date.today():
+                findings.append(f("LOW", "security.txt has expired", "trust", 1, 1, f"Expires: {m.group(1)}",
+                                  "Update the Expires field (RFC 9116 requires a future date)."))
+        except ValueError:
+            pass
+    else:
+        findings.append(f("LOW", "security.txt has no Expires field", "trust", 1, 1, "Expires: missing",
+                          "RFC 9116 requires Contact and Expires."))
+    return findings, ("security.txt", "published"), text
+
+
+_EXPOSED = [("/.git/HEAD", rb"^ref:\s|^[0-9a-f]{40}\s*$", "Git repository metadata"),
+            ("/.env", rb"(?m)^[A-Z][A-Z0-9_]{2,}\s*=", "environment file"),
+            ("/.DS_Store", rb"^\x00\x00\x00\x01Bud1", "macOS directory listing")]
+
+
+def check_exposed_files(base):
+    """Four gates before crying wolf: exactly 200, not HTML, a format-specific signature,
+    and a body that differs from a random-path control (catch-all routes and Worker 404
+    pages answer every path identically)."""
+    control = fetch(normalize(base, "/.seo-audit-control-7f3k9/HEAD"), max_bytes=2048)
+    hits = []
+    for path, sig, label in _EXPOSED:
+        r = fetch(normalize(base, path), max_bytes=2048)
+        if control.status == 200 and control.body[:2048] == r.body[:2048]:
+            continue
+        if (r.status == 200 and "html" not in r.header("content-type", "").lower()
+                and b"<html" not in r.body[:300].lower() and re.search(sig, r.body[:2048])):
+            hits.append(f"{path} ({label})")
+    if hits:
+        return [f("CRITICAL", "Private files are publicly downloadable", "trust", 5, 1, "; ".join(hits),
+                  "Block these paths at the server/CDN and rotate any credentials they contain. An "
+                  "exposed .git or .env lets anyone rebuild your source and secrets.")]
+    return []
+
+
+def check_hsts_quality(home_page):
+    r = home_page.get("response")
+    if not r:
+        return None
+    hsts = r.header("strict-transport-security")
+    if not hsts:
+        return None
+    m = re.search(r"max-age=(\d+)", hsts)
+    age = int(m.group(1)) if m else 0
+    notes = []
+    if age < 15552000:
+        notes.append("max-age under 6 months")
+    if "includesubdomains" not in hsts.lower():
+        notes.append("no includeSubDomains")
+    return ("HSTS", hsts + (" · " + ", ".join(notes) if notes else " · strong"))
+
+
+# =================================================================================
+# Structured data depth
+# =================================================================================
+# Types whose Google rich results were withdrawn or restricted. Markup is harmless, but
+# nobody should expect a SERP feature from it. (Dates per Google Search Central.)
+RETIRED_RICH_RESULTS = {
+    "FAQPage": "FAQ rich results ended 2026-05-07",
+    "HowTo": "HowTo rich results ended 2023-09-13",
+    "SpecialAnnouncement": "rich result retired 2025",
+    "ClaimReview": "fact-check rich result retired 2025",
+    "VehicleListing": "rich result retired 2025",
+    "EstimatedSalary": "rich result retired 2025",
+    "LearningVideo": "rich result retired 2025",
+    "Quiz": "practice-problems rich result retired 2026",
+    "SearchAction": "sitelinks search box retired 2024-11-21",
+}
+# (Book actions and Course list survive; Course *info* did not. Dataset markup only feeds
+# Dataset Search. Markup for a retired feature is inert, never an error.)
+_SELF_SERVING = {"LocalBusiness", "Organization", "Restaurant", "Store", "Corporation",
+                 "ProfessionalService", "MedicalBusiness", "LodgingBusiness", "TouristAttraction"}
+
+
+def _jsonld_nodes(parser):
+    nodes = []
+
+    def walk(n):
+        if isinstance(n, dict):
+            nodes.append(n)
+            for v in n.values():
+                walk(v)
+        elif isinstance(n, list):
+            for v in n:
+                walk(v)
+    for raw in parser.jsonld:
+        try:
+            walk(json.loads(raw))
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return nodes
+
+
+def _types(node):
+    t = node.get("@type")
+    if isinstance(t, str):
+        return {t}
+    if isinstance(t, (list, tuple, set)):
+        return {str(x) for x in t}
+    return set()          # numeric / boolean / missing @type: unusable, never fatal
+
+
+def check_schema_depth(page, is_home):
+    p = page.get("parser")
+    if not p or not p.jsonld:
+        return []
+    findings, nodes = [], _jsonld_nodes(p)
+    site_host = re.sub(r"^www\.", "", urllib.parse.urlparse(page["url"]).hostname or "")
+    for n in nodes:
+        ts = _types(n)
+        if ts & {"Article", "BlogPosting", "NewsArticle"}:
+            missing = [k for k in ("headline", "image", "datePublished", "dateModified", "author") if not n.get(k)]
+            auth = n.get("author")
+            auth = auth[0] if isinstance(auth, list) and auth else auth
+            if isinstance(auth, dict) and not (auth.get("url") or auth.get("sameAs")):
+                missing.append("author.url")
+            if missing:
+                findings.append(f("LOW", "Article schema is missing recommended properties", "schema", 2, 1,
+                                  "missing: " + ", ".join(missing),
+                                  "Add them: image is needed for article rich results and Discover, dates are the "
+                                  "freshness signal engines read, and author.url/sameAs is how an author is "
+                                  "resolved to a real entity."))
+            break
+    for n in nodes:
+        ts = _types(n)
+        if ts & _SELF_SERVING and (n.get("aggregateRating") or n.get("review")):
+            nurl = str(n.get("url") or n.get("@id") or "")
+            own = (not nurl) or site_host in nurl
+            if own:
+                findings.append(f("MEDIUM", "Self-serving review markup on the business's own entity", "schema", 3, 1,
+                                  f"{'/'.join(sorted(ts & _SELF_SERVING))} with aggregateRating/review on its own site",
+                                  "Google ignores review stars for LocalBusiness/Organization when the site "
+                                  "controls the reviews about itself, and ratings copied from Google/Yelp/"
+                                  "Tripadvisor violate the review-snippet guidelines. Remove it, or mark up "
+                                  "first-party reviews of products/services you sell instead."))
+                break
+    if is_home:
+        org = next((n for n in nodes if _types(n) & {"Organization", "Corporation", "LocalBusiness", "NGO"}), None)
+        if org:
+            want = [("logo", "logo"), ("sameAs", "sameAs"), ("legalName", "legalName"),
+                    ("address", "address"), ("foundingDate", "foundingDate")]
+            missing = [lbl for k, lbl in want if not org.get(k)]
+            if not (org.get("contactPoint") or org.get("email") or org.get("telephone")):
+                missing.append("contactPoint/email/telephone")
+            if len(missing) >= 2:
+                findings.append(f("LOW", "Homepage Organization schema is thin", "schema", 3, 1,
+                                  "missing: " + ", ".join(missing),
+                                  "None of these is required by Google, so this is about disambiguation, not "
+                                  "eligibility: a new or little-known brand should state its legalName, logo, "
+                                  "sameAs, contact, address and foundingDate once, on the homepage node, and "
+                                  "show the same facts in visible text. Do not expect schema alone to raise "
+                                  "AI citations; controlled studies find no such lift."))
+    all_types = set().union(*[_types(n) for n in nodes]) if nodes else set()
+    retired = sorted(all_types & set(RETIRED_RICH_RESULTS))
+    if retired:
+        findings.append(f("INFO", "Schema types that no longer earn a Google rich result", "schema", 1, 1,
+                          "; ".join(f"{t}: {RETIRED_RICH_RESULTS[t]}" for t in retired),
+                          "No action required. The markup is inert, not an error, but it earns no SERP "
+                          "feature, and controlled studies find no lift in AI citations from adding "
+                          "schema either. Keep it only if it matches visible content."))
+    return findings
+
+
+# =================================================================================
+# Answer-engine readiness (what AI search can extract, date, and attribute)
+# =================================================================================
+# Plumbing types sort last so the table shows what the page is ABOUT first.
+_STRUCTURAL_TYPES = {"BreadcrumbList", "ListItem", "ItemList", "ImageObject", "WebSite", "WebPage",
+                     "SearchAction", "EntryPoint", "PostalAddress", "Answer", "Question",
+                     "ContactPoint", "GeoCoordinates", "OpeningHoursSpecification", "ReadAction"}
+_QUESTION_RE = re.compile(r"^(who|what|when|where|why|how|which|can|does|do|is|are|should|will)\b.*\?$|\?$", re.I)
+_DATE_TEXT_RE = re.compile(
+    r"\b(updated|last reviewed|last updated|published|reviewed|as of)\b[^.]{0,40}\b(19|20)\d{2}\b", re.I)
+_STREET_RE = re.compile(
+    r"\b\d{1,6}\s+(?:[NSEW]\.?\s+)?[A-Z][\w.'-]*(?:\s+[A-Z][\w.'-]*){0,3}\s+"
+    r"(?:St|Street|Ave|Avenue|Blvd|Boulevard|Rd|Road|Dr|Drive|Ln|Lane|Way|Hwy|Highway|Pkwy|Suite|Ste)\b\.?")
+
+
+def check_answer_readiness(page):
+    """Per-page extractability signals. Snippet restrictions are scored; the rest is
+    recorded for the readiness table because evidence for each is correlational."""
+    p, r = page.get("parser"), page.get("response")
+    if not p or not r or page.get("status") != 200:
+        return [], None
+    findings = []
+    robots = p.meta_robots + " " + r.header("x-robots-tag", "").lower()
+    if "nosnippet" in robots or re.search(r"max-snippet\s*:\s*0\b", robots):
+        findings.append(f("HIGH", "Snippets are disabled for this page", "ai search", 4, 1,
+                          trunc(robots.strip(), 120),
+                          "nosnippet / max-snippet:0 removes the text snippet in Google Search and also "
+                          "keeps the page out of AI Overviews and AI Mode, which honor the same controls. "
+                          "Remove it unless that is the goal."))
+    elif (m := re.search(r"max-snippet\s*:\s*(\d+)", robots)) and 0 < int(m.group(1)) < 50:
+        findings.append(f("LOW", "Snippet length is tightly capped", "ai search", 2, 1, m.group(0),
+                          "A very small max-snippet limits how much of the page search and AI features can quote."))
+    if re.search(r"\b(noarchive|nocache)\b", robots):
+        findings.append(f("LOW", "noarchive / nocache limits Bing Chat and Copilot", "ai search", 2, 1,
+                          trunc(robots.strip(), 120),
+                          "Google ignores these directives now, but Bing gives them AI meaning: noarchive = "
+                          "do not link the page in Chat and Copilot, nocache = show only URL, title and "
+                          "snippet. Remove them unless that is the intent."))
+    words = p.word_count
+    if p.nosnippet_attrs and words and p.nosnippet_attrs >= 5:
+        findings.append(f("LOW", "Many elements are marked data-nosnippet", "ai search", 2, 1,
+                          f"{p.nosnippet_attrs} elements", "Check that the passages you want quoted aren't excluded."))
+    nodes = _jsonld_nodes(p)
+    has_date_schema = any(n.get("dateModified") or n.get("datePublished") for n in nodes)
+    visible_date = bool(p.time_tags or _DATE_TEXT_RE.search(p.visible_text[:20000]))
+    article_like = any(_types(n) & {"Article", "BlogPosting", "NewsArticle"} for n in nodes)
+    if article_like and not visible_date:
+        findings.append(f("LOW", "Article shows no visible publish/update date", "ai search", 2, 1,
+                          "date only in schema" if has_date_schema else "no date in schema or text",
+                          "Show a human-readable published/updated date (ideally in a <time datetime> "
+                          "element) that matches dateModified. Answer engines favor content they can date, "
+                          "and a schema-only date can be treated as unverified."))
+    heads = p.headings["h2"] + p.headings["h3"]
+    stats = {
+        "url": page["url"], "words": words,
+        "question_headings": sum(1 for h in heads if _QUESTION_RE.search(h.strip())),
+        "subheadings": len(heads), "lists": p.list_count, "tables": p.table_count,
+        "dated": "visible" if visible_date else ("schema only" if has_date_schema else "none"),
+        "schema": ", ".join(sorted(page.get("schema_types", []),
+                                   key=lambda t: (t in _STRUCTURAL_TYPES, t))[:4]) or "none",
+    }
+    return findings, stats
+
+
+def check_entity_transparency(pages, home_page):
+    """Who is behind the site? An address normally lives on the about/contact/legal
+    pages, so fetch those (they are rarely in a sample) before saying it is missing."""
+    have = {pg["url"].rstrip("/") for pg in pages}
+    wanted = {}
+    for pg in pages:
+        p = pg.get("parser")
+        for href in (p.links if p else []):
+            u = normalize(pg["url"], href)
+            if not u or not u.startswith("http") or not same_site(u, pg["url"]) or u.rstrip("/") in have:
+                continue
+            path = urllib.parse.urlparse(u).path
+            for kind, rx in _TRUST_PATTERNS.items():
+                if rx.search(path):
+                    wanted.setdefault(kind, u)
+    extra_text, extra_nodes, extra_addr = [], [], False
+    for u in list(wanted.values())[:4]:
+        r = fetch(u, max_bytes=400_000)
+        if r.status == 200:
+            _, _, ep = _head_signals(r)
+            extra_text.append(ep.visible_text[:30000])
+            extra_nodes.extend(_jsonld_nodes(ep))
+            extra_addr = extra_addr or bool(ep.address_tags)
+    saw_trust_page = bool(extra_text) or any(
+        rx.search(urllib.parse.urlparse(pg["url"]).path) for pg in pages for rx in _TRUST_PATTERNS.values())
+    text = " ".join([(pg.get("parser").visible_text[:30000] if pg.get("parser") else "") for pg in pages]
+                    + extra_text)
+    nodes = [n for pg in pages if pg.get("parser") for n in _jsonld_nodes(pg["parser"])] + extra_nodes
+    has_postal = (any(isinstance(n.get("address"), (dict, str)) and n.get("address")
+                      for n in nodes if _types(n) & {"Organization", "Corporation", "NGO"})
+                  or extra_addr
+                  or any(pg.get("parser") and pg["parser"].address_tags for pg in pages)
+                  or bool(_STREET_RE.search(text))
+                  or bool(re.search(r"\bP\.?\s?O\.?\s+Box\s+\d+", text, re.I)))
+    legal = bool(re.search(r"\b(LLC|L\.L\.C\.|Inc\.?|Ltd\.?|GmbH|Corp\.?|PLC|Pty|S\.A\.|B\.V\.)\b", text))
+    findings = []
+    if not has_postal and saw_trust_page:
+        findings.append(f("LOW", "No postal address found anywhere on the crawled pages", "trust", 2, 1,
+                          "no PostalAddress in Organization schema, no <address>, no street-address text "
+                          "on the crawled pages or the about/contact/legal pages",
+                          "Publish a real mailing address (footer, contact or about page, and Organization "
+                          "schema). An organization reachable only by email is a classic low-trust pattern "
+                          "for quality raters and for assistants asked 'is this company legitimate?'."))
+    return findings, ("Entity transparency",
+                      f"postal address {'✓' if has_postal else '✗'} · legal entity named {'✓' if legal else '✗'}")
+
+
+def check_llms_txt(base, llms_resp):
+    """Validate llms.txt against the llmstxt.org shape and test the URLs it advertises.
+    Everything here is INFO and never scored: a May 2026 log study of 137,210 domains found
+    97% of llms.txt files got zero requests and no AI bot probing for one; Google says it
+    does not use such files. The file is public, though, so wrong URLs in it are worth fixing."""
+    text = llms_resp.text
+    lines = [l for l in text.splitlines() if l.strip()]
+    findings, notes = [], []
+    if not lines or not lines[0].startswith("# "):
+        notes.append("first line is not an H1 title")
+    if not any(l.startswith("> ") for l in lines[:6]):
+        notes.append("no blockquote summary")
+    links = re.findall(r"\[[^\]]+\]\((https?://[^)\s]+)\)", text)
+    if not links:
+        notes.append("no markdown links")
+    ctype = llms_resp.header("content-type", "").lower()
+    if "text/plain" not in ctype and "markdown" not in ctype:
+        notes.append(f"served as {ctype or 'unknown type'}")
+    bad, noncanon = [], []
+    own = [u for u in dict.fromkeys(links) if same_site(u, base)][:12]
+    for u in own:
+        r = fetch(u, max_bytes=200_000)
+        if r.status >= 400 or r.status == 0:
+            bad.append(f"{u} ({r.status})")
+        elif r.chain and not _trivial_redirect(u, r.final_url):
+            noncanon.append(u + " (redirects)")
+        elif "html" in r.header("content-type", "").lower():
+            can, noindex, _ = _head_signals(r)
+            if noindex:
+                noncanon.append(u + " (noindex)")
+            elif can and can.rstrip("/") != r.final_url.rstrip("/"):
+                noncanon.append(u + " (canonical elsewhere)")
+    if bad:
+        findings.append(f("INFO", "llms.txt lists URLs that don't resolve", "ai search", 2, 1,
+                          trunc("; ".join(bad[:4]), 200), "Fix or remove the dead links."))
+    if noncanon:
+        findings.append(f("INFO", "llms.txt points at non-canonical URLs", "ai search", 2, 1,
+                          trunc("; ".join(noncanon[:4]), 200),
+                          "List the same canonical URLs you want search engines to index, so citations "
+                          "and search results agree on one address per page."))
+    if notes:
+        findings.append(f("INFO", "llms.txt deviates from the llmstxt.org format", "ai search", 1, 1,
+                          "; ".join(notes), "Optional: H1 title, '>' summary, then H2 sections of markdown links."))
+    full = fetch(normalize(base, "/llms-full.txt"), max_bytes=2048)
+    return findings, ("llms.txt", f"found · {len(links)} links"
+                      + (" · llms-full.txt present" if full.status == 200 and b"<html" not in full.body[:500].lower() else ""))
+
+
+def check_markdown_negotiation(home_url):
+    r = fetch(home_url, max_bytes=4096, extra_headers={"Accept": "text/markdown, text/html;q=0.5"})
+    ok = r.status == 200 and "markdown" in r.header("content-type", "").lower()
+    return ("Markdown for agents", "serves text/markdown on request" if ok
+            else "HTML only (content negotiation for text/markdown not offered — optional)")
+
+
+# =================================================================================
+# Share images across templates, duplicate passages, near-duplicate pages
+# =================================================================================
+def check_page_share_image(page, home_url):
+    """The homepage share image is checked in depth elsewhere; here we make sure every
+    OTHER audited template has one that loads and isn't just a logo."""
+    p = page.get("parser")
+    if not p or page.get("status") != 200 or page["url"].rstrip("/") == home_url.rstrip("/"):
+        return []
+    og = p.og("og:image") or p.twitter("twitter:image")
+    if not og:
+        return [f("LOW", "Page has no share image of its own", "social", 2, 2, "og:image missing",
+                  "Give each template an og:image (1200×630). Links shared from inner pages otherwise unfurl bare.")]
+    iu = normalize(page["url"], og)
+    r = fetch(iu, max_bytes=3_000_000, ua=BROWSER_UA)      # GET, never HEAD — see check_head_parity
+    if r.status != 200:
+        return [f("MEDIUM", "Share image does not load", "social", 3, 1, f"{trunc(iu, 140)} → HTTP {r.status or r.error}",
+                  "Fix the og:image URL. A broken share image unfurls as a blank card everywhere the link is posted.")]
+    info = image_info(r)
+    if info and info["width"] and info["height"]:
+        w, h = info["width"], info["height"]
+        if w < 600 or abs((w / h) - 1.91) / 1.91 > 0.35:
+            return [f("LOW", "Share image is small or not landscape", "social", 2, 2,
+                      f"{w}×{h} · {trunc(iu, 100)}",
+                      "Use a 1200×630 landscape image. Logos and square images are cropped or shrunk to a "
+                      "thumbnail card on most platforms.")]
+    return []
+
+
+def _sentences(text):
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if len(s.split()) >= 12]
+
+
+def check_repeated_passages(page):
+    p = page.get("parser")
+    if not p or p.word_count < 150:
+        return []
+    seen, dup = set(), []
+    for s in _sentences(p.visible_text[:40000]):
+        k = s.lower()
+        if k in seen and s not in dup:
+            dup.append(s)
+        seen.add(k)
+    if dup:
+        return [f("LOW", "The same sentence appears more than once on the page", "on page", 1, 1,
+                  trunc(dup[0], 140) + (f" (+{len(dup) - 1} more)" if len(dup) > 1 else ""),
+                  "Remove the repeated block — usually a template partial rendered twice.")]
+    return []
+
+
+def _shingles(text, k=6):
+    w = re.findall(r"[a-z0-9']+", text.lower())
+    return {" ".join(w[i:i + k]) for i in range(0, max(0, len(w) - k + 1))}
+
+
+def check_template_duplication(pages):
+    """Within each template: how much of a page is unique, and are any two pages
+    near-copies? Uses 6-word shingles over visible text."""
+    findings, rows = [], []
+    by_t = {}
+    for pg in pages:
+        p = pg.get("parser")
+        if p and pg.get("status") == 200 and p.word_count >= 80:
+            by_t.setdefault(url_template(pg["url"]), []).append((pg["url"], _shingles(p.visible_text[:60000]), p.word_count))
+    for tmpl, items in by_t.items():
+        if len(items) < 3:
+            continue
+        counts = {}
+        for _, sh, _ in items:
+            for s in sh:
+                counts[s] = counts.get(s, 0) + 1
+        common = {s for s, c in counts.items() if c >= max(2, int(len(items) * 0.8))}
+        uniq_words = sorted(int(wc * (1 - len(sh & common) / max(1, len(sh)))) for _, sh, wc in items)
+        med = uniq_words[len(uniq_words) // 2]
+        near = 0
+        for i in range(len(items)):
+            for j in range(i + 1, len(items)):
+                a, b = items[i][1], items[j][1]
+                if a and b and len(a & b) / len(a | b) >= 0.8:
+                    near += 1
+        rows.append({"template": tmpl, "pages": len(items), "median_unique_words": med, "near_duplicate_pairs": near})
+        if near:
+            findings.append(f("MEDIUM", "Near-duplicate pages within a template", "on page", 3, 3,
+                              f"{tmpl}: {near} page pair(s) share ≥80% of their text",
+                              "Differentiate, consolidate with a 301/canonical, or noindex the copies. "
+                              "Mass-produced near-identical pages are what Google's scaled-content and "
+                              "doorway policies target."))
+        elif med < 120:
+            findings.append(f("LOW", "Template pages are mostly boilerplate", "on page", 3, 3,
+                              f"{tmpl}: median ≈{med} unique words per page across {len(items)} sampled",
+                              "Add page-specific substance (facts, evidence, local detail). When most of a "
+                              "page is shared template text, engines have little reason to index each one."))
+    return findings, rows
+
+
+# =================================================================================
 # Social preview
 # =================================================================================
 def analyze_social(home_page):
@@ -1697,14 +2962,23 @@ def analyze_social(home_page):
                         "Use a 1200x630 (1.91:1) image so it isn't cropped on Facebook/LinkedIn."))
             metrics.append(("Image size", f"{info['size'] // 1024} KB"))
             metrics.append(("Image type", info["mime"] or "unknown"))
-            if info["size"] > 1024 * 1024:
-                out["findings"].append(f("LOW", "Social image over 1 MB", "social", 2, 1,
+            if info["size"] > 600 * 1024:
+                out["findings"].append(f("LOW", "Share image is over 600 KB", "social", 2, 1,
                                          f"{info['size'] // 1024} KB",
-                                         "Compress the share image; large files slow link unfurling."))
+                                         "WhatsApp documents a 600 KB ceiling for og:image (LinkedIn allows 5 MB). "
+                                         "A 1200×630 JPEG under 600 KB satisfies every documented platform limit at once."))
     else:
         out["findings"].append(f("MEDIUM", "No Open Graph image", "social", 3, 2, "og:image missing",
                                  "Add og:image (1200x630) so shared links show a rich preview."))
 
+    if r is not None:
+        head_end = r.body.lower().find(b"</head>")      # bytes, not characters
+        if head_end > 300 * 1024:
+            out["findings"].append(f("LOW", "<head> ends beyond the first 300 KB of HTML", "social", 2, 2,
+                                     f"</head> at byte ~{head_end // 1024} KB",
+                                     "WhatsApp only reads link-preview tags within the first 300 KB, and other "
+                                     "unfurlers fetch a limited byte range too. Move inlined CSS/JS/JSON below "
+                                     "the meta tags or out of the document."))
     if title:
         metrics.append(("Title length", f"{len(title)} chars"))
     if desc:
@@ -1892,8 +3166,13 @@ def score_categories(all_findings, psi, robots_info):
         seen.add(key)
         unique.append(fi)
     for cat in CATEGORIES:
-        deduction = sum(SEVERITY_WEIGHT[fi["severity"]] for fi in unique if fi["category"] == cat)
-        scores[cat] = max(0, 100 - deduction)
+        # Diminishing returns: the two heaviest findings in a category count in full, the
+        # next two at 75%, the rest at 50%. With ~130 checks a category would otherwise hit
+        # the floor on a pile of LOWs and stop distinguishing a bad site from a terrible one.
+        weights = sorted((SEVERITY_WEIGHT[fi["severity"]] for fi in unique if fi["category"] == cat),
+                         reverse=True)
+        deduction = sum(w * (1.0 if i < 2 else 0.75 if i < 4 else 0.5) for i, w in enumerate(weights))
+        scores[cat] = max(0, round(100 - deduction))
     # Performance: the base score already reflects observable signals from the HTML and
     # headers (compression, render-blocking JS, page weight, DOM size, image dimensions,
     # response time) — those are things we DID observe, so they always count. When
@@ -1917,7 +3196,8 @@ def confidence_level(psi, pages, ai_blocked):
 # =================================================================================
 # Orchestration
 # =================================================================================
-def run_audit(start_url, max_pages=5, use_pagespeed=False):
+def run_audit(start_url, max_pages=15, use_pagespeed=False, sweep=100, probe_ai=True,
+              network_checks=True):
     if not start_url.startswith("http"):
         start_url = "https://" + start_url
     parsed = urllib.parse.urlparse(start_url)
@@ -1929,22 +3209,20 @@ def run_audit(start_url, max_pages=5, use_pagespeed=False):
     robots_found = robots_resp.status == 200 and robots_resp.body
     robots_info = parse_robots(robots_resp.text) if robots_found else {"sitemaps": [], "ai_blocked": [], "blocks_all": False}
 
-    sm_urls = []
-    for sm in robots_info["sitemaps"]:
-        sm_urls.extend(collect_sitemap_urls(sm))
-    sitemap_exists = bool(robots_info["sitemaps"])
-    if not sm_urls:
+    sm_files = list(robots_info["sitemaps"])
+    sitemap_exists = bool(sm_files)
+    sm_meta = read_sitemaps(sm_files) if sm_files else None
+    if not sm_meta or not sm_meta["urls"]:
         default_sm = normalize(base, "/sitemap.xml")
         r_sm = fetch(default_sm, max_bytes=200_000)
         head = r_sm.body[:4096].lower()
         if r_sm.status == 200 and (b"<urlset" in head or b"<sitemapindex" in head):
             sitemap_exists = True
-            sm_urls = collect_sitemap_urls(default_sm)
+            sm_files = [default_sm]
+            sm_meta = read_sitemaps(sm_files)
+    sm_urls = sm_meta["urls"] if sm_meta else []
     sitemap_found = sitemap_exists and bool(sm_urls)
 
-    # llms.txt — an emerging convention for giving AI crawlers a curated content index.
-    # We report it, but only as INFO: large-scale studies have found no measurable link
-    # between having one and being cited by LLMs, so it shouldn't move the score.
     llms_resp = fetch(normalize(base, "/llms.txt"))
     llms_found = (llms_resp.status == 200 and bool(llms_resp.body)
                   and b"<html" not in llms_resp.body[:2000].lower())
@@ -1953,7 +3231,19 @@ def run_audit(start_url, max_pages=5, use_pagespeed=False):
     pages_urls = [u for u, _ in page_specs]
 
     site_findings = []
-    if not robots_found:
+    if robots_resp.status >= 500:
+        site_findings.append(f("CRITICAL", "robots.txt returns a server error", "crawlability", 5, 2,
+                               f"GET /robots.txt → HTTP {robots_resp.status}",
+                               "Google treats a robots.txt that answers 5xx as 'disallow everything' and "
+                               "stops crawling the site until it recovers. Serve 200 (or 404 if you have none)."))
+    elif robots_found and ("html" in robots_resp.header("content-type", "").lower()
+                           or robots_resp.body.lstrip()[:1] == b"<"):
+        site_findings.append(f("HIGH", "robots.txt is an HTML page", "crawlability", 4, 1,
+                               f"content-type: {robots_resp.header('content-type') or 'unknown'}",
+                               "A catch-all route is answering /robots.txt with the site shell. Crawlers "
+                               "cannot parse it, so none of your rules (or your Sitemap line) apply. Serve a "
+                               "real text/plain robots.txt."))
+    elif not robots_found:
         site_findings.append(f("MEDIUM", "robots.txt not found", "crawlability", 3, 1, "/robots.txt missing",
                                "Add a robots.txt that allows crawling and points to your sitemap."))
     elif sitemap_exists and not robots_info["sitemaps"]:
@@ -1972,84 +3262,164 @@ def run_audit(start_url, max_pages=5, use_pagespeed=False):
         site_findings.append(f("CRITICAL", "robots.txt blocks all crawlers", "crawlability", 5, 1,
                                "User-agent: * Disallow: /",
                                "Remove the site-wide Disallow so search engines can index the site."))
+    if robots_found and len(robots_resp.body) > 500 * 1024:
+        site_findings.append(f("MEDIUM", "robots.txt exceeds 500 KiB", "crawlability", 3, 2,
+                               f"{len(robots_resp.body) // 1024} KiB",
+                               "Google and RFC 9309 parsers stop reading at 500 KiB; rules past that point are ignored."))
     if robots_info.get("ai_blocked"):
         agents = sorted(set(robots_info["ai_blocked"]))
-        site_findings.append(f("LOW", "robots.txt blocks AI crawlers", "ai search", 2, 1,
-                               ", ".join(agents) + " disallowed",
-                               "Allow these crawlers if you want this content cited in AI answers "
-                               "(ChatGPT, Claude, Perplexity…); keep the block only if it's deliberate policy."))
-    if not llms_found:
-        site_findings.append(f("INFO", "No llms.txt file", "ai search", 1, 1, "/llms.txt not found",
-                               "Optional/emerging: an llms.txt at the site root offers AI crawlers a curated "
-                               "content index. Evidence that it affects AI citations is so far inconclusive, so "
-                               "treat it as low priority — server-rendered content and schema matter far more."))
+        live = [a for a in agents if AI_CRAWLER_ROLES.get(a) in ("search", "user")]
+        if live:
+            site_findings.append(f("MEDIUM", "robots.txt blocks AI search crawlers", "ai search", 4, 1,
+                                   ", ".join(live) + " disallowed"
+                                   + (" (also: " + ", ".join(a for a in agents if a not in live) + ")" if len(agents) > len(live) else ""),
+                                   "These agents build answer-engine search indexes or fetch a page when a "
+                                   "person asks about it. Blocking them removes the site from those answers. "
+                                   "If the goal was to stay out of model training, block only the training "
+                                   "crawlers (GPTBot, ClaudeBot, CCBot, Google-Extended…) and allow these."))
+        else:
+            site_findings.append(f("LOW", "robots.txt blocks AI training crawlers", "ai search", 2, 1,
+                                   ", ".join(agents) + " disallowed",
+                                   "A legitimate policy choice; keep it if deliberate. Two things to know: "
+                                   "Google-Extended does not affect AI Overviews or AI Mode (Googlebot and "
+                                   "snippet controls do), though sites blocking it have been measured getting "
+                                   "no Gemini citations; and Applebot-Extended is an opt-out token, not a crawler."))
+    # A missing llms.txt is never a finding: 2026 server-log studies show AI crawlers do not
+    # request it, and Google documents that it does not use such files. We only validate
+    # one that exists (INFO), because a file that points at dead or non-canonical URLs is
+    # still a public mistake.
+    if sitemap_found:
+        site_findings.extend(sitemap_meta_findings(sm_meta))
 
-    # Analyze pages concurrently — each is mostly network wait, so a small thread pool
-    # cuts wall-clock roughly linearly. ThreadPoolExecutor.map preserves input order, so
-    # the homepage stays first and the report order is deterministic.
+    # ---- deep pages (full per-page tables) ----
     workers = min(8, max(1, len(pages_urls)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         pages = [pg for pg, _ in ex.map(analyze_page, pages_urls)]
     for pg, (_, src) in zip(pages, page_specs):
         pg["source"] = src
 
-    # Sitemap hygiene: the sitemap should list final URLs, not redirects.
-    sm_redirects = [p["url"] for p in pages if p.get("source") == "sitemap" and p.get("chain_hops")]
+    if pages and (pages[0].get("status") or 0) >= 400:
+        site_findings.append(f("CRITICAL", "The homepage does not load", "crawlability", 5, 2,
+                               f"GET {pages[0]['url']} → HTTP {pages[0]['status']}",
+                               "Everything else in this report is secondary: the site's front door "
+                               "returns an error to crawlers and visitors."))
+
+    # ---- sweep: a wider stratified sample of the sitemap, analyzed the same way but
+    # reported in aggregate. This is what catches a problem that lives on the 250-page
+    # template rather than on the dozen pages that get a full table. ----
+    sweep_urls = stratified_sample([u for u in sm_urls if same_site(base, u)], max(0, sweep),
+                                   exclude=pages_urls) if sweep else []
+    sweep_pages = []
+    if sweep_urls:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            sweep_pages = [pg for pg, _ in ex.map(analyze_page, sweep_urls)]
+        for pg in sweep_pages:
+            pg["source"] = "sitemap"
+    all_pages = pages + sweep_pages
+
+    # Sitemap hygiene, judged on every sitemap URL we fetched.
+    from_sm = [p for p in all_pages if p.get("source") == "sitemap"]
+    sm_redirects = [p["url"] for p in from_sm if p.get("chain_hops")]
     if len(sm_redirects) >= 2:
         site_findings.append(f("LOW", f"Sitemap lists redirecting URLs ({len(sm_redirects)})",
                                "crawlability", 2, 1, trunc("; ".join(sm_redirects[:4]), 200),
                                "Regenerate the sitemap with final canonical URLs — redirecting entries "
                                "waste crawl budget."))
+    sm_dead = [p["url"] for p in from_sm if p.get("status", 0) in (404, 410) or p.get("status", 0) >= 500]
+    if sm_dead:
+        site_findings.append(f("HIGH" if len(sm_dead) >= max(2, len(from_sm) * 0.1) else "MEDIUM",
+                               f"Sitemap lists URLs that return errors ({len(sm_dead)} of {len(from_sm)} checked)",
+                               "crawlability", 4, 1, trunc("; ".join(sm_dead[:4]), 200),
+                               "Remove dead URLs from the sitemap or restore the pages."))
+    sm_noindex = [p["url"] for p in from_sm if "noindex" in (p.get("robots") or "")]
+    if sm_noindex:
+        site_findings.append(f("MEDIUM", f"Sitemap lists noindexed URLs ({len(sm_noindex)} of {len(from_sm)} checked)",
+                               "crawlability", 3, 1, trunc("; ".join(sm_noindex[:4]), 200),
+                               "A sitemap should list only indexable URLs. Drop these, or remove the noindex."))
+    sm_noncanon = []
+    for p in from_sm:
+        can = normalize(p.get("final_url") or p["url"], p.get("canonical") or "") if p.get("canonical") else ""
+        if can and same_site(can, p["url"]) and can.rstrip("/") != (p.get("final_url") or p["url"]).rstrip("/"):
+            sm_noncanon.append(p["url"])
+    if len(sm_noncanon) >= 2:
+        site_findings.append(f("MEDIUM", f"Sitemap lists non-canonical URLs ({len(sm_noncanon)} of {len(from_sm)} checked)",
+                               "crawlability", 3, 1, trunc("; ".join(sm_noncanon[:4]), 200),
+                               "List the canonical URL of each page only; a sitemap and a canonical tag "
+                               "that disagree send search engines conflicting signals."))
 
-    descriptions = {}
-    titles = {}
-    for page in pages:
+    fell_back = [p["url"] for p in all_pages if p.get("ua_fallback")]
+    still_blocked = [p["url"] for p in all_pages if p.get("status") in (401, 403, 406, 429)]
+    if fell_back or still_blocked:
+        site_findings.append(f(
+            "INFO", "Site refuses non-browser user-agents", "crawlability", 2, 2,
+            f"{len(fell_back)} page(s) were only readable with a browser user-agent; "
+            f"{len(still_blocked)} stayed blocked (401/403/429)",
+            "Bot protection is refusing automated clients. Make sure it admits verified search "
+            "and AI crawlers. Pages that stayed blocked could not be audited, so treat the score "
+            "as partial."))
+
+    # cross-page duplicates — across deep AND swept pages
+    descriptions, titles = {}, {}
+    for page in all_pages:
         if page.get("description"):
             descriptions.setdefault(page["description"], []).append(page["url"])
         if page.get("title"):
             titles.setdefault(page["title"], []).append(page["url"])
-
-    # cross-page duplicate checks (added to each offending page)
     for desc, urls in descriptions.items():
         if len(urls) > 1:
-            for page in pages:
+            for page in all_pages:
                 if page.get("description") == desc:
                     page["findings"].append(f("MEDIUM", "Duplicate meta description across pages",
                                               "on page", 3, 2, f"Same description on {len(urls)} pages",
                                               "Write a page-specific description reflecting this page's unique content."))
     for title, urls in titles.items():
         if len(urls) > 1:
-            for page in pages:
+            for page in all_pages:
                 if page.get("title") == title:
                     page["findings"].append(f("MEDIUM", "Duplicate title across pages",
                                               "on page", 3, 2, f"Same title on {len(urls)} pages",
                                               "Give each page a distinct, descriptive title."))
 
-    # Homepage entity schema — Organization + WebSite JSON-LD is foundational for both
-    # rich results and for search/AI engines to identify the entity behind the site
-    # (an E-E-A-T and knowledge-graph signal that carries more weight in 2026).
     if pages:
         home_types = set(pages[0].get("schema_types", []))
         if not ({"Organization", "WebSite", "LocalBusiness"} & home_types):
             pages[0]["findings"].append(f(
                 "LOW", "No Organization/WebSite schema on homepage", "schema", 3, 2,
                 "Neither Organization nor WebSite JSON-LD found on the homepage",
-                "Add Organization (with logo and sameAs links to your social/profile URLs) and WebSite "
-                "JSON-LD so search and AI engines can identify and trust the entity behind the site."))
+                "Add Organization (with logo and sameAs links to your profile URLs) and WebSite "
+                "JSON-LD so search engines can tie the site to one entity (site name, logo, knowledge panel)."))
 
-    # Breadcrumb schema: with several pages crawled and none declaring breadcrumbs,
-    # SERPs show raw URLs instead of the site hierarchy. Skipped when nothing is
-    # server-rendered — the client-render CRITICAL already covers that root cause.
     any_rendered = any(p.get("word_count", 0) > 0 for p in pages)
     if (any_rendered and len(pages) >= 3
-            and not any("BreadcrumbList" in (p.get("schema_types") or []) for p in pages)):
+            and not any("BreadcrumbList" in (p.get("schema_types") or []) for p in all_pages)):
         site_findings.append(f("LOW", "No BreadcrumbList schema on any crawled page", "schema", 2, 2,
-                               f"0 of {len(pages)} pages declare breadcrumb structured data",
+                               f"0 of {len(all_pages)} pages declare breadcrumb structured data",
                                "Add BreadcrumbList JSON-LD (and visible breadcrumbs) so search results "
                                "show your site hierarchy instead of a raw URL."))
 
-    # ---- site-wide checks: host variants, 404 handling, TLS, trust pages,
-    # broken links, asset caching, analytics ----
+    # ---- per-page deep checks that need extra requests: run on every deep page, but
+    # image/byte checks only on the first page of each template to bound traffic ----
+    home_url = pages[0]["url"] if pages else base
+    readiness = []
+    seen_templates = set()
+    for i, page in enumerate(pages):
+        extra = []
+        extra += check_csp_blocks(page) + check_head_order(page) + check_html_caching(page)
+        extra += check_schema_depth(page, is_home=(i == 0)) + check_repeated_passages(page)
+        ar_f, ar_row = check_answer_readiness(page)
+        extra += ar_f
+        if ar_row:
+            readiness.append(ar_row)
+        t = url_template(page["url"])
+        if t not in seen_templates or i == 0:
+            seen_templates.add(t)
+            extra += check_hero_and_thumbs(page) + check_page_share_image(page, home_url)
+        page["findings"].extend(extra)
+    for page in sweep_pages:   # cheap, no extra requests
+        page["findings"].extend(check_schema_depth(page, False) + check_repeated_passages(page)
+                                + check_answer_readiness(page)[0])
+
+    # ---- site-wide probes ----
     health = []
     hv_f, hv_h = check_host_variants(base, pages[0]["final_url"] if pages else base)
     site_findings.extend(hv_f)
@@ -2060,35 +3430,90 @@ def run_audit(start_url, max_pages=5, use_pagespeed=False):
     tls_f, tls_h = tls_certificate(parsed.hostname or domain)
     site_findings.extend(tls_f)
     health.append(tls_h)
-    tr_f, tr_h, tr_sig = check_trust_pages(pages)
+    tr_f, tr_h, tr_sig = check_trust_pages(all_pages)
     site_findings.extend(tr_f)
     health.append(tr_h)
-    crawled = {p["url"] for p in pages} | {p["final_url"] for p in pages if p.get("final_url")}
-    bl_f, bl_h = check_broken_links(pages, crawled)
-    site_findings.extend(bl_f)
-    health.append(bl_h)
+    crawled = {p["url"] for p in all_pages} | {p["final_url"] for p in all_pages if p.get("final_url")}
+    la_f, la_h, link_summary = check_link_architecture(all_pages, crawled, sm_urls)
+    site_findings.extend(la_f)
+    health.extend(la_h)
+    dup_f, dup_rows = check_template_duplication(all_pages)
+    site_findings.extend(dup_f)
+    et_f, et_h = check_entity_transparency(all_pages, pages[0] if pages else None)
+    site_findings.extend(et_f)
+    health.append(et_h)
+
+    ai_matrix = []
     if pages:
         site_findings.extend(check_asset_caching(pages[0]))
+        site_findings.extend(check_fonts(pages[0]))
         an_f, an_h = detect_analytics(pages[0])
         site_findings.extend(an_f)
         health.append(an_h)
-    health.append(("llms.txt", "found" if llms_found else "not found (optional)"))
-    health.append(("AI crawler access",
+        hp = pages[0].get("parser")
+        og0 = normalize(home_url, hp.og("og:image")) if hp and hp.og("og:image") else ""
+        by_prefix = {}       # one same-site image per top-level directory (/assets, /media, …):
+        for pg in all_pages:  # static files and app-routed media often behave differently
+            pr = pg.get("parser")
+            for im in (pr.imgs if pr else []):
+                u = normalize(pg["url"], im["src"]) if im["src"] and not im["src"].startswith("data:") else ""
+                if u and same_site(u, base):
+                    by_prefix.setdefault(urllib.parse.urlparse(u).path.split("/")[1], u)
+        site_findings.extend(check_head_parity(
+            pages[0], [og0] + list(by_prefix.values())[:4] + [sm_files[0] if sm_files else ""]))
+        hsts = check_hsts_quality(pages[0])
+        if hsts:
+            health.append(hsts)
+        if pages[0].get("status") == 200:
+            health.append(check_markdown_negotiation(home_url))
+
+    if robots_found:
+        rp_f, rp_h = robots_platform_signals(robots_resp.text, robots_resp)
+        site_findings.extend(rp_f)
+        health.append(rp_h)
+    if llms_found:
+        ll_f, ll_h = check_llms_txt(base, llms_resp)
+        site_findings.extend(ll_f)
+        health.append(ll_h)
+    else:
+        health.append(("llms.txt", "not present (no action needed; AI crawlers are not observed requesting it)"))
+    health.append(("AI crawler robots.txt rules",
                    ("blocked: " + ", ".join(sorted(set(robots_info["ai_blocked"]))))
-                   if robots_info.get("ai_blocked") else "no AI crawlers blocked in robots.txt"))
+                   if robots_info.get("ai_blocked") else "no AI crawlers disallowed"))
+    if probe_ai and pages and pages[0].get("status") == 200:
+        inner = next((p["url"] for p in pages[1:] if p.get("status") == 200), None)
+        ai_f, ai_h, ai_matrix = probe_ai_agents(home_url, robots_resp.text if robots_found else "", inner)
+        site_findings.extend(ai_f)
+        health.extend(ai_h)
 
-    # PageSpeed on the homepage
+    site_findings.extend(check_exposed_files(base))
+    st_f, st_h, st_text = check_security_txt(base)
+    site_findings.extend(st_f)
+    health.append(st_h)
+    if network_checks:      # third-party lookups: DNS-over-HTTPS and RDAP
+        cd_f, mail_domains = check_contact_domains(all_pages, parsed.hostname or domain, st_text)
+        site_findings.extend(cd_f)
+        ea_f, ea_h = check_email_auth(parsed.hostname or domain, mail_domains)
+        site_findings.extend(ea_f)
+        if ea_h:
+            health.append(ea_h)
+        de_f, de_h = check_domain_expiry(parsed.hostname or domain)
+        site_findings.extend(de_f)
+        health.append(de_h)
+
+    verif = []
+    if pages and pages[0].get("parser"):
+        hp = pages[0]["parser"]
+        verif = [n for n, k in (("Google", "google-site-verification"), ("Bing", "msvalidate.01"),
+                                ("Yandex", "yandex-verification")) if hp.meta_content("name", k)]
+    health.append(("Webmaster verification tags",
+                   ", ".join(verif) if verif else "none in the homepage HTML (DNS/file verification not visible here)"))
+
     psi = pagespeed(pages[0]["final_url"] if pages else base, use_pagespeed)
-
     social = analyze_social(pages[0]) if pages else {"metrics": [], "findings": []}
-
-    # keyword focus + footprint — must run while page parsers are still attached
     keywords = extract_keywords(pages)
-    footprint = extract_footprint(pages)
+    footprint = extract_footprint(all_pages)
 
-    # Local-business schema: if the site shows local signals (phone links, Google
-    # Maps/Business Profile links) it should declare LocalBusiness — and if it does,
-    # the record should be complete enough to feed the map pack and AI answers.
     local = (footprint.get("google") or {}).get("local")
     has_local_signals = (tr_sig.get("has_tel")
                          or (footprint.get("google") or {}).get("gbp_links")
@@ -2100,8 +3525,8 @@ def run_audit(start_url, max_pages=5, use_pagespeed=False):
         if missing_local:
             site_findings.append(f("LOW", "LocalBusiness schema incomplete", "schema", 2, 1,
                                    "missing: " + ", ".join(missing_local),
-                                   "Fill in telephone, full address, geo, and openingHours in the "
-                                   "LocalBusiness JSON-LD — complete data feeds the map pack and AI answers."))
+                                   "Google requires only name and address; telephone, geo and openingHours are "
+                                   "recommended and make the listing consistent with your Business Profile."))
     elif has_local_signals:
         site_findings.append(f("MEDIUM", "No LocalBusiness schema for a local business", "schema", 3, 2,
                                "Site shows local signals (phone / Google Maps links) but no "
@@ -2110,7 +3535,40 @@ def run_audit(start_url, max_pages=5, use_pagespeed=False):
                                "Restaurant) with name, address, telephone, geo, openingHours, and sameAs — "
                                "the backbone of local SEO."))
 
-    # gather every finding for scoring
+    # ---- aggregate the sweep: one site-wide finding per issue type, with counts ----
+    deep_keys = {(fi["category"], fi["title"]) for p in pages for fi in p["findings"]}
+    agg = {}
+    for sp in sweep_pages:
+        for fi in sp["findings"]:
+            if fi["severity"] == "INFO":
+                continue
+            agg.setdefault((fi["category"], fi["title"]), {"f": fi, "urls": []})["urls"].append(sp["url"])
+    sweep_summary = []
+    for (cat, title), v in sorted(agg.items(), key=lambda kv: (SEVERITY_ORDER[kv[1]["f"]["severity"]], -len(kv[1]["urls"]))):
+        n_aff = len(v["urls"])
+        tmpls = sorted({url_template(u) for u in v["urls"]})
+        sweep_summary.append({"severity": v["f"]["severity"], "title": title, "category": cat,
+                              "count": n_aff, "templates": tmpls, "example": v["urls"][0]})
+        if (cat, title) not in deep_keys:
+            fi = dict(v["f"])
+            # Prevalence: a problem on under 10% of swept pages is a page problem, not a
+            # template problem, so it scores one step lower (CRITICAL is never softened).
+            if n_aff < max(2, len(sweep_pages) * 0.1) and fi["severity"] in ("HIGH", "MEDIUM"):
+                fi["severity"] = {"HIGH": "MEDIUM", "MEDIUM": "LOW"}[fi["severity"]]
+            fi["observed"] = (f"{n_aff} of {len(sweep_pages)} swept sitemap pages "
+                              f"(templates: {', '.join(tmpls[:3])}) · e.g. {urllib.parse.urlparse(v['urls'][0]).path} "
+                              f"· {trunc(str(v['f']['observed']), 90)}")
+            site_findings.append(fi)
+
+    # ---- coverage: which templates exist, and how much of each did we look at ----
+    clusters = cluster_urls([u for u in sm_urls if same_site(base, u)])
+    looked = {}
+    for p in all_pages:
+        looked[url_template(p["url"])] = looked.get(url_template(p["url"]), 0) + 1
+    coverage = [{"template": t, "urls": len(m), "audited": looked.get(t, 0)}
+                for t, m in sorted(clusters.items(), key=lambda kv: -len(kv[1]))]
+    unseen = [c for c in coverage if c["urls"] >= 5 and c["audited"] == 0]
+
     all_findings = (list(site_findings) + list(social["findings"])
                     + list(footprint["findings"]) + list(psi.get("findings", [])))
     for page in pages:
@@ -2118,26 +3576,40 @@ def run_audit(start_url, max_pages=5, use_pagespeed=False):
 
     scores, overall = score_categories(all_findings, psi, robots_info)
     conf = confidence_level(psi, pages, robots_info.get("ai_blocked"))
+    if pages and sum(1 for p in all_pages if p.get("status") == 200) < max(1, len(all_pages) // 2):
+        conf = "low"          # most pages did not load: the score describes very little
+    if conf == "high" and unseen:
+        conf = "medium"
 
-    # sort each page's findings by severity then impact
     for page in pages:
         page["findings"].sort(key=lambda x: (SEVERITY_ORDER[x["severity"]], -x["impact"]))
-        # drop heavy parser/response objects before returning (not JSON serializable)
+    for page in all_pages:
         page.pop("parser", None)
         page.pop("response", None)
     social["findings"].sort(key=lambda x: (SEVERITY_ORDER[x["severity"]], -x["impact"]))
     site_findings.sort(key=lambda x: (SEVERITY_ORDER[x["severity"]], -x["impact"]))
 
     return {
-        "url": base, "domain": domain,
+        "url": base, "domain": domain, "version": VERSION,
         "generated": _dt.datetime.now(),
         "page_count": len(pages),
+        "sweep_count": len(sweep_pages),
+        "sitemap_url_count": len(sm_urls),
+        "sitemap_truncated": bool(sm_meta and sm_meta["truncated"]),
+        "sitemap_files": (sm_meta or {}).get("files_read", 0),
         "confidence": conf,
         "overall": overall,
         "scores": scores,
         "robots_found": bool(robots_found),
         "sitemap_found": bool(sitemap_found),
         "health": health,
+        "coverage": coverage,
+        "coverage_gaps": [c["template"] for c in unseen],
+        "ai_matrix": ai_matrix,
+        "readiness": readiness,
+        "duplication": dup_rows,
+        "link_summary": link_summary,
+        "sweep_summary": sweep_summary,
         "psi": psi,
         "social": social,
         "keywords": keywords,
@@ -2150,15 +3622,25 @@ def run_audit(start_url, max_pages=5, use_pagespeed=False):
 def main():
     ap = argparse.ArgumentParser(description="Audit a website's SEO and write an HTML+PDF report.")
     ap.add_argument("url", help="Site URL, e.g. https://example.com")
-    ap.add_argument("--max-pages", type=int, default=5)
+    ap.add_argument("--max-pages", type=int, default=15,
+                    help="Pages that get a full per-page table, sampled across URL templates (default 15)")
+    ap.add_argument("--sweep", type=int, default=100,
+                    help="Additional sitemap URLs analyzed and reported in aggregate (default 100, 0 = off)")
+    ap.add_argument("--no-ai-probe", action="store_true",
+                    help="Skip requesting the homepage with AI-crawler user-agents")
+    ap.add_argument("--offline-dns", action="store_true",
+                    help="Skip third-party lookups (RDAP domain expiry, DNS-over-HTTPS mail checks)")
+    ap.add_argument("--version", action="version", version="seo-audit " + VERSION)
     ap.add_argument("--out", default=".", help="Output directory")
     ap.add_argument("--no-pdf", action="store_true", help="Skip PDF rendering")
     ap.add_argument("--pagespeed", action="store_true", help="Query PageSpeed Insights (best effort)")
     ap.add_argument("--json", action="store_true", help="Also write the raw report JSON")
     args = ap.parse_args()
 
-    print(f"Auditing {args.url} (up to {args.max_pages} pages)…", file=sys.stderr)
-    report = run_audit(args.url, args.max_pages, args.pagespeed)
+    print(f"seo-audit {VERSION} · auditing {args.url} ({args.max_pages} deep pages + "
+          f"{args.sweep} swept)…", file=sys.stderr)
+    report = run_audit(args.url, args.max_pages, args.pagespeed, sweep=args.sweep,
+                       probe_ai=not args.no_ai_probe, network_checks=not args.offline_dns)
 
     # import the renderer (sibling module)
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -2187,7 +3669,11 @@ def main():
         else:
             print("PDF rendering unavailable; HTML report written.", file=sys.stderr)
 
-    print(f"\nOverall score: {report['overall']}/100  ·  {report['confidence']} confidence")
+    print(f"\nOverall score: {report['overall']}/100  ·  {report['confidence']} confidence  ·  "
+          f"{report['page_count']} deep + {report['sweep_count']} swept of "
+          f"{report['sitemap_url_count']} sitemap URLs")
+    if report.get("coverage_gaps"):
+        print("Templates never sampled: " + ", ".join(report["coverage_gaps"]))
     print(f"HTML: {html_path}")
 
 
