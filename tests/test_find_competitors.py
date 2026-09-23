@@ -6,7 +6,11 @@ The Brave sample below is synthetic but mirrors the structure of real search.bra
 result pages (September 2026): section#mixed-main, div.snippet[data-type=web][data-pos]
 with the title in a .title element's title attribute, an ad block with
 data-landing-page, an untyped entity snippet, a video cluster, #faq, #discussions,
-#locations, and the #infobox card in section#mixed-side.
+#locations, and the #infobox card in section#mixed-side. Like every real result page it
+carries the word "captcha" in Brave's i18n bundle, which is not a captcha signal.
+NO_RESULTS_SAMPLE is a 200 page for a query Brave has nothing for; the two captcha
+samples carry the interstitial's markers (its sentence and torproject.org link, or only
+its page:"/captcha" config).
 """
 
 import contextlib
@@ -26,6 +30,7 @@ import seo_audit as SA                                            # noqa: E402
 
 BRAVE_SAMPLE = """<!doctype html><html lang="en"><head><title>flagstaff ghost tour - Brave Search</title>
 <link rel="stylesheet" href="https://cdn.search.brave.com/serp/v3/_app/immutable/assets/app.css">
+<script>const i18n = {"Switch to traditional captcha":"Switch to traditional CAPTCHA"};</script>
 </head><body><header><a href="https://search.brave.com/">Brave Search</a></header>
 <main class="main-column"><section id="mixed-top"></section>
 <section id="mixed-main" class="svelte-e12qt1"><!--[-->
@@ -85,6 +90,19 @@ FALLBACK_SAMPLE = """<html><body><a href="https://search.brave.com/settings">Set
 CAPTCHA_SAMPLE = """<html><head><title>Brave Search</title></head><body><p>Your request has
 been flagged as being suspicious and Brave Search decided to schedule a captcha for you.</p>
 <a href="https://tb-manual.torproject.org/security-settings/#safest">safest</a></body></html>"""
+
+CAPTCHA_CONFIG_SAMPLE = """<html><head><title>Brave Search</title>
+<script>__app = {data: [{type: "data", data: {page:"/captcha", lang: "en"}}]};</script>
+</head><body><div id="app"></div></body></html>"""
+
+NO_RESULTS_SAMPLE = """<!doctype html><html lang="en"><head><title>site:nothing.example - Brave Search</title>
+<script>const i18n = {"Switch to traditional captcha":"Switch to traditional CAPTCHA"};</script>
+</head><body><header><a href="https://search.brave.com/">Brave Search</a></header>
+<main class="main-column"><section id="mixed-main" class="svelte-e12qt1">
+ <div class="snippet svelte-jmfu5f"><p>Not many great matches came back for your search.</p></div>
+</section></main>
+<footer><a href="https://brave.com/privacy/">Privacy</a><a href="https://status.brave.app/">Status</a></footer>
+</body></html>"""
 
 SERPAPI_SAMPLE = {
     "search_metadata": {"status": "Success"},
@@ -217,7 +235,16 @@ class TestParseBrave(unittest.TestCase):
 
     def test_captcha_detection(self):
         self.assertTrue(FC.looks_like_captcha(CAPTCHA_SAMPLE))
+        self.assertTrue(FC.looks_like_captcha(CAPTCHA_CONFIG_SAMPLE))   # page:"/captcha" alone
+        self.assertIn("captcha", BRAVE_SAMPLE)                        # the i18n bundle
         self.assertFalse(FC.looks_like_captcha(BRAVE_SAMPLE))
+        self.assertFalse(FC.looks_like_captcha(""))
+
+    def test_no_results_page_is_not_a_captcha(self):
+        self.assertIn("captcha", NO_RESULTS_SAMPLE)
+        self.assertNotIn('data-type="web"', NO_RESULTS_SAMPLE)
+        self.assertFalse(FC.looks_like_captcha(NO_RESULTS_SAMPLE))
+        self.assertEqual(FC.parse_brave_page(NO_RESULTS_SAMPLE)["organic"], [])
 
     def test_garbage_does_not_raise(self):
         self.assertEqual(FC.parse_brave_html("<div data-type='web'><a href='https://x.com/"), [])
@@ -274,6 +301,25 @@ class TestBraveLoop(unittest.TestCase):
         records, status, calls, _ = self.run_loop(
             [html_response(b"", status=500), html_response(BRAVE_SAMPLE),
              html_response(b"", status=502), html_response(BRAVE_SAMPLE)])
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(records), 2)
+        self.assertIsNone(status["stopped"])
+
+    def test_two_no_results_pages_in_a_row_stop(self):
+        records, status, calls, _ = self.run_loop(
+            [html_response(NO_RESULTS_SAMPLE), html_response(NO_RESULTS_SAMPLE)])
+        self.assertEqual(len(calls), 2)                  # the first did not stop the run
+        self.assertEqual(records, [])
+        self.assertIn("Two failed responses", status["stopped"])
+        self.assertIn("no results parsed", status["stopped"])
+        self.assertNotIn("captcha", status["stopped"])
+        self.assertEqual([n["note"] for n in status["notes"]],
+                         ["no results parsed", "no results parsed"])
+
+    def test_single_no_results_page_does_not_stop(self):
+        records, status, calls, _ = self.run_loop(
+            [html_response(NO_RESULTS_SAMPLE), html_response(BRAVE_SAMPLE),
+             html_response(NO_RESULTS_SAMPLE), html_response(BRAVE_SAMPLE)])
         self.assertEqual(len(calls), 4)
         self.assertEqual(len(records), 2)
         self.assertIsNone(status["stopped"])
@@ -404,6 +450,18 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(self.cat("fox10phoenix.com"), "news")
         self.assertEqual(self.cat("azdailysun.com"), "news")
         self.assertEqual(self.cat("ghostcitytours.com"), "business")
+        # anchored on the site name: a hint word inside a tour business's name, or a brand
+        # token in a subdomain, does not move it out of "business"
+        self.assertEqual(self.cat("downtownflagstaffghosttours.com"), "business")
+        self.assertEqual(self.cat("goodtimestours.com"), "business")
+        self.assertEqual(self.cat("booking.rivaltours.com"), "business")
+        self.assertEqual(self.cat("book.peek.com"), "marketplace")    # peek is the site name
+        self.assertEqual(FC.classify_domain("downtownflagstaff.org")[1],
+                         "heuristic: 'downtown' in site name")
+        self.assertEqual(self.cat("flagstaffchamber.com"), "directory")
+        self.assertEqual(self.cat("arizonatourism.com"), "directory")   # "tourism" is no tour
+        self.assertEqual(self.cat("flag-news.com"), "news")
+        self.assertEqual(self.cat("nytimes.com"), "news")
 
     def test_own_domains_and_subdomains(self):
         self.assertEqual(self.cat("example-client.com"), "own")
@@ -584,6 +642,27 @@ class TestCli(unittest.TestCase):
                     os.path.join(tmp, "competitors-blocked.com-2026-01-02.md")))
             finally:
                 FC.fetch = orig
+
+    def test_unwritable_out_exits_with_one_line_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            good = os.path.join(tmp, "serp.json")
+            with open(good, "w") as fh:
+                json.dump(SERPAPI_SAMPLE, fh)
+            # makedirs fails on an existing file and on a path under one; open fails when
+            # the output file's name is taken by a directory
+            blocked = os.path.join(tmp, "blocked")
+            os.makedirs(os.path.join(blocked, "competitors-example-client.com-2026-01-02.md"))
+            for out in (good, os.path.join(good, "sub"), blocked):
+                with self.subTest(out=out):
+                    err = io.StringIO()
+                    with contextlib.redirect_stdout(io.StringIO()), \
+                            contextlib.redirect_stderr(err):
+                        with self.assertRaises(SystemExit) as ctx:
+                            FC.main(["--client", "example-client.com", "--serp-json", good,
+                                     "--date", "2026-01-02", "--out", out])
+                    self.assertEqual(ctx.exception.code, 1)
+                    self.assertIn("error: cannot write to " + out, err.getvalue())
+                    self.assertEqual(len(err.getvalue().strip().splitlines()), 1)
 
     def test_needs_queries_or_json(self):
         with contextlib.redirect_stderr(io.StringIO()):

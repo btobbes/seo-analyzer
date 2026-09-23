@@ -291,10 +291,15 @@ def _health_features(r):
         flag = tick(entity, label)
         out[key] = _cell(_yn(flag), flag, entity)
 
-    # seo_audit omits the HSTS row when the header is not sent, so a report that has
-    # health rows but no HSTS row means "no HSTS".
+    # seo_audit omits the HSTS row when the header is not sent, and also when the homepage
+    # never answered (error, block or challenge page), so a missing row means "no HSTS"
+    # only when the report has health rows and its homepage returned 200. Otherwise the
+    # row is unknown, not absent.
     hsts = _health(r, "HSTS")
-    flag = health_flag(hsts) if hsts is not None else (False if _as_list(r.get("health")) else None)
+    home = _homepage(r)
+    fetched = home is not None and _int(home.get("status")) == 200
+    flag = (health_flag(hsts) if hsts is not None
+            else (False if (_as_list(r.get("health")) and fetched) else None))
     out["hsts"] = _cell(_yn(flag), flag, hsts)
 
     tls = _health(r, "TLS certificate")
@@ -302,12 +307,27 @@ def _health_features(r):
     out["tls_days"] = _cell(m.group(1) if m else "n/a", None, tls)
 
     matrix = [m for m in _as_list(r.get("ai_matrix")) if isinstance(m, dict)]
-    refused = [str(m.get("agent")) for m in matrix if m.get("verdict") != "ok"]
-    value = f"{len(matrix) - len(refused)} ok, {len(refused)} refused" if matrix else "not tested"
-    if refused:
-        value += " (" + ", ".join(refused) + ")"
-    out["ai_edge"] = _cell(value, (not refused) if matrix else None,
-                           _health(r, "AI crawler edge access"))
+    # seo_audit verdicts: "ok", "refused (N)", "challenged (N)", "pay-per-crawl (402)",
+    # or "no response" / "HTTP N" when the auditor's own request failed. Only the
+    # middle three are evidence that the site turns the agent away. startswith() keeps
+    # the " on some pages" suffix working.
+    def _v(m):
+        return str(m.get("verdict") or "")
+    refused = [str(m.get("agent")) for m in matrix
+               if _v(m).startswith(("refused", "challenged", "pay-per-crawl"))]
+    unknown = [str(m.get("agent")) for m in matrix
+               if not _v(m).startswith(("ok", "refused", "challenged", "pay-per-crawl"))]
+    ok_n = len(matrix) - len(refused) - len(unknown)
+    if not matrix:
+        value, present = "not tested", None
+    else:
+        value = f"{ok_n} ok, {len(refused)} refused"
+        if refused:
+            value += " (" + ", ".join(refused) + ")"
+        if unknown:
+            value += f", {len(unknown)} not answered (" + ", ".join(unknown) + ")"
+        present = False if refused else (None if unknown else True)
+    out["ai_edge"] = _cell(value, present, _health(r, "AI crawler edge access"))
     return out
 
 
@@ -775,9 +795,15 @@ def _layout(cmp):
 
 
 def _md_text(v):
+    """Markdown-safe text. Code values go in backticks as they are; anything else has its
+    emphasis, code-span and link markers (* _ ` [ ]), backslashes and < escaped, so a
+    title like "*Adult Only*" is quoted, not turned into italics."""
     s = "n/a" if v is None or v == "" else str(v)
-    s = s.replace("\n", " ").replace("<", "\\<")
-    return f"`{s}`" if isinstance(v, Code) else s
+    s = s.replace("\n", " ")
+    if isinstance(v, Code):
+        return f"`{s}`"
+    s = re.sub(r"([*_`\\\[\]])", r"\\\1", s)
+    return s.replace("<", "\\<")
 
 
 def _md_cell(v):
@@ -866,17 +892,20 @@ def main(argv=None):
     except ValueError as e:
         sys.exit(f"seo_compare: error: {e}")
 
-    os.makedirs(args.out, exist_ok=True)
     stem = os.path.join(args.out, f"seo-compare-{_safe_name(cmp['client'])}-{cmp['date']}")
     outputs = [(stem + ".md", render_markdown(cmp))]
     if args.json:
         outputs.append((stem + ".json", json.dumps(cmp, indent=2, ensure_ascii=False) + "\n"))
     if args.html:
         outputs.append((stem + ".html", render_html(cmp)))
-    for path, text in outputs:
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        print(f"Wrote {path}")
+    try:
+        os.makedirs(args.out, exist_ok=True)
+        for path, text in outputs:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            print(f"Wrote {path}")
+    except OSError as e:
+        sys.exit(f"seo_compare: error: cannot write to {args.out} ({e.strerror or e})")
     print()
     print(cmp["summary"])
 

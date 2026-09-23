@@ -244,7 +244,7 @@ class PageParser(HTMLParser):
         self._in_head = False
         self.heading_sequence = []      # heading tags in document order, e.g. ["h1","h2"]
         self.imgs = []                  # {src, loading, width, height, fetchpriority, srcset, srcset_val, picture_sources}
-        self.sources = []               # <source> tags: {type, srcset, in_picture}
+        self.sources = []               # <source> tags: {type, srcset, media, in_picture}
         self._picture_sources = None    # sources of the <picture> currently open, if any
         self._seq = 0                   # document-order counter for head resources
         self.stylesheet_seq = []        # order index of each <link rel=stylesheet>
@@ -290,6 +290,9 @@ class PageParser(HTMLParser):
             if (a.get("name") or "").lower() == "viewport":
                 self.has_viewport_tag = True
         elif tag == "link":
+            # a <noscript> fallback link (the async-stylesheet pattern) loads only with
+            # JavaScript off, so it is not a second request on a normal page view
+            a["_in_noscript"] = "noscript" in self._open_skip
             self.link_tags.append(a)
             if "stylesheet" in (a.get("rel") or "").lower():
                 self.stylesheet_seq.append(self._seq)
@@ -300,6 +303,7 @@ class PageParser(HTMLParser):
         elif tag == "source":
             rec = {"type": (a.get("type") or "").strip().lower(),
                    "srcset": (a.get("srcset") or "").strip(),
+                   "media": (a.get("media") or "").strip().lower(),
                    "in_picture": self._picture_sources is not None}
             self.sources.append(rec)
             if self._picture_sources is not None:
@@ -1301,11 +1305,19 @@ _LOCAL_TYPES = {
     "ChildCare", "Preschool", "AnimalShelter", "PetStore", "Florist", "GroceryStore",
     "ShoppingCenter", "SelfStorage", "DryCleaningOrLaundry", "EmploymentAgency",
     "PostOffice", "PoliceStation", "FireStation", "EmergencyService", "TelevisionStation",
-    "RadioStation", "TouristTrip", "Airport", "TrainStation", "BusStation",
+    "RadioStation", "Airport", "TrainStation", "BusStation",
 }
 _LOCAL_SUFFIXES = ("Business", "Store", "Shop", "Salon", "Restaurant", "Service", "Agency",
                    "Clinic", "Center", "Centre", "Station", "Attraction", "Dealer", "Repair",
                    "Contractor", "School", "Studio", "Club", "Theater", "Theatre", "Park", "Lodging")
+# Real schema.org types that end in one of those suffixes but are not LocalBusiness
+# subtypes: the Service family is Intangible (an offering, often carrying its own
+# aggregateRating), the rest are CivicStructure or EducationalOrganization types.
+_NOT_LOCAL = {
+    "Service", "TaxiService", "FoodService", "BroadcastService", "GovernmentService",
+    "CableOrSatelliteService", "WebAPI", "SubwayStation", "PerformingArtsTheater",
+    "ElementarySchool", "MiddleSchool", "HighSchool", "Park", "RVPark", "TouristTrip",
+}
 
 
 def _looks_local_type(t):
@@ -1313,10 +1325,16 @@ def _looks_local_type(t):
     t = str(t or "")
     if t in _LOCAL_TYPES:
         return True
-    return any(t.endswith(sfx) for sfx in _LOCAL_SUFFIXES) and t[:1].isupper()
+    if t in _NOT_LOCAL:
+        return False
+    return any(t.endswith(sfx) and len(t) > len(sfx) for sfx in _LOCAL_SUFFIXES) and t[:1].isupper()
 
 
-_MODERN_IMG_RE = re.compile(r"\.(webp|avif)(\?|,|\s|$)|f(ormat)?[=_](webp|avif|auto)", re.I)
+# A format request must start a query parameter or a path/transform token, so ?ref=auto
+# and staff_avif.jpg do not count; fm=webp and auto=format are the imgix, Contentful and
+# Sanity spellings.
+_MODERN_IMG_RE = re.compile(r"\.(webp|avif)(\?|,|\s|$)|(?:^|[?&,/_])(?:f|fm|format|output)[=_](?:webp|avif|auto)"
+                            r"|(?:^|[?&])auto=format", re.I)
 
 
 def _norm_url(u):
@@ -1329,7 +1347,7 @@ def _norm_url(u):
 
 def _social_platform(host):
     for frag, name in SOCIAL_PLATFORMS:
-        if frag in host:
+        if re.search(r"(^|\.)" + re.escape(frag), host):     # box.com is not x.com
             return name
     return None
 
@@ -2225,24 +2243,53 @@ def _content_length(resp):
 
 def _srcset_candidates(srcset):
     """[(url, weight)] from a srcset string; weight is the width descriptor (or density
-    × 1000) so the largest candidate can be picked."""
-    out = []
-    for part in (srcset or "").split(","):
-        toks = part.strip().split()
-        if not toks:
-            continue
+    × 1000) so the largest candidate can be picked. Follows the HTML parsing rules: a
+    URL is a run of non-whitespace, so a comma inside it (Cloudinary c_fill,w_1600;
+    Cloudflare Images width=800,format=auto; ImageKit tr:w-800,q-80) does not split the
+    candidate; only a comma that trails the URL or sits in the descriptor run ends it.
+    data: URLs are skipped."""
+    out, s, pos = [], (srcset or "").strip(), 0
+    while pos < len(s):
+        while pos < len(s) and (s[pos].isspace() or s[pos] == ","):
+            pos += 1
+        start = pos
+        while pos < len(s) and not s[pos].isspace():
+            pos += 1
+        url, descs = s[start:pos], ""
+        if not url:
+            break
+        if url.endswith(","):
+            url = url.rstrip(",")
+        else:
+            descs = re.match(r"[^,]*", s[pos:]).group(0)
+            pos += len(descs)
+        d = descs.split()[0].lower() if descs.split() else ""
         w = 0
-        if len(toks) > 1:
-            d = toks[1].lower()
-            if d.endswith("w") and d[:-1].isdigit():
-                w = int(d[:-1])
-            elif d.endswith("x"):
-                try:
-                    w = int(float(d[:-1]) * 1000)
-                except ValueError:
-                    w = 0
-        out.append((toks[0], w))
+        if d.endswith("w") and d[:-1].isdigit():
+            w = int(d[:-1])
+        elif d.endswith("x"):
+            try:
+                w = int(float(d[:-1]) * 1000)
+            except ValueError:
+                w = 0
+        if url and not url.startswith("data:"):
+            out.append((url, w))
     return out
+
+
+_MQ_WIDTH_RE = re.compile(r"\((min|max)-width\s*:\s*([\d.]+)\s*(px|em|rem)?\)")
+HERO_VIEWPORT_PX = 412   # the phone width the hero fix text assumes
+
+
+def _media_matches(media, width_px=HERO_VIEWPORT_PX):
+    """True unless a width clause of a <source media> excludes the phone viewport."""
+    if not media:
+        return True
+    for kind, n, unit in _MQ_WIDTH_RE.findall(media):
+        v = float(n) * (16 if unit in ("em", "rem") else 1)
+        if (kind == "min" and width_px < v) or (kind == "max" and width_px > v):
+            return False
+    return True
 
 
 def _hero_candidate(page_url, hero):
@@ -2257,13 +2304,16 @@ def _hero_candidate(page_url, hero):
         return max(cands, key=lambda c: c[1])[0] if cands else ""
 
     for s in hero.get("picture_sources") or []:
-        if s.get("type") in ("image/avif", "image/webp") and s.get("srcset"):
+        if (s.get("type") in ("image/avif", "image/webp") and s.get("srcset")
+                and _media_matches(s.get("media"))):
             u = largest(s["srcset"])
             if u:
-                hero["srcset"] = hero.get("srcset") or ("," in s["srcset"])
+                hero["srcset"] = hero.get("srcset") or len(_srcset_candidates(s["srcset"])) > 1
                 return (normalize(page_url, u),
-                        f" · measured the {s['type'].split('/')[1].upper()} <picture> source browsers "
-                        "fetch, not the <img src> fallback")
+                        f" · measured the {s['type'].split('/')[1].upper()} <picture> source a "
+                        f"{HERO_VIEWPORT_PX}px phone fetches"
+                        + (f" (media={s['media']})" if s.get("media") else "")
+                        + ", not the <img src> fallback")
     if hero.get("imagesrcset"):
         u = largest(hero["imagesrcset"])
         if u:
@@ -2363,9 +2413,15 @@ def check_fonts(home_page):
     gf = list(dict.fromkeys(gf_all))
     if not gf:
         return findings
-    if len(gf_all) > len(gf):
+    # The async pattern (media=print + onload, with a <noscript> copy for JavaScript-off
+    # visitors) is one request on a normal page view; only links outside <noscript> count.
+    gf_live = [lt.get("href") for lt in p.link_tags
+               if "stylesheet" in (lt.get("rel") or "").lower()
+               and "fonts.googleapis.com" in (lt.get("href") or "")
+               and not lt.get("_in_noscript")]
+    if len(gf_live) > len(set(gf_live)):
         findings.append(f("LOW", "Google Fonts stylesheet is linked more than once", "performance", 2, 1,
-                          f"{len(gf_all)} <link rel=stylesheet> tags, {len(gf)} distinct href(s)",
+                          f"{len(gf_live)} <link rel=stylesheet> tags, {len(set(gf_live))} distinct href(s)",
                           "Keep one <link> per Google Fonts stylesheet. The duplicate is an extra "
                           "render-blocking request on every page view, and it double-counts in "
                           "font-payload tools."))
@@ -2426,7 +2482,9 @@ def check_rating_consistency(pages):
             cnt = ar.get("reviewCount") or ar.get("ratingCount")
             if cnt is None:
                 continue
-            name = " ".join(str(n.get("name") or "").split()).lower() or "(unnamed entity)"
+            name = " ".join(str(n.get("name") or "").split()).lower()
+            if not name:
+                continue      # nothing says two nameless nodes are the same entity
             key = (str(ar.get("ratingValue") or ""), str(cnt))
             seen.setdefault(name, {}).setdefault(key, []).append(pg["url"])
     findings = []
@@ -2480,28 +2538,43 @@ def _affiliate_kind(u):
 def check_affiliate_share(pages):
     """A site where most indexable pages exist to send the click to a merchant is what
     Google's thin-affiliation and scaled-content policies describe. Count the pages whose
-    outbound links carry affiliate tracking or go through a known network."""
-    analysed, hits, kinds, tmpls = 0, 0, {}, {}
+    outbound links carry affiliate tracking or go through a known network. An affiliate
+    URL repeated on more than half of the analysed pages is header, footer or navigation
+    chrome (one "buy my book" or "book on Viator" link), not a page built to send the
+    click elsewhere, so it does not make a page count."""
+    per_page = []                                   # (page, {affiliate_url: kind})
     for pg in pages:
         p = pg.get("parser")
         if not p or pg.get("status") != 200:
             continue
-        analysed += 1
-        page_kinds = set()
+        found = {}
         for href in p.links:
             u = normalize(pg["url"], href)
             if not u or not u.startswith("http") or same_site(u, pg["url"]):
                 continue
             k = _affiliate_kind(u)
             if k:
-                page_kinds.add(k)
-        if page_kinds:
-            hits += 1
-            for k in page_kinds:
-                kinds[k] = kinds.get(k, 0) + 1
-            t = url_template(pg["url"])
-            tmpls[t] = tmpls.get(t, 0) + 1
-    if analysed < 20 or hits < analysed * 0.3:
+                found[u.split("#")[0]] = k
+        per_page.append((pg, found))
+    analysed = len(per_page)
+    if analysed < 20:
+        return []
+    url_pages = {}
+    for _, found in per_page:
+        for u in found:
+            url_pages[u] = url_pages.get(u, 0) + 1
+    chrome = {u for u, n in url_pages.items() if n > analysed * 0.5}   # header/footer/nav link
+    hits, kinds, tmpls = 0, {}, {}
+    for pg, found in per_page:
+        page_kinds = {k for u, k in found.items() if u not in chrome}
+        if not page_kinds:
+            continue
+        hits += 1
+        for k in page_kinds:
+            kinds[k] = kinds.get(k, 0) + 1
+        t = url_template(pg["url"])
+        tmpls[t] = tmpls.get(t, 0) + 1
+    if hits < analysed * 0.3:
         return []
     share = hits / analysed
     top_kinds = ", ".join(k for k, _ in sorted(kinds.items(), key=lambda kv: -kv[1])[:3])
@@ -2516,13 +2589,18 @@ def check_affiliate_share(pages):
               "them to a separate domain.")]
 
 
-_TITLE_SPLIT_RE = re.compile(r"\s+[|\-–—·»:]\s+")
+# Colon, pipe and guillemet need whitespace only after them ("Brand: Page"); the
+# hyphen, the dash characters and the middle dot need it on both sides so "Route-66"
+# stays one word; a " by " before the last words is a separator ("Page by Brand").
+_TITLE_SPLIT_RE = re.compile(r"\s*[|»:]\s+|\s+[\-–—·]\s+|\s+by\s+(?=\S)", re.I)
 
 
-def title_concentration(pages, min_pages=10):
+def title_concentration(pages, min_pages=10, brand_names=()):
     """Which two-word phrase do the most page titles share, after stripping the brand
     segment most titles carry? Many titles chasing one phrase is how a site ends up
-    competing with itself. Informational: shown in the keyword section, never scored."""
+    competing with itself. Informational: shown in the keyword section, never scored.
+    `brand_names` seeds the brand set (og:site_name and the schema organization names
+    of the homepage), so a brand placed in fewer than 40% of titles is still stripped."""
     titles = [(pg["url"], pg.get("title") or "") for pg in pages if pg.get("title")]
     if len(titles) < min_pages:
         return None
@@ -2533,14 +2611,20 @@ def title_concentration(pages, min_pages=10):
             for cand in (parts[0], parts[-1]):
                 segs[cand.lower()] = segs.get(cand.lower(), 0) + 1
     brand = {s for s, n in segs.items() if n >= max(3, len(titles) * 0.4)}
+    brand |= {" ".join(str(b).split()).lower() for b in brand_names if b}
     per_phrase = {}
     for url, t in titles:
-        core = " ".join(s for s in _TITLE_SPLIT_RE.split(t) if s.strip().lower() not in brand)
         seen = set()
-        for ph in _keyphrases(core):
-            if ph.count(" ") == 1 and ph not in seen:
-                seen.add(ph)
-                per_phrase.setdefault(ph, []).append(url)
+        # phrases come from each segment on its own, so no bigram spans a separator
+        for seg in _TITLE_SPLIT_RE.split(t):
+            if seg.strip().lower() in brand:
+                continue
+            for ph in _keyphrases(seg):
+                if ph.count(" ") == 1 and ph not in seen:
+                    seen.add(ph)
+                    per_phrase.setdefault(ph, []).append(url)
+    # a phrase in (nearly) every title is the brand, however it was punctuated
+    per_phrase = {ph: u for ph, u in per_phrase.items() if len(u) < len(titles) * 0.9}
     if not per_phrase:
         return None
     ph, urls = max(per_phrase.items(), key=lambda kv: (len(kv[1]), -len(kv[0])))
@@ -2568,6 +2652,21 @@ def _registrable(host):
     return host[4:] if host.startswith("www.") else host
 
 
+# Second-level labels that country registries sell under (acme.co.uk, acme.com.au,
+# acme.co.nz, acme.or.jp). Taking the last two labels of those gives "co.uk", which
+# would treat every other .co.uk domain as a subdomain of the site.
+_CC_SLD = {"co", "com", "org", "net", "gov", "edu", "ac", "ne", "or", "ltd", "plc", "me", "gen"}
+
+
+def _site_reg(host):
+    """The registrable domain of host (shop.acme.co.uk -> acme.co.uk, shop.acme.com ->
+    acme.com), close enough to the public suffix list for skipping the site's own
+    subdomains."""
+    parts = host.split(".")
+    n = 3 if len(parts) >= 3 and len(parts[-1]) == 2 and parts[-2] in _CC_SLD else 2
+    return ".".join(parts[-n:])
+
+
 def _entity_names(nodes):
     """Normalised names of the Organization/LocalBusiness-family nodes in a page's schema."""
     names = set()
@@ -2591,7 +2690,7 @@ def check_owned_domains(pages, base, limit=12):
     if not p or not r:
         return [], ("Owned domains", "not checked"), []
     site_host = _registrable(urllib.parse.urlparse(base).hostname)
-    site_reg = ".".join(site_host.split(".")[-2:])
+    site_reg = _site_reg(site_host)
     my_ids = set(_ANALYTICS_ID_RE.findall(r.text[:400_000]))
     my_names = _entity_names(_jsonld_nodes(p))
     if p.og("og:site_name"):
@@ -2601,7 +2700,7 @@ def check_owned_domains(pages, base, limit=12):
     def skip_host(host):
         return (not host or host == site_host or host == site_reg or host.endswith("." + site_reg)
                 or host.endswith(".google") or _social_platform(host)
-                or any(s in host for s in _OWNED_SKIP_HOSTS))
+                or any(re.search(r"(^|\.)" + re.escape(s), host) for s in _OWNED_SKIP_HOSTS))
 
     def consider(u, declared):
         u = normalize(home["url"], u) if u else ""
@@ -2639,14 +2738,27 @@ def check_owned_domains(pages, base, limit=12):
             for h in pp.links[:400])
         shares = bool(my_ids & their_ids)
         same_entity = bool(pp) and bool(my_names & _entity_names(_jsonld_nodes(pp)))
+        # A directory or DMO listing often carries LocalBusiness schema named after the
+        # business it lists. It gives itself away by naming a different site (og:site_name
+        # or a WebSite node) or by sitting on a deep path such as /listing/acme/.
+        their_site = set()
+        if pp:
+            if pp.og("og:site_name"):
+                their_site.add(" ".join(pp.og("og:site_name").split()).lower())
+            their_site |= {" ".join(str(n.get("name") or "").split()).lower()
+                           for n in _jsonld_nodes(pp) if "WebSite" in _types(n) and n.get("name")}
+        depth = len([s for s in urllib.parse.urlparse(u).path.split("/") if s])
+        listing = (bool(their_site) and not (their_site & my_names)) or depth >= 2
         # sameAs alone is not ownership: sites list their DMO listing, their Wikipedia
         # page or a Maps share link there. Declared AND publishing the same organization
-        # name in its own schema is; a shared analytics property is on its own.
-        owned = shares or (declared and same_entity)
+        # name in its own schema AND not being a directory entry is; a shared analytics
+        # property is on its own.
+        owned = shares or (declared and same_entity and not listing)
         return {"domain": host, "url": u, "status": rr.status, "final_host": final_host,
                 "canonical_host": can_host, "title": (pp.title if pp else "")[:120],
                 "declared_in_sameas": declared, "shares_analytics": shares,
-                "same_entity_name": same_entity, "links_back": links_back, "owned": owned,
+                "same_entity_name": same_entity, "directory_listing": listing,
+                "links_back": links_back, "owned": owned,
                 "separate_live_site": bool(owned and ok and final_host != site_host
                                            and not skip_host(final_host)
                                            and (not can_host or can_host == final_host))}
@@ -3929,7 +4041,13 @@ def run_audit(start_url, max_pages=15, use_pagespeed=False, sweep=100, probe_ai=
     psi = pagespeed(pages[0]["final_url"] if pages else base, use_pagespeed)
     social = analyze_social(pages[0]) if pages else {"metrics": [], "findings": []}
     keywords = extract_keywords(pages)
-    tc = title_concentration(all_pages)
+    brand_names = set()      # the homepage's own names, so a brand in any title position is stripped
+    if pages and pages[0].get("parser"):
+        hp = pages[0]["parser"]
+        brand_names = _entity_names(_jsonld_nodes(hp))
+        if hp.og("og:site_name"):
+            brand_names.add(" ".join(hp.og("og:site_name").split()).lower())
+    tc = title_concentration(all_pages, brand_names=brand_names)
     if tc:
         keywords["title_concentration"] = tc
         keywords.setdefault("insights", []).append(
@@ -4055,7 +4173,8 @@ def main():
     ap.add_argument("--no-ai-probe", action="store_true",
                     help="Skip requesting the homepage with AI-crawler user-agents")
     ap.add_argument("--offline-dns", action="store_true",
-                    help="Skip third-party lookups (RDAP domain expiry, DNS-over-HTTPS mail checks)")
+                    help="Skip third-party lookups (RDAP domain expiry, DNS-over-HTTPS mail checks) "
+                         "and the owned-domains probe (fetches up to 12 other sites)")
     ap.add_argument("--version", action="version", version="seo-audit " + VERSION)
     ap.add_argument("--out", default=".", help="Output directory")
     ap.add_argument("--no-pdf", action="store_true", help="Skip PDF rendering")

@@ -85,8 +85,13 @@ Brave markup relied on (checked against saved result pages, September 2026)
     Brave does not link a website there, and it is not Google's local pack). If no
     data-type="web" block is found the parser falls back to every external <a href> in
     document order, minus Brave's own hosts, w3.org, Google Maps links and asset URLs, and
-    marks the record parse_mode "fallback". A captcha interstitial is detected before that
-    fallback runs, because it links to torproject.org and would otherwise look like a result.
+    marks the record parse_mode "fallback". Brave's captcha interstitial is detected before
+    that fallback runs, because its torproject.org link would otherwise look like a result.
+    It is recognized by its page:"/captcha" config, its "flagged as being suspicious"
+    sentence or that torproject.org link. The bare word "captcha" is no signal: every normal
+    result page carries it in Brave's i18n bundle. A 200 page with none of those markers and
+    no parseable result (a query Brave has nothing for) is not a captcha; it counts as a
+    failure under the two-in-a-row rule.
 
 Tally and score
     Per domain (lowercased, "www." stripped): the queries it appeared in, best position,
@@ -106,19 +111,27 @@ Classification (hints, and the report says so)
     marketplace  OTAs and listing platforms (CLASSIFY_TABLE["marketplace"]).
     social       social networks and video platforms.
     reference    wikis, plus any .edu host.
-    news         a few named outlets, plus heuristics: news, times, tribune, herald or
-                 gazette in the host; a site name ending in "sun"; fox/abc/nbc/cbs station
-                 names; K/W call letters followed by "tv".
-    directory    heuristics: visit, tourism, downtown or chamber in the host, or a .org or
-                 .gov host.
+    news         a few named outlets, plus heuristics on the site name (below): news,
+                 times, tribune, herald or gazette as one of its hyphen-separated words or
+                 at its end (flag-news, nytimes); a site name ending in "sun";
+                 fox/abc/nbc/cbs station names; K/W call letters followed by "tv".
+    directory    heuristics on the site name: visit, tourism, downtown or chamber at its
+                 start, at its end or as one of its hyphen-separated words (visitarizona,
+                 flagstaffchamber), skipped when the name also contains "tour" outside
+                 "tourism"; or a .org or .gov host.
     business     everything else. These are the competitor candidates.
-    Table entries containing a dot are domains and match the host or any subdomain. Entries
-    without one are brand tokens and match any dot- or hyphen-separated label of the host
-    except the TLD, so "tripadvisor" matches tripadvisor.co.uk and "expedia" matches
-    expedia-aarp.com. Blogs, affiliates and resellers the table does not know land in
-    "business", and some .org news outlets land in "directory". --classify-file takes JSON,
-    either {"domain": "category"} or {"category": ["domain", ...]}, and wins over the table
-    and the heuristics. A category outside the built-in set gets a table of its own.
+    The site name is the registrable label ("goodtimestours" for www.goodtimestours.com,
+    "bbc" for bbc.co.uk). The word heuristics above and the brand tokens look only at it:
+    subdomain labels and hint words in the middle of a name do not count, so
+    booking.rivaltours.com and goodtimestours.com stay "business", and the "tour" rule
+    keeps downtownflagstaffghosttours.com there too. Table entries containing a dot are
+    domains and match the host or any subdomain. Entries without one are brand tokens and
+    match the site name or one of its hyphen-separated words, so "tripadvisor" matches
+    tripadvisor.co.uk and "expedia" matches expedia-aarp.com. Blogs, affiliates and
+    resellers the table does not know land in "business", and some .org news outlets land
+    in "directory". --classify-file takes JSON, either {"domain": "category"} or
+    {"category": ["domain", ...]}, and wins over the table and the heuristics. A category
+    outside the built-in set gets a table of its own.
 """
 
 import argparse
@@ -197,7 +210,10 @@ _BRAVE_ID_KINDS = {
 _ENGINE_HOSTS = ("brave.com", "brave.app", "w3.org", "hackerone.com")
 _ASSET_RE = re.compile(r"\.(?:png|jpe?g|gif|webp|avif|svg|ico|css|js|mjs|woff2?|ttf|otf|eot|"
                        r"mp4|webm|json|xml|webmanifest|map)$", re.I)
-_CAPTCHA_RE = re.compile(r"captcha", re.I)
+# Markers of Brave's "your request has been flagged" interstitial. The bare word "captcha"
+# is not one: every normal result page has it twice in the i18n bundle.
+_CAPTCHA_RE = re.compile(r'page:"/captcha"|flagged as being suspicious'
+                         r'|https?://[^"\s]*torproject\.org', re.I)
 
 
 # =====================================================================================
@@ -235,10 +251,6 @@ def _host_matches(host, domain):
     return bool(domain) and (host == domain or host.endswith("." + domain))
 
 
-def _labels(host):
-    return [t for t in re.split(r"[.\-]", host) if t]
-
-
 def _site_name(host):
     """The registrable label: "azdailysun" for azdailysun.com, "bbc" for bbc.co.uk."""
     parts = host.split(".")
@@ -253,8 +265,10 @@ def _entry_matches(host, entry):
         return False
     if "." in entry:
         return _host_matches(host, normalize_domain(entry))
-    labels = _labels(host)
-    return entry in (labels[:-1] if len(labels) > 1 else labels)
+    # Brand tokens match the site name or one of its hyphen-separated words, never a
+    # subdomain label: "booking" is not booking.rivaltours.com.
+    name = _site_name(host)
+    return entry == name or entry in name.split("-")
 
 
 def load_classify_file(path):
@@ -306,15 +320,18 @@ def classify_domain(domain, own=(), overrides=None):
                 return cat, "table: " + entry
     if host.endswith(".edu") or ".edu." in host:
         return "reference", "heuristic: .edu"
-    bare = host.rsplit(".", 1)[0] if "." in host else host
+    # Anchored on the site name so goodtimestours.com is not news and
+    # downtownflagstaffghosttours.com is not a DMO (module docstring).
+    name = _site_name(host)
     for hint in NEWS_HINTS:
-        if hint in bare:
-            return "news", "heuristic: '%s' in host" % hint
-    if _NEWS_SITE_RE.search(_site_name(host)):
+        if hint in name.split("-") or name.endswith(hint):
+            return "news", "heuristic: '%s' in site name" % hint
+    if _NEWS_SITE_RE.search(name):
         return "news", "heuristic: station or paper name"
-    for hint in DIRECTORY_HINTS:
-        if hint in bare:
-            return "directory", "heuristic: '%s' in host" % hint
+    if not re.search(r"tour(?!ism)", name):
+        for hint in DIRECTORY_HINTS:
+            if name.startswith(hint) or name.endswith(hint) or hint in name.split("-"):
+                return "directory", "heuristic: '%s' in site name" % hint
     for tld in (".org", ".gov"):
         if host.endswith(tld) or (tld + ".") in host:
             return "directory", "heuristic: %s host" % tld
@@ -496,8 +513,12 @@ class _BraveParser(HTMLParser):
 
 
 def looks_like_captcha(html):
-    """True for Brave's "your request has been flagged" interstitial (no web results)."""
-    return bool(_CAPTCHA_RE.search(html or "")) and 'data-type="web"' not in (html or "")
+    """True for Brave's "your request has been flagged" interstitial.
+
+    Matches its page:"/captcha" config, its "flagged as being suspicious" sentence or its
+    torproject.org link. A normal page with no organic blocks is not a captcha: it falls
+    through to the "no results parsed" failure in fetch_brave_serps."""
+    return bool(_CAPTCHA_RE.search(html or ""))
 
 
 def parse_brave_page(html, top=DEFAULT_TOP):
@@ -1297,13 +1318,17 @@ def main(argv=None):
               % report["queries_requested"], file=sys.stderr)
         raise SystemExit(1)
 
-    os.makedirs(args.out, exist_ok=True)
     stem = os.path.join(args.out, "competitors-%s-%s" % (client, date))
     md_path, json_path = stem + ".md", stem + ".json"
-    with open(md_path, "w", encoding="utf-8") as fh:
-        fh.write(render_markdown(report))
-    with open(json_path, "w", encoding="utf-8") as fh:
-        json.dump(report, fh, indent=2, ensure_ascii=False, default=str)
+    try:
+        os.makedirs(args.out, exist_ok=True)
+        with open(md_path, "w", encoding="utf-8") as fh:
+            fh.write(render_markdown(report))
+        with open(json_path, "w", encoding="utf-8") as fh:
+            json.dump(report, fh, indent=2, ensure_ascii=False, default=str)
+    except OSError as e:
+        print("error: cannot write to %s (%s)" % (args.out, e.strerror or e), file=sys.stderr)
+        raise SystemExit(1)
 
     total = report["queries_captured"]
     print("Wrote %s" % md_path)

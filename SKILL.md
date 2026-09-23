@@ -68,7 +68,8 @@ Two rules follow from that, and they matter more than anything else in this file
      rate-limited without a key; set `PAGESPEED_API_KEY`. Without it Core Web Vitals are
      **not measured**; the static performance checks find causes, not numbers.
    - `--no-ai-probe` — skip requesting the homepage with AI-crawler user-agents.
-   - `--offline-dns` — skip third-party lookups (RDAP domain expiry, DNS-over-HTTPS).
+   - `--offline-dns` — skip third-party lookups (RDAP domain expiry, DNS-over-HTTPS) and
+     the owned-domains probe, which fetches up to 12 other sites once each.
    - `--no-pdf`, `--json`, `--out DIR`.
 
    It writes `seo-report-<domain>-<date>.html`, `.pdf`, and optionally `.json`.

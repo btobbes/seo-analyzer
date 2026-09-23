@@ -257,34 +257,45 @@ Each came out of the competitive audit of 2026-09-22 (see `competitive-analysis.
 where the client's lost position was partly its own doing. Function names are in
 `scripts/seo_audit.py`.
 
-**trust** — `check_rating_consistency`: the site's own LocalBusiness/Organization-family
+**trust.** `check_rating_consistency`: the site's own LocalBusiness/Organization-family
 nodes declare different `reviewCount`/`ratingCount` values for the same entity name on
 different pages (LOW). Product nodes are ignored, since different products may differ.
 
-**on page** — `check_affiliate_share`: of the analysed pages (status 200, at least 20 of
+**on page.** `check_affiliate_share`: of the analysed pages (status 200, at least 20 of
 them), the share whose outbound links carry affiliate tracking: Amazon `tag=`, Viator
 `pid=P…`, Booking.com `aid=`, GetYourGuide `partner_id=`, Expedia `affcid=`, generic click
 ids (`irclickid`, `clickid`, `affiliate_id`, `aff_id`, `affid`, `afftrack`), or a known
-affiliate network host. LOW at 30%, MEDIUM at 50%; the templates and the kinds of
-tracking are named. `ref=` and `utm_` alone never count.
+affiliate network host. An affiliate URL that appears on more than half of the analysed
+pages is header, footer or navigation chrome (one "buy the book" link) and does not make
+a page count. LOW at 30%, MEDIUM at 50%; the templates and the kinds of tracking are
+named. `ref=` and `utm_` alone never count.
 
-**crawlability** — `check_owned_domains` (network; skipped with `--offline-dns`): the
+**crawlability.** `check_owned_domains` (network; skipped with `--offline-dns`): the
 homepage's `sameAs` URLs and its external links, minus social platforms, marketplaces,
 CDNs and other well-known hosts, up to 12 candidates, fetched once each with a browser
 UA. A domain is "owned" when it shares an analytics property id (`G-`, `GTM-`, `UA-`,
 `AW-`) with the homepage, or when it is declared in `sameAs` *and* its own schema names
-the same organization (a `sameAs` pointing at a DMO listing, a Wikipedia page or a Maps
+the same organization *and* it is not a directory listing (a page that names a different
+site in `og:site_name` or a `WebSite` node, or sits on a path two or more levels deep such
+as `/directory/acme/`). A `sameAs` pointing at a DMO listing, a Wikipedia page or a Maps
 share link is a pointer to a page about the business, not a domain it runs; the first
-real-site run caught exactly that). Owned domains that return 200 and canonicalize to
-themselves are *separate live sites* (LOW; MEDIUM with two or more, or when one shares
-the analytics property). Owned domains that redirect or canonicalize to the audited site
-are counted in the health row and never a finding. The JSON carries every probed
-candidate under `owned_domains` (status, final host, canonical host, title, declared,
-shares analytics, same entity name, links back).
+real-site run caught exactly that. Skip-list and social-platform matching is anchored at
+a domain label, so `acmeplumbing.com` is not skipped for containing `bing.`, and the
+site's own registrable domain is computed with country second-level labels in mind
+(`shop.acme.co.uk` is a subdomain of `acme.co.uk`; `acme-heating.co.uk` is not). Owned
+domains that return 200 and canonicalize to themselves are *separate live sites* (LOW;
+MEDIUM with two or more, or when one shares the analytics property). Owned domains that
+redirect or canonicalize to the audited site are counted in the health row and never a
+finding. The JSON carries every probed candidate under `owned_domains` (status, final
+host, canonical host, title, declared, shares analytics, same entity name, directory
+listing, links back).
 
-**keyword focus (not scored)** — `title_concentration`: after stripping the brand segment
-that 40% or more of titles share, the two-word phrase found in the most crawled titles,
-reported when at least 5 titles and 15% of them carry it. Six owned URLs on three domains
+**keyword focus (not scored).** `title_concentration`: after stripping the brand segment
+that 40% or more of titles share (plus the homepage's schema organization names and
+`og:site_name`, so "Brand: Page" and "Page by Brand" are handled), the two-word phrase
+found in the most crawled titles, taken per title segment so no phrase spans a separator,
+reported when at least 5 titles and 15% of them carry it and fewer than 90% do (a phrase
+in nearly every title is the brand, however punctuated). Six owned URLs on three domains
 chasing "flagstaff ghost tour" is the case it was written for.
 
 ## Fixed in 2.1.0

@@ -311,6 +311,47 @@ class TestFeatures(unittest.TestCase):
         self.assertIs(present(self.cmp, "ai_edge", 1), False)
         self.assertEqual(row(self.cmp, "ai_edge")["cells"][1]["value"], "2 ok, 1 refused (GPTBot)")
 
+    def test_hsts_unknown_when_homepage_did_not_load(self):
+        # seo_audit also omits the HSTS row when the homepage never answered, so a missing
+        # row reads as "no HSTS" only when the homepage returned 200.
+        for status in (403, 0, "no pages"):
+            with self.subTest(status=status):
+                rival = small_rival()
+                if status == "no pages":
+                    rival["pages"] = []
+                else:
+                    rival["pages"][0]["status"] = status
+                cmp = SC.compare_reports(client_report(), [rival], date="2026-09-23")
+                self.assertIsNone(present(cmp, "hsts", 1))
+                self.assertEqual(row(cmp, "hsts")["cells"][1]["value"], "n/a")
+                self.assertNotIn("an HSTS header", cmp["advantages"][0]["client_has"])
+
+    def test_ai_edge_auditor_failures_are_not_refusals(self):
+        rival = small_rival()
+        rival["ai_matrix"] = ai_matrix()
+        rival["ai_matrix"][1]["verdict"] = "no response"          # GPTBot probe timed out
+        cmp = SC.compare_reports(client_report(), [rival], date="2026-09-23")
+        self.assertIsNone(present(cmp, "ai_edge", 1))
+        self.assertEqual(row(cmp, "ai_edge")["cells"][1]["value"],
+                         "2 ok, 0 refused, 1 not answered (GPTBot)")
+        self.assertNotIn("AI crawler access at the edge (no agent refused)",
+                         cmp["advantages"][0]["client_has"])
+        # "HTTP N" is an auditor-side failure too; every refusal form still counts
+        for verdict, expected in (("HTTP 500", None), ("no response on some pages", None),
+                                  ("refused (403) on some pages", False),
+                                  ("challenged (503)", False), ("pay-per-crawl (402)", False)):
+            with self.subTest(verdict=verdict):
+                rival["ai_matrix"][1]["verdict"] = verdict
+                cmp = SC.compare_reports(client_report(), [rival], date="2026-09-23")
+                self.assertIs(present(cmp, "ai_edge", 1), expected)
+        # a real refusal wins over an unanswered probe, and both are named
+        rival["ai_matrix"][1]["verdict"] = "refused (403)"
+        rival["ai_matrix"][2]["verdict"] = "no response"
+        cmp = SC.compare_reports(client_report(), [rival], date="2026-09-23")
+        self.assertIs(present(cmp, "ai_edge", 1), False)
+        self.assertEqual(row(cmp, "ai_edge")["cells"][1]["value"],
+                         "1 ok, 1 refused (GPTBot), 1 not answered (ClaudeBot)")
+
     def test_homepage_and_footprint_rows(self):
         def cells(key):
             return row(self.cmp, key)["cells"]
@@ -431,6 +472,22 @@ class TestRender(unittest.TestCase):
         self.assertIn("\\<head>", md)               # angle bracket escaped for Markdown
         self.assertNotIn("—", md)              # no em dashes in generated prose
 
+    def test_markdown_escapes_emphasis_code_and_link_markers(self):
+        client = client_report()
+        client["pages"][0]["title"] = "Mountain Town *Adult Only* Tour_2026 [new]"
+        client["pages"][0]["h1"] = ["Use `x` here"]
+        cmp = SC.compare_reports(client, [small_rival()], date="2026-09-23")
+        md = SC.render_markdown(cmp)
+        lines = md.splitlines()
+        title_row = next(ln for ln in lines if ln.startswith("| Homepage title |"))
+        self.assertIn("Mountain Town \\*Adult Only\\* Tour\\_2026 \\[new\\]", title_row)
+        h1_row = next(ln for ln in lines if ln.startswith("| Homepage H1 |"))
+        self.assertIn("Use \\`x\\` here", h1_row)
+        self.assertIn("`/tours/*`", md)             # Code cells stay in backticks, unescaped
+        self.assertNotIn("\\`/tours", md)
+        # HTML escapes with html.escape only, so the title stays literal there
+        self.assertIn("Mountain Town *Adult Only* Tour_2026 [new]", SC.render_html(cmp))
+
     def test_markdown_for_a_peer_says_the_caveat_does_not_apply(self):
         md = SC.render_markdown(SC.compare_reports(client_report(), [peer_rival()], date="2026-09-23"))
         self.assertIn("Caveat applies: no", md)
@@ -492,6 +549,28 @@ class TestCli(unittest.TestCase):
                 SC.main([c, bad, "--out", d])
             self.assertNotIn(ctx.exception.code, (0, None))
             self.assertIn("domain", str(ctx.exception.code))
+
+    def test_unwritable_out_exits_with_one_line_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = self._write(d, "client.json", client_report())
+            r = self._write(d, "rival.json", small_rival())
+            # makedirs fails on an existing file and on a path under one; open fails when
+            # the output file's name is taken by a directory
+            blocked = os.path.join(d, "blocked")
+            os.makedirs(os.path.join(blocked, "seo-compare-client.example-2026-01-02.md"))
+            for out in (c, os.path.join(c, "sub"), blocked):
+                with self.subTest(out=out):
+                    with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as ctx:
+                        SC.main([c, r, "--out", out, "--date", "2026-01-02"])
+                    self.assertNotIn(ctx.exception.code, (0, None))
+                    self.assertIn("seo_compare: error: cannot write to " + out,
+                                  str(ctx.exception.code))
+            fail = subprocess.run([sys.executable, _SCRIPT, c, r, "--out", c],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(fail.returncode, 0)
+            self.assertNotIn("Traceback", fail.stderr)
+            self.assertEqual(len(fail.stderr.strip().splitlines()), 1)
+            self.assertIn("seo_compare: error: cannot write to", fail.stderr)
 
     def test_script_runs_as_a_program(self):
         with tempfile.TemporaryDirectory() as d:
