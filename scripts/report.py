@@ -102,10 +102,15 @@ def _zone_chips(zones):
 
 def keyword_block(r):
     kw = r.get("keywords") or {}
+    # built before the early return: title concentration reads only <title>, so it is
+    # still worth showing on a client-rendered site with no crawlable body text
+    insights = ""
+    if kw.get("insights"):
+        insights = "<ul class='kwnotes'>" + "".join(f"<li>{esc(i)}</li>" for i in kw["insights"]) + "</ul>"
     if not kw.get("available"):
         note = esc(kw.get("note", "Keyword analysis unavailable — no crawlable on-page text."))
         return ("<h2>Keyword focus</h2>"
-                f"<p class='status' style='margin-top:0'>{note}</p>")
+                f"<p class='status' style='margin-top:0'>{note}</p>{insights}")
     rows = []
     for t in kw["terms"]:
         kind = "phrase" if t["n"] >= 2 else "word"
@@ -124,9 +129,6 @@ def keyword_block(r):
              "<th>Keyword</th><th>Type</th><th>Appears in (SEO-weighted)</th>"
              "<th>Body uses</th><th>Prominence</th></tr></thead><tbody>"
              + "".join(rows) + "</tbody></table>")
-    insights = ""
-    if kw.get("insights"):
-        insights = "<ul class='kwnotes'>" + "".join(f"<li>{esc(i)}</li>" for i in kw["insights"]) + "</ul>"
     method = ("<p class='status' style='margin:0 0 8px'>What the site actually emphasizes, ranked by "
               "<b>where</b> each term appears — not raw frequency. Placement is weighted Title ×5, H1 ×4, "
               "H2–H3 / meta ×3, URL / schema ×2, body ×1 (body capped so repetition can't outrank deliberate "
