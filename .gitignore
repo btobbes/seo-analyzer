@@ -9,3 +9,10 @@ __pycache__/
 seo-report-*.html
 seo-report-*.pdf
 seo-report-*.json
+
+# Generated comparison and competitor-discovery outputs
+seo-compare-*.md
+seo-compare-*.json
+seo-compare-*.html
+competitors-*.md
+competitors-*.json

@@ -13,7 +13,10 @@ description: >-
   social previews, or AI-crawler visibility; or asks for an "SEO report" / "SEO
   audit" / "site health check" for a given URL or domain. Trigger even if they just
   paste a URL and ask "how's the SEO on this?" or "what's wrong with this site for
-  search?".
+  search?". Also use it for competitive analysis: "who is outranking us", "compare us
+  with <rival>", "why are we losing position to <site>", "what does <rival> do better",
+  or "find our top competitors and compare" (competitor discovery, side-by-side audits,
+  the seven-lens comparison in references/competitive-analysis.md).
 ---
 
 # SEO Audit
@@ -82,6 +85,45 @@ Two rules follow from that, and they matter more than anything else in this file
    (Core Web Vitals without PageSpeed, anything behind a login, the money path).
    Interpret; don't dump the table.
 
+6. **Competitive analysis (when the question is "who is beating us and why").** The full
+   method is `references/competitive-analysis.md`; what can be fetched and what is worth
+   buying is `references/competitor-sources.md`. The short form:
+
+   1. Ask what "losing position" means (organic rank, map pack, a marketplace's category
+      order, bookings) and request the owner's Search Console, Business Profile and
+      booking exports; they answer the question directly. Say up front what the
+      environment cannot observe (usually Google itself).
+   2. Write about 20 queries in five classes (head terms, the rivals' product classes,
+      informational, venue/landmark, brands) into a file.
+   3. Find the competitive set:
+
+      ```bash
+      python3 scripts/find_competitors.py --client example.com --owned other-example.com \
+        --queries-file queries.txt --out <output-dir>
+      ```
+
+      It tallies the domains occupying the results (Brave live, or `--serp-json` exports
+      from SerpApi or DataForSEO when someone has bought real Google data), classifies
+      them (business, marketplace, social/video, directory/news, own) and shortlists the
+      rivals to audit. Add the marketplace category leaders and anyone the owner named.
+      Three to five rivals; classify each as local-direct, national franchise or aggregator.
+   4. Audit every rival with the same flags as the client, then compare:
+
+      ```bash
+      python3 scripts/seo_compare.py client.json rival1.json rival2.json --out <output-dir> --json --html
+      ```
+
+      Ignore the overall scores when page counts differ by more than about 3x or a site
+      has no sitemap; the comparison says when that applies. Read the absent-features
+      matrix and the findings unique to each side.
+   5. Run the seven lenses (on-page and offer, distribution and reviews, links and
+      partners, search visibility by query class, the client's own architecture,
+      conversion path, data sources), verify every strategy-changing claim with a fresh
+      request, and write the report in the seven-part order the reference gives: verdict,
+      what the rival does well and the counter-move that does it better, self-inflicted
+      problems, conversion fixes, where the client already wins, the other rivals, and
+      data plus a dated 90-day plan.
+
 ## How it works (so you can explain or adjust it)
 
 - **Template-stratified sampling.** Sitemap URLs are clustered by path shape
@@ -144,6 +186,26 @@ Two rules follow from that, and they matter more than anything else in this file
   median unique words per page and any near-duplicate pairs (≥80% shared). A sentence
   repeated on one page (a partial rendered twice) is flagged.
 - **Share images on every template**, fetched with GET: missing, broken, or small/square.
+- **Consistency and estate checks (2.1.0).** Self-declared review counts that disagree
+  across pages (LOW, trust); a large share of analysed pages carrying affiliate tracking,
+  which is what Google's thin-affiliation and scaled-content policies describe (LOW at
+  30%, MEDIUM at 50%, on page); other domains the same business runs, found through a
+  shared analytics property or a `sameAs` entry whose target names the same organization
+  in its own schema, fetched once each, reported when they are separate live sites rather
+  than redirects (LOW/MEDIUM, crawlability; skipped with `--offline-dns`; listed in the
+  JSON as `owned_domains`); and title concentration,
+  how many crawled titles share one two-word phrase after the brand segment is stripped,
+  shown in the keyword section and never scored. Each came out of a competitive audit
+  where the client's losses were partly self-inflicted.
+- **False positives fixed in 2.1.0.** `<script type="module">` is deferred by
+  specification and no longer counts as render-blocking; AVIF/WebP delivered through
+  `<picture><source>`, `srcset` or an image preload no longer triggers "no modern
+  formats"; the hero check measures the `<picture>` source a browser fetches instead of
+  the JPEG fallback and says so; a Google Fonts stylesheet linked twice is reported once
+  as a duplicate link and its files are counted once; LocalBusiness subtypes without the
+  word "Business" in their name (TravelAgency, Dentist, Winery...) are recognised; and
+  single-post permalinks (one TripAdvisor review, one Facebook video) no longer fill the
+  footprint table.
 - **Site-wide probes** (unchanged): all four host variants, real-404 handling, TLS expiry,
   asset caching, analytics stack, redirect chains with the full hop list.
 - **Client-render suppression**, **RFC 9309 robots evaluation**, **PageSpeed integration**,
@@ -168,7 +230,10 @@ once per issue type, like everything else. Details and the full check list are i
 
 `python3 -m unittest discover -s tests -v` runs unit tests and an integration suite
 against a local fixture site that reproduces each defect (and a clean twin that guards
-against false positives). Run it after changing any check. No network access is needed.
+against false positives), plus `tests/test_checks_21.py` (the 2.1.0 checks and fixed
+false positives, each with a firing and a silent case), `tests/test_compare.py` and
+`tests/test_find_competitors.py` (the comparison and discovery scripts on synthetic
+inputs). Run it after changing any check. No network access is needed.
 
 ## Notes
 
@@ -179,3 +244,9 @@ against false positives). Run it after changing any check. No network access is 
 - Re-running after fixes and diffing the `--json` outputs is a good way to show progress.
 - If the site blocks the crawler entirely, say so plainly rather than presenting an empty
   report as if the site were healthy.
+- Never compare overall scores across sites. An 11-page site with no robots.txt, no
+  sitemap and no schema scored 81 against a 1,062-URL site's 84 (2026-09-22): the small
+  site scored well by having nothing to check. Compare category by category, page counts
+  beside them, and read what each site lacks (`scripts/seo_compare.py` does this).
+- A rival's marketing claim ("award-winning, as seen on...") is a claim until the
+  outlet's own page confirms it. Search for it; report what was and was not found.

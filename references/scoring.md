@@ -251,6 +251,64 @@ wide or far from landscape (LOW). Always fetched with GET. Homepage: og:image ov
 (MEDIUM); template median under 120 unique words (LOW); a ≥12-word sentence repeated on
 one page (LOW).
 
+## Checks added in 2.1.0
+
+Each came out of the competitive audit of 2026-09-22 (see `competitive-analysis.md`),
+where the client's lost position was partly its own doing. Function names are in
+`scripts/seo_audit.py`.
+
+**trust** — `check_rating_consistency`: the site's own LocalBusiness/Organization-family
+nodes declare different `reviewCount`/`ratingCount` values for the same entity name on
+different pages (LOW). Product nodes are ignored, since different products may differ.
+
+**on page** — `check_affiliate_share`: of the analysed pages (status 200, at least 20 of
+them), the share whose outbound links carry affiliate tracking: Amazon `tag=`, Viator
+`pid=P…`, Booking.com `aid=`, GetYourGuide `partner_id=`, Expedia `affcid=`, generic click
+ids (`irclickid`, `clickid`, `affiliate_id`, `aff_id`, `affid`, `afftrack`), or a known
+affiliate network host. LOW at 30%, MEDIUM at 50%; the templates and the kinds of
+tracking are named. `ref=` and `utm_` alone never count.
+
+**crawlability** — `check_owned_domains` (network; skipped with `--offline-dns`): the
+homepage's `sameAs` URLs and its external links, minus social platforms, marketplaces,
+CDNs and other well-known hosts, up to 12 candidates, fetched once each with a browser
+UA. A domain is "owned" when it shares an analytics property id (`G-`, `GTM-`, `UA-`,
+`AW-`) with the homepage, or when it is declared in `sameAs` *and* its own schema names
+the same organization (a `sameAs` pointing at a DMO listing, a Wikipedia page or a Maps
+share link is a pointer to a page about the business, not a domain it runs; the first
+real-site run caught exactly that). Owned domains that return 200 and canonicalize to
+themselves are *separate live sites* (LOW; MEDIUM with two or more, or when one shares
+the analytics property). Owned domains that redirect or canonicalize to the audited site
+are counted in the health row and never a finding. The JSON carries every probed
+candidate under `owned_domains` (status, final host, canonical host, title, declared,
+shares analytics, same entity name, links back).
+
+**keyword focus (not scored)** — `title_concentration`: after stripping the brand segment
+that 40% or more of titles share, the two-word phrase found in the most crawled titles,
+reported when at least 5 titles and 15% of them carry it. Six owned URLs on three domains
+chasing "flagstaff ghost tour" is the case it was written for.
+
+## Fixed in 2.1.0
+
+False positives hand-verified on one site and reproduced in `tests/test_checks_21.py`:
+
+- **Render-blocking scripts** ignored `type="module"`; module scripts are deferred by
+  specification, so a Vite/Astro bundle in `<head>` fired on every page of a modern build.
+- **No modern image formats** only looked at `<img src>`; AVIF/WebP through
+  `<picture><source type=image/avif>`, `srcset` or `<link rel=preload as=image>` was
+  invisible.
+- **Hero image weight** measured the `<img src>` JPEG fallback (716 KB) when the browser
+  fetched the `<picture>` AVIF (282 KB). It now measures the largest candidate of the first
+  AVIF/WebP source (or the preload's `imagesrcset`) and says which file it measured.
+- **Web font payload** counted the same woff2 files twice when the Google Fonts
+  stylesheet was linked twice (308 KB reported, 154 KB real). Files are counted once, and
+  the duplicate `<link>` is its own LOW finding ("Google Fonts stylesheet is linked more
+  than once").
+- **LocalBusiness schema incomplete** picked a thinner `Organization` node over a
+  `TravelAgency` node because subtypes were matched by substring against a short list.
+  `_looks_local_type()` knows the schema.org LocalBusiness family and its suffixes.
+- **Social & local footprint** listed every TripAdvisor `ShowUserReviews-*` permalink and
+  every Facebook video as a profile row. Single-post permalinks are now noise.
+
 ### Deliberately not scored
 
 Question headings, lists, tables, llms.txt presence, markdown content negotiation,
@@ -323,3 +381,20 @@ crawlable text (fully client-rendered), the section says so instead of inventing
    sites built differently from the one that motivated the check (bot-protected
    publishers, 50,000-URL sitemaps, sites with no sitemap).
 6. Bump `VERSION` in `seo_audit.py`.
+
+## Comparing sites
+
+Category scores and the overall score are built from findings deduplicated by
+`(category, title)`, with diminishing returns, so they describe *what was observed*.
+They do not reward what a site has: a site with no structured data has no schema
+findings about wrong structured data, and a site with no sitemap has no sitemap hygiene
+findings. Two consequences for competitive work:
+
+- Do not rank sites by overall score. Compare category by category, with the audited
+  page counts beside them, and treat absent features (no robots.txt, no sitemap, no
+  JSON-LD, no analytics, no trust pages, no share image) as the gap they are.
+  `scripts/seo_compare.py` builds that view from two or more `--json` reports and prints a
+  caveat when page counts differ by more than 3x or a site has no sitemap.
+- Audit rivals with the same `--max-pages` and `--sweep` as the client, and re-audit
+  after any migration settles; a rival caught mid-rebuild (old URLs 404, no sitemap yet)
+  looks weaker than it will be in 60 days.
