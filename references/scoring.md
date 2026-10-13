@@ -132,11 +132,13 @@ redirect — www vs non-www (MEDIUM); host variants unreachable (LOW); missing p
 / `canonical` / `hreflang` failures when PSI runs.
 
 **on page:** missing/over-long/short title; missing/over-long/short meta description;
-meta description lacks CTA verb; missing H1 (HIGH); multiple H1 (LOW); heading levels skip
+most meta descriptions lack a CTA verb (one site-level LOW, legal/utility pages excluded);
+missing H1 (HIGH); multiple H1 (LOW); heading levels skip
 (LOW); thin content <300 words; long content (≥600 words) without subheadings (LOW);
 missing canonical tag (LOW); URL slug not clean — uppercase/underscores/spaces (LOW);
 dead-end page with no internal links (LOW); very high internal link count >300 (LOW);
-images missing alt; duplicate title across pages; duplicate meta description across pages;
+images missing alt (an absent attribute; `alt=""` is decorative and only an all-decorative
+page gets an INFO note); duplicate title across pages; duplicate meta description across pages;
 no analytics detected (INFO) / only deprecated Universal Analytics (LOW).
 
 **Client-render suppression:** when a page is detected as client-rendered, the dependent
@@ -147,7 +149,7 @@ instead of a pile of misleading findings that would double-count it.
 **schema:** no JSON-LD (LOW); invalid JSON-LD (MEDIUM); FAQPage schema without visible FAQ
 content (MEDIUM); homepage missing Organization/WebSite schema (LOW); social profiles not in
 `sameAs` (LOW); no BreadcrumbList on any crawled page when ≥3 pages have server-rendered text
-(LOW); LocalBusiness schema incomplete — missing phone/address/geo/hours (LOW); local signals
+and at least one crawled URL is two path segments deep (LOW); LocalBusiness schema incomplete — missing phone/address/geo/hours (LOW); local signals
 (tel:/Maps links) but no LocalBusiness schema at all (MEDIUM).
 
 **trust:** not HTTPS (CRITICAL); http:// version serves 200 without redirecting to HTTPS
