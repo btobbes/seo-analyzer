@@ -56,33 +56,37 @@ Each item names the failure it exists to catch. They come from real audits.
     locally on one page per template in mobile mode. Static checks find the causes; only a
     browser measures LCP, INP and CLS. New sites have no field data, so make sure a
     real-user beacon is actually able to run (no CSP block) before traffic arrives.
+14. **Check sitemap `<lastmod>` against the real change history.** Hand-maintained dates go
+    stale: a site whose pricing and team pages changed on 2026-10-08 to 10 still declared
+    2026-09-27/28. Google only uses lastmod when it is consistently accurate; derive it
+    from the commit date of the page and the data files it renders, or drop it.
 
 ## The money path
 
-14. **Run a test transaction end to end** on an isolated environment: qualify, pay, receive,
+15. **Run a test transaction end to end** on an isolated environment: qualify, pay, receive,
     cancel, refund. Check the database rows and the emails, not just the success page.
-15. **Test dependency failure, not only success.** If a step depends on a third-party API
+16. **Test dependency failure, not only success.** If a step depends on a third-party API
     (an archive, a registry, a places lookup), make it fail and watch what the customer sees.
     A flaky free API that gates checkout turns every outage into lost sales.
-16. Confirm payment webhooks deliver 2xx in the provider dashboard. A browser redirect that
+17. Confirm payment webhooks deliver 2xx in the provider dashboard. A browser redirect that
     works can hide a webhook that has been failing for weeks.
-17. **Check analytics can see revenue.** The purchase event needs value, currency and a
+18. **Check analytics can see revenue.** The purchase event needs value, currency and a
     transaction id, and purchases made inside logged-in areas need server-side events.
-18. **Check nothing secret rides in a URL that analytics can read.** Resume links, magic
+19. **Check nothing secret rides in a URL that analytics can read.** Resume links, magic
     links and offer tokens in query strings are sent to analytics as the page location.
-19. Read the promises in the checkout and account copy against what the code does:
+20. Read the promises in the checkout and account copy against what the code does:
     "instantly", "every January", "refunded in full". Every unenforced promise is a finding.
 
 ## Trust and hygiene
 
-20. Domain auto-renew and a valid card on file (the script reports the expiry date only).
-21. Typo and hyphen variants of the domain: registered defensively or at least known.
-22. Transactional email: sending domain matches the site, SPF/DKIM/DMARC aligned, DMARC has
+21. Domain auto-renew and a valid card on file (the script reports the expiry date only).
+22. Typo and hyphen variants of the domain: registered defensively or at least known.
+23. Transactional email: sending domain matches the site, SPF/DKIM/DMARC aligned, DMARC has
     a reporting address, and the contact addresses in templates are the current ones.
-23. Private files and internal docs excluded from the deploy (the script probes a few
+24. Private files and internal docs excluded from the deploy (the script probes a few
     well-known paths; a repo-root-is-the-site setup needs a full allowlist review).
-24. A consent mechanism if the site will get EU/UK traffic and runs analytics.
-25. Uptime and error alerting wired to a channel someone reads, and a database backup taken
+25. A consent mechanism if the site will get EU/UK traffic and runs analytics.
+26. Uptime and error alerting wired to a channel someone reads, and a database backup taken
     before traffic arrives.
 
 ## How to report

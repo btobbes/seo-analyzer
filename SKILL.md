@@ -67,6 +67,14 @@ Two rules follow from that, and they matter more than anything else in this file
    - `--pagespeed` — query PageSpeed Insights for lab metrics and CrUX field data. Often
      rate-limited without a key; set `PAGESPEED_API_KEY`. Without it Core Web Vitals are
      **not measured**; the static performance checks find causes, not numbers.
+     When PSI answers 429 (the keyless quota is shared across every keyless user and is
+     often exhausted), run Lighthouse locally instead:
+     `npx -y lighthouse@12 <URL> --only-categories=performance,accessibility,seo,best-practices --form-factor=mobile --screenEmulation.mobile --throttling-method=simulate --output=json --output-path=lh.json --chrome-flags="--headless=new" --quiet`.
+     From `lh.json` read the category scores; the LCP, CLS and TBT display values; the
+     `largest-contentful-paint-element` phases (a large Render Delay on a text LCP usually
+     means a web-font swap); `errors-in-console` (a CSP block shows here); and the hosts in
+     `network-requests`, which prove which analytics tags actually fire (the static audit
+     can't). These are lab numbers under simulated slow 4G, not field data.
    - `--no-ai-probe` — skip requesting the homepage with AI-crawler user-agents.
    - `--offline-dns` — skip third-party lookups (RDAP domain expiry, DNS-over-HTTPS) and
      the owned-domains probe, which fetches up to 12 other sites once each.
@@ -79,14 +87,32 @@ Two rules follow from that, and they matter more than anything else in this file
    GET fine). If two findings conflict, resolve it first. If the site is being changed
    while you audit, re-run immediately before reporting; findings go stale in hours.
 
-5. **Report back.** Lead with what blocks launch, not with the score. Give the overall
+5. **Review the Google consoles when the owner can give access.** The crawl cannot see
+   whether Google has fetched the sitemap, which URLs it knows, or whether GA4 keeps and
+   counts the events the site sends. With a read-only service-account key:
+
+   ```bash
+   python3 scripts/google_console_review.py --site <URL> --key <key.json> --urls-from-sitemap --launched YYYY-MM-DD --json <output-dir>/console.json
+   ```
+
+   It prints a findings table (retention, key events, custom dimensions, signals and
+   identity, stream URL, sitemap freshness, URLs unknown to Google or crawled before the
+   launch date, host variants collecting impressions) and the raw configuration. It never
+   writes. What each answer means, what the APIs refuse to show (data filters, the Search
+   Console link, reporting identity in v1beta, change history without `analytics.edit`), and
+   how to join the console facts with the crawl are in `references/google-console-review.md`.
+   A relaunch two days old can score 90 on the crawl while Search Console still holds the
+   old site and GA4 is on two-month retention with no key event; these facts outrank the
+   score.
+
+6. **Report back.** Lead with what blocks launch, not with the score. Give the overall
    score with its coverage ("81/100 from 115 of 480 URLs, all 8 templates sampled"), then
    the CRITICAL and HIGH items, then the highest-leverage fixes (high impact, low effort).
    Separate what you verified from what the tool reported, and state what was not checked
    (Core Web Vitals without PageSpeed, anything behind a login, the money path).
    Interpret; don't dump the table.
 
-6. **Competitive analysis (when the question is "who is beating us and why").** The full
+7. **Competitive analysis (when the question is "who is beating us and why").** The full
    method is `references/competitive-analysis.md`; what can be fetched and what is worth
    buying is `references/competitor-sources.md`. The short form:
 
@@ -207,6 +233,20 @@ Two rules follow from that, and they matter more than anything else in this file
   word "Business" in their name (TravelAgency, Dentist, Winery...) are recognised; and
   single-post permalinks (one TripAdvisor review, one Facebook video) no longer fill the
   footprint table.
+- **False positives fixed in 2.2.0.** An image with `alt=""` is decorative by the HTML
+  spec and WCAG and no longer counts as missing alt (only an absent attribute does); a
+  page whose images are all `alt=""` gets one unscored INFO note. Analytics loaded from a
+  first-party script is recognised by its IDs (a bare GA4 `G-` measurement ID, numeric
+  `data-meta` / `data-linkedin` attributes, `fbq(`), and the LinkedIn Insight Tag,
+  Cloudflare Web Analytics and Umami are detected; when nothing is found the finding says
+  what was searched and that a first-party loader is invisible to it. The footprint table
+  skips a platform's own pages (privacy policy, legal, help, product and feature pages)
+  and on GitHub accepts only `owner` or `owner/repo`. "No BreadcrumbList schema" needs at
+  least one crawled URL two path segments deep, since a flat site has no hierarchy to
+  show. A meta description without an action verb is now one site-level LOW, raised only
+  when more than half of at least three non-legal pages lack one, instead of a LOW on
+  nearly every page. A CSP that blocks the Cloudflare Web Analytics beacon is named as
+  such, with the exact directives to add or the dashboard switch to turn it off.
 - **Site-wide probes** (unchanged): all four host variants, real-404 handling, TLS expiry,
   asset caching, analytics stack, redirect chains with the full hop list.
 - **Client-render suppression**, **RFC 9309 robots evaluation**, **PageSpeed integration**,
@@ -231,15 +271,17 @@ once per issue type, like everything else. Details and the full check list are i
 
 `python3 -m unittest discover -s tests -v` runs unit tests and an integration suite
 against a local fixture site that reproduces each defect (and a clean twin that guards
-against false positives), plus `tests/test_checks_21.py` (the 2.1.0 checks and fixed
-false positives, each with a firing and a silent case), `tests/test_compare.py` and
-`tests/test_find_competitors.py` (the comparison and discovery scripts on synthetic
-inputs). Run it after changing any check. No network access is needed.
+against false positives), plus `tests/test_checks_21.py` and `tests/test_checks_22.py`
+(the 2.1.0 and 2.2.0 checks and fixed false positives, each with a firing and a silent
+case), `tests/test_google_console_review.py` (the console reviewer against canned Google
+responses, no key needed), `tests/test_compare.py` and `tests/test_find_competitors.py`
+(the comparison and discovery scripts on synthetic inputs). Run it after changing any check. No network access is needed.
 
 ## Notes
 
 - This audits what is observable from the public site. It does not log in, submit forms,
-  execute JavaScript, or read Search Console. Be explicit about that scope.
+  execute JavaScript, or read Search Console. `scripts/google_console_review.py` covers the
+  consoles read-only when a key is available; otherwise be explicit about that scope.
 - The network load is modest but real: about 200 to 300 requests for a default run,
   eight at a time. Lower `--sweep` for fragile sites.
 - Re-running after fixes and diffing the `--json` outputs is a good way to show progress.

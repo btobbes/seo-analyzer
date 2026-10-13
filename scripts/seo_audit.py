@@ -38,7 +38,7 @@ from html.parser import HTMLParser
 
 # A descriptive UA: honest about being an auditor, but browser-shaped so servers that
 # sniff for "Mozilla" still serve the real page.
-VERSION = "2.1.0"   # bump on every behavior change; shown in the report footer and --version
+VERSION = "2.2.0"   # bump on every behavior change; shown in the report footer and --version
 USER_AGENT = "Mozilla/5.0 (compatible; SEO-Audit-Skill/2.1; +https://claude.com/claude-code)"
 # A plain desktop-browser UA: the baseline an AI-crawler probe is compared against, and
 # what font/CSS endpoints need to see before they serve woff2.
@@ -235,7 +235,8 @@ class PageParser(HTMLParser):
         self.text_parts = []
         self._skip_depth = 0
         self.img_total = 0
-        self.img_missing_alt = 0
+        self.img_missing_alt = 0   # no alt attribute at all
+        self.img_empty_alt = 0     # alt="" (decorative by the HTML spec)
         self.img_missing_dim = 0
         self.has_viewport_tag = False
         self._open_skip = []
@@ -318,8 +319,12 @@ class PageParser(HTMLParser):
                               "srcset_val": (a.get("srcset") or "").strip(),
                               "picture_sources": (list(self._picture_sources)
                                                   if self._picture_sources is not None else [])})
-            if not (a.get("alt") or "").strip():
+            # alt="" marks an image decorative (HTML spec, WCAG H67) and Lighthouse passes
+            # it; only an absent attribute leaves a screen reader reading the file name.
+            if "alt" not in a:
                 self.img_missing_alt += 1
+            elif not (a.get("alt") or "").strip():
+                self.img_empty_alt += 1
             if not (a.get("width") and a.get("height")):
                 self.img_missing_dim += 1
         elif tag in HEADING_TAGS:
@@ -776,10 +781,8 @@ def analyze_page(url):
         elif dl < 70:
             findings.append(f("LOW", "Meta description short", "on page", 2, 1, f"{dl} chars",
                              "Expand toward ≈150 chars to use the available SERP space."))
-        if not has_cta(p.meta_description):
-            findings.append(f("LOW", "Meta description lacks a CTA verb", "on page", 2, 1,
-                             trunc(p.meta_description, 90),
-                             "Add a verb like 'Learn', 'Explore', 'Get', or 'Compare' to invite the click."))
+        # a missing call to action is judged once across the site (check_description_ctas):
+        # per page it fired on nearly every page, privacy policy and terms included
 
     h1s = p.headings["h1"]
     if len(h1s) == 0 and not client_rendered:
@@ -876,6 +879,12 @@ def analyze_page(url):
         findings.append(f(sev, "Images missing alt text", "on page", 2, 2,
                           f"{p.img_missing_alt}/{p.img_total} images without alt",
                           "Add descriptive alt text for accessibility and image search."))
+    if (p.img_total >= 3 and not p.img_missing_alt and p.img_empty_alt == p.img_total
+            and not client_rendered):
+        findings.append(f("INFO", "All images marked decorative (alt=\"\")", "on page", 1, 1,
+                          f"{p.img_empty_alt}/{p.img_total} images carry alt=\"\"",
+                          "Fine if they are logos, thumbnails or illustrations with a visible caption; "
+                          "give any image that carries meaning (a product, a person, a chart) a real alt."))
 
     # ---- schema ----
     types, valid, invalid = parse_jsonld_types(p.jsonld)
@@ -1285,6 +1294,24 @@ _SOCIAL_NOISE = ("/sharer", "/share?", "/share/", "/intent/", "/dialog/", "share
                  "/plugins/", "/login", "/signup", "/oauth", "share.php",
                  "showuserreviews", "/posts/", "/videos/", "/photos/", "/reel/", "/reels/",
                  "/status/", "/watch?v=", "/shorts/", "/comments/")
+# The platform's own pages (its privacy policy, help centre, product pages) that sites
+# link from cookie banners and footers. Matched as whole path segments, so a profile
+# called /helpscout or /pressreader survives while /help/123 and /legal/privacy-policy
+# do not; a hyphen also ends a segment for /privacy-policy and /help-center.
+_SOCIAL_NONPROFILE_RE = re.compile(
+    r"/(?:privacy|legal|policy|policies|help|support|terms|features|about|business|ads"
+    r"|marketplace|developers|docs|blog|press|careers|jobs|explore|search|hashtag)(?=[/?#.-]|$)")
+# The same pages on a subdomain: business.facebook.com, help.instagram.com, about.linkedin.com.
+_SOCIAL_NONPROFILE_HOSTS = {"privacy", "legal", "help", "support", "developers", "developer",
+                            "business", "ads", "about", "docs", "blog", "press", "careers",
+                            "jobs", "transparency", "policies", "newsroom", "engineering"}
+# github.com/<owner> and github.com/<owner>/<repo> are profiles; these first segments are
+# GitHub's own sections, not owners.
+_GITHUB_RESERVED = {"features", "topics", "marketplace", "sponsors", "orgs", "enterprise",
+                    "pricing", "about", "security", "collections", "trending", "events",
+                    "settings", "login", "site", "customer-stories", "solutions", "resources",
+                    "team", "readme", "apps", "contact", "join", "new", "notifications",
+                    "explore", "search", "pulls", "issues", "codespaces", "copilot"}
 
 # schema.org LocalBusiness and its subtypes do not share a name fragment (TravelAgency,
 # Dentist, Winery...). Recognise the family by exact common members and by the
@@ -1352,6 +1379,19 @@ def _social_platform(host):
     return None
 
 
+def _is_profile_path(plat, host, path):
+    """False for a platform's own legal/help/product pages and, on GitHub, for anything
+    deeper than owner/repo or under one of GitHub's own sections."""
+    if host.split(".")[0] in _SOCIAL_NONPROFILE_HOSTS:
+        return False
+    if _SOCIAL_NONPROFILE_RE.search(path.lower()):
+        return False
+    if plat == "GitHub":
+        segs = [s for s in path.split("/") if s]
+        return 1 <= len(segs) <= 2 and segs[0].lower() not in _GITHUB_RESERVED
+    return True
+
+
 def extract_footprint(pages):
     """Collect social profiles linked from the site (page links + schema sameAs) and any
     local / Google Business Profile signals. Returns a dict for the report."""
@@ -1396,7 +1436,10 @@ def extract_footprint(pages):
         low = u.lower()
         if any(frag in low for frag in _SOCIAL_NOISE):
             continue
-        if not urllib.parse.urlparse(u).path.strip("/"):  # bare homepage, not a profile
+        path = urllib.parse.urlparse(u).path
+        if not path.strip("/"):  # bare homepage, not a profile
+            continue
+        if not _is_profile_path(plat, host, path):
             continue
         key = (plat, norm)
         if key in seen:
@@ -1704,8 +1747,14 @@ def check_asset_caching(home_page):
     return findings
 
 
+# Script URLs catch the vendor snippets. Sites that load their tags from a first-party
+# script (/assets/js/analytics.js with the IDs in data attributes) show only the IDs, so
+# the bare GA4 measurement ID and the numeric Meta/LinkedIn data attributes count too.
 _ANALYTICS_SIGNS = [
     ("GA4 (gtag.js)", r"googletagmanager\.com/gtag/js|gtag\("),
+    # a G- id inside a hashed asset name (/assets/G-ABCDEFGH.js, chunk.G-ABCDEFGH.css)
+    # is not a measurement ID, so a / or . on either side disqualifies the match
+    ("GA4 measurement ID", r"(?<![/.])\bG-[A-Z0-9]{8,12}\b(?!\.)"),
     ("Google Tag Manager", r"googletagmanager\.com/gtm\.js|GTM-[A-Z0-9]{4,}"),
     ("Universal Analytics (deprecated)", r"google-analytics\.com/analytics\.js|['\"]UA-\d{4,}-\d"),
     ("Plausible", r"plausible\.io/js"),
@@ -1713,8 +1762,18 @@ _ANALYTICS_SIGNS = [
     ("Matomo", r"matomo\.js|matomo\.php|piwik\.js"),
     ("Microsoft Clarity", r"clarity\.ms"),
     ("Hotjar", r"static\.hotjar\.com"),
-    ("Meta Pixel", r"connect\.facebook\.net/[^\"']*fbevents"),
+    ("Cloudflare Web Analytics", r"static\.cloudflareinsights\.com/beacon"),
+    # a bare "umami" would fire on every ramen menu; match the script host, the script
+    # name or the UUID website id its snippet carries
+    ("Umami", r"umami\.is/|umami\.js|data-website-id=[\"']?[0-9a-f]{8}-[0-9a-f]{4}-"),
+    ("Meta Pixel", r"connect\.facebook\.net/[^\"']*fbevents|data-meta=[\"']?\d{10,}|\bfbq\("),
+    # data-linkedin is also a common attribute for a team member's profile URL, so only
+    # a numeric partner ID counts
+    ("LinkedIn Insight Tag", r"snap\.licdn\.com|px\.ads\.linkedin\.com|data-linkedin=[\"']?\d{4,}[\"'\s>]"),
 ]
+# names that mean a working measurement setup beside a leftover Universal Analytics tag
+_MODERN_ANALYTICS = ("GA4", "Google Tag Manager", "Plausible", "Fathom", "Matomo", "Microsoft",
+                     "Hotjar", "Cloudflare", "Umami")
 
 
 def detect_analytics(home_page):
@@ -1725,15 +1784,19 @@ def detect_analytics(home_page):
         return [], ("Analytics", "not checked")
     txt = r.text[:400_000]
     hits = [name for name, rx in _ANALYTICS_SIGNS if re.search(rx, txt)]
+    if "GA4 (gtag.js)" in hits and "GA4 measurement ID" in hits:
+        hits.remove("GA4 measurement ID")     # the same tag seen twice
     findings = []
     ua_only = any(h.startswith("Universal") for h in hits) and not any(
-        h.startswith(("GA4", "Google Tag Manager", "Plausible", "Fathom", "Matomo",
-                      "Microsoft", "Hotjar")) for h in hits)
+        h.startswith(_MODERN_ANALYTICS) for h in hits)
     if not hits:
         findings.append(f("INFO", "No analytics detected", "on page", 1, 1,
-                          "No GA4/GTM/Plausible/Matomo/Clarity/Hotjar snippet in the homepage HTML",
+                          "no GA4/GTM/Meta/LinkedIn/Plausible/Fathom/Matomo/Clarity/Hotjar/Cloudflare "
+                          "signature in the homepage HTML",
                           "Install analytics (GA4 or a privacy-friendly alternative) and verify the site "
-                          "in Google Search Console — you can't improve what you don't measure."))
+                          "in Google Search Console — you can't improve what you don't measure. If tags "
+                          "load from a first-party script, the audit cannot see them; confirm with a "
+                          "browser's network panel."))
     elif ua_only:
         findings.append(f("LOW", "Only deprecated Universal Analytics found", "on page", 2, 1,
                           "; ".join(hits),
@@ -2820,6 +2883,56 @@ def _csp_allows(src_list, script_url, page_url):
     return False
 
 
+def _path_depth(u):
+    return len([s for s in urllib.parse.urlparse(u or "").path.split("/") if s])
+
+
+def check_breadcrumbs(pages, all_pages):
+    """Breadcrumbs describe a hierarchy. A flat site (/, /team, /privacy) has none to
+    show, so the finding needs at least one crawled URL two or more segments deep."""
+    any_rendered = any(p.get("word_count", 0) > 0 for p in pages)
+    nested = any(_path_depth(p.get("final_url") or p.get("url")) >= 2 for p in pages + all_pages)
+    if (any_rendered and len(pages) >= 3 and nested
+            and not any("BreadcrumbList" in (p.get("schema_types") or []) for p in all_pages)):
+        return [f("LOW", "No BreadcrumbList schema on any crawled page", "schema", 2, 2,
+                  f"0 of {len(all_pages)} pages declare breadcrumb structured data",
+                  "Add BreadcrumbList JSON-LD (and visible breadcrumbs) so search results "
+                  "show your site hierarchy instead of a raw URL.")]
+    return []
+
+
+# Legal and utility pages are not written to win a click, so they are left out of the
+# call-to-action count.
+_UTILITY_PAGE_RE = re.compile(r"privacy|terms|cookie|legal|imprint|impressum|disclaimer"
+                              r"|accessibility|sitemap|404", re.I)
+
+
+def check_description_ctas(all_pages):
+    """One site-level finding when most marketing pages' meta descriptions carry no
+    action verb. Per page this fired on almost every page and drowned the report."""
+    checked, lacking = 0, []
+    for p in all_pages:
+        desc = p.get("description") or ""
+        if not desc:
+            continue
+        u = p.get("final_url") or p.get("url") or ""
+        if _UTILITY_PAGE_RE.search(urllib.parse.urlparse(u).path) or \
+                _UTILITY_PAGE_RE.search(p.get("title") or ""):
+            continue
+        checked += 1
+        if not has_cta(desc):
+            lacking.append(u)
+    if checked >= 3 and len(lacking) > checked / 2:
+        return [f("LOW", "Most meta descriptions lack a call to action", "on page", 2, 1,
+                  f"{len(lacking)} of {checked} descriptions have no action verb "
+                  f"(e.g. {', '.join(lacking[:2])})",
+                  "Add a verb like 'Learn', 'Explore', 'Get', or 'Compare' to invite the click.")]
+    return []
+
+
+_CF_BEACON_HOST = "static.cloudflareinsights.com"
+
+
 def check_csp_blocks(page):
     """A CSP that forbids a script the page itself ships (classic: a CDN-injected RUM /
     analytics beacon) means that script silently never runs."""
@@ -2845,6 +2958,20 @@ def check_csp_blocks(page):
         if su and su.startswith("http") and not _csp_allows(srcs, su, page["final_url"] or page["url"]):
             blocked.append(urllib.parse.urlparse(su).hostname or su)
     blocked = sorted(set(blocked))
+    # Cloudflare injects the Web Analytics beacon into HTML only for browser-like
+    # user-agents: the audit UA and real browsers get it, curl's default UA does not. A
+    # hand check with curl must send a browser UA or the blocked script seems not to exist.
+    if _CF_BEACON_HOST in blocked:
+        others = [h for h in blocked if h != _CF_BEACON_HOST]
+        return [f("MEDIUM", "Content-Security-Policy blocks a script the page loads", "performance", 3, 1,
+                  f"script-src does not allow {_CF_BEACON_HOST} — the Cloudflare Web Analytics beacon "
+                  "the zone injects into every HTML response for browser user-agents"
+                  + (f" (also blocked: {', '.join(others[:3])})" if others else ""),
+                  "Either add https://static.cloudflareinsights.com to script-src and "
+                  "https://cloudflareinsights.com to connect-src, or switch Web Analytics off for "
+                  "the zone (Cloudflare dashboard > Analytics & Logs > Web Analytics). Until then "
+                  "the beacon is blocked, so no RUM Core Web Vitals, and every page view logs a "
+                  "CSP error.")]
     if blocked:
         return [f("MEDIUM", "Content-Security-Policy blocks a script the page loads", "performance", 3, 1,
                   "script-src does not allow: " + ", ".join(blocked[:4]),
@@ -3912,13 +4039,8 @@ def run_audit(start_url, max_pages=15, use_pagespeed=False, sweep=100, probe_ai=
                 "Add Organization (with logo and sameAs links to your profile URLs) and WebSite "
                 "JSON-LD so search engines can tie the site to one entity (site name, logo, knowledge panel)."))
 
-    any_rendered = any(p.get("word_count", 0) > 0 for p in pages)
-    if (any_rendered and len(pages) >= 3
-            and not any("BreadcrumbList" in (p.get("schema_types") or []) for p in all_pages)):
-        site_findings.append(f("LOW", "No BreadcrumbList schema on any crawled page", "schema", 2, 2,
-                               f"0 of {len(all_pages)} pages declare breadcrumb structured data",
-                               "Add BreadcrumbList JSON-LD (and visible breadcrumbs) so search results "
-                               "show your site hierarchy instead of a raw URL."))
+    site_findings.extend(check_breadcrumbs(pages, all_pages))
+    site_findings.extend(check_description_ctas(all_pages))
 
     # ---- per-page deep checks that need extra requests: run on every deep page, but
     # image/byte checks only on the first page of each template to bound traffic ----
