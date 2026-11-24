@@ -7,7 +7,11 @@ description: >-
   coverage, an AI-crawler access matrix tested at the network edge, link-architecture
   and canonical checks, a social-share preview analysis, and per-page findings tables,
   each finding tagged with severity, category, impact/effort, what was observed, and
-  a concrete fix. Also use it for pre-launch / pre-indexing readiness reviews. Use this
+  a concrete fix. When Google Search Console or GA4 access exists (a service-account
+  key), it also reads the index state of every sitemap URL, search performance by URL
+  template, queries within reach of page one, and ranks the crawl's findings by search
+  demand; use it whenever the user mentions Search Console, GSC, indexing, impressions,
+  clicks or rankings data. Also use it for pre-launch / pre-indexing readiness reviews. Use this
   whenever the user wants to analyze, audit, score, or improve a site's SEO; check
   search-engine readiness, crawlability, structured data, meta tags, Open Graph /
   social previews, or AI-crawler visibility; or asks for an "SEO report" / "SEO
@@ -85,6 +89,12 @@ Three rules follow from that, and they matter more than anything else in this fi
      means a web-font swap); `errors-in-console` (a CSP block shows here); and the hosts in
      `network-requests`, which prove which analytics tags actually fire (the static audit
      can't). These are lab numbers under simulated slow 4G, not field data.
+     Run one template per run and re-run any page that returns `NO_FCP` or an empty
+     category list (headless Chrome sometimes fails to paint; it is not a site fault). A
+     multi-second TTFB phase inside the LCP breakdown while `server-response-time` reads
+     under 300 ms is the simulator's model of the slow link, not the server. A
+     `robots-txt` audit that fails with no items listed is a fetch flake; check the file
+     with a GET before reporting it.
    - `--no-ai-probe` — skip requesting the homepage with AI-crawler user-agents.
    - `--offline-dns` — skip third-party lookups (RDAP domain expiry, DNS-over-HTTPS) and
      the owned-domains probe, which fetches up to 12 other sites once each.
@@ -103,14 +113,37 @@ Three rules follow from that, and they matter more than anything else in this fi
    With a read-only service-account key:
 
    ```bash
-   python3 scripts/google_console_review.py --site <URL> --key <key.json> --urls-from-sitemap --launched YYYY-MM-DD --json <output-dir>/console.json --markdown <output-dir>/console.md
+   python3 scripts/google_console_review.py --site <URL> --key <key.json> \
+     --urls-from-sitemap --inspect-max 400 --days 90 --launched YYYY-MM-DD \
+     --brand <brand words> --audit-json <output-dir>/seo-report-<domain>-<date>.json \
+     --json <output-dir>/console.json --markdown <output-dir>/console.md
    ```
+
+   Search Console's record can be months older than the page: a site can score 84 on
+   the crawl while a quarter of its pages still carry a noindex verdict from a crawl
+   made before a header was removed (133 of 473 sitemap URLs on one site, 85 days after
+   the fix, 2026-11-23). Nothing in the crawl can see that.
 
    The key can also come from an environment variable holding the JSON or its base64
    (`--key-env VAR`, or one of the default names the script looks for), which is how a
    cloud session or CI job carries it. Look for one before asking:
-   `env | grep -iE 'GOOGLE|GSC|GA_' | sed 's/=.*/=<set>/'`. Never print the key, never
-   write it into the repository.
+   `env | grep -iE 'GOOGLE|GSC|GA_' | sed 's/=.*/=<set>/'`, and check the project's notes
+   for a key path. Never print or `cat` the key, never write it into the repository. With
+   no access at all, ask once for a read-only key or for the exports listed under "No API
+   access" in the reference, and carry on with the crawl while you wait.
+
+   Run it after the crawl so `--audit-json` can join the two, and in the background: URL
+   Inspection takes 3 to 10 seconds a URL, so 400 URLs is 15 to 25 minutes. Choose the flags
+   on purpose:
+   - `--inspect-max`: the whole sitemap when it is under about 1,500 URLs (the quota is
+     about 2,000 a day per property and re-runs spend it again). Above that, the sample is
+     spread across URL templates and the table carries a scaled site-wide estimate.
+   - `--days`: 28 for an established site; 90 when 28 days holds under about 1,000
+     impressions, because nothing is readable below that.
+   - `--launched`: the date of the last change Google must have seen (a relaunch, a
+     noindex removed, a migration).
+   - `--brand`: the brand's words, with the common misspelling, to split brand from
+     non-brand demand.
 
    The order of work:
 
@@ -120,7 +153,8 @@ Three rules follow from that, and they matter more than anything else in this fi
       empty property list means the owner has not added the `client_email` yet. The script
       reports that as a finding and reviews whichever half it can. Tell the owner the
       exact address to add and where (`references/google-console-review.md`, "Access").
-   2. **Run the review** with `--urls-from-sitemap`. It inspects every sitemap URL,
+   2. **Run the review** with `--urls-from-sitemap`. It inspects the sitemap's URLs (all
+      of them up to `--inspect-max`, a sample across URL templates above that),
       pulls search performance for the window, the window before and all 16 months, reads
       the GA4 settings, the events for the window, and 14 months of sessions by date,
       source, landing page, event and hostname, and fetches the homepage to see whether
@@ -160,12 +194,47 @@ Three rules follow from that, and they matter more than anything else in this fi
    can score 92 with one page indexed and no measurement at all. These facts outrank the
    score.
 
-6. **Report back.** Lead with what blocks launch, not with the score. Give the overall
-   score with its coverage ("81/100 from 115 of 480 URLs, all 8 templates sampled"), then
-   the CRITICAL and HIGH items, then the highest-leverage fixes (high impact, low effort).
-   Separate what you verified from what the tool reported, and state what was not checked
-   (Core Web Vitals without PageSpeed, anything behind a login, the money path).
-   Interpret; don't dump the table.
+   Read the output in this order, and let it reorder the crawl's findings:
+   1. **Index state by template** (URL inspection table). Any noindex verdict the tool
+      re-fetched and found indexable today is the top finding of the whole review. It does
+      not clear by itself: Google recrawls a page it believes is noindex rarely, and a
+      fresh sitemap `<lastmod>` alone did not trigger it in the case above. The fix is
+      the owner's "Request indexing" on the hubs, about a dozen a day, so give them the
+      list in priority order (hubs that link to the most pages first).
+   2. **Search performance by URL template.** Which template earns the impressions and at
+      what position decides where on-page work pays. A template ranking around 10 is worth
+      title and content work; one ranking around 40 is not going to move on a title.
+   3. **Queries within reach** (positions 4 to 20). Check each page's title, H1 and first
+      paragraph against the query before proposing a change; many already match and need
+      links or time instead.
+   4. **Crawl findings ranked by search demand.** Fix from the top. This is the table that
+      turns the crawl's severity order into a work order.
+   5. The GA4 settings (retention, key events, custom dimensions) and the rest.
+
+   Do not: quote a position that sits on a handful of impressions; read a zero-impression
+   template as "no demand" before checking whether it is indexed; treat the raw totals of a
+   sampled inspection as site-wide rates (use the scaled estimate row); or change a
+   Google setting. The tool never writes; resubmitting a sitemap or requesting indexing is
+   the owner's click unless they ask you in writing. What each field means, the traps, and
+   what the APIs refuse to show are in `references/google-console-review.md`.
+
+6. **Report back.** Lead with what blocks launch, not with the score. When Search Console
+   was read, the index state comes first ("262 of 473 sitemap URLs indexed, 133 held as
+   noindex from a crawl on 30 August"), then search demand by template, then the crawl.
+   Give the overall score with its coverage ("81/100 from 115 of 480 URLs, all 8 templates
+   sampled"), then the CRITICAL and HIGH items, then the highest-leverage fixes (high
+   impact, low effort) in the order the demand table gives. Separate what you verified
+   from what the tool reported, and state what was not checked (Core Web Vitals without
+   PageSpeed, anything behind a login, the money path, Search Console when no access was
+   given). Interpret; don't dump the table.
+
+   **Before applying a fix in the site's own repository**, read the project's rules and
+   run its tests: a finding's suggested fix is a hypothesis about someone else's product.
+   On the site above, `rel="nofollow"` on links to a noindex utility page was the textbook
+   fix and the repository had a guard test, backed by an owner ruling, that forbids the
+   token anywhere in the source. Leave such a fix out and say why. Split the work list
+   into what you changed, what needs the owner's click in a console, and what needs a
+   product decision.
 
 7. **Competitive analysis (when the question is "who is beating us and why").** The full
    method is `references/competitive-analysis.md`; what can be fetched and what is worth
@@ -322,6 +391,16 @@ Three rules follow from that, and they matter more than anything else in this fi
   site's, campaign traffic filed under Unassigned, sitemap URLs held back from the index
   by coverage state, other hosts Google found the pages through, and near-zero search
   visibility on a site whose sitemap is more than 60 days old.
+- **Console reviewer 0.3.0 (skill 2.4.0).** Search Console data now sets the review's
+  priorities. `--inspect-max` inspects up to 1,800 URLs, sampled across URL templates when
+  the sitemap is larger, several at a time. Every noindex verdict is re-fetched live, so a
+  stale verdict (Google's record is old, the page is indexable now) is told apart from a
+  sitemap entry that really serves noindex; verdicts explained that way are left out of
+  the general held-back finding, which now breaks down by template. New findings: a
+  canonical Google chose against the declared one, and copies mostly over 60 days old.
+  New tables: performance by URL template, queries at positions 4 to 20, queries split
+  across pages, brand against non-brand (`--brand`), a weekly trend, and the crawl's
+  findings ranked by search demand (`--audit-json`). No crawl check changed in 2.4.0.
 - **Site-wide probes** (unchanged): all four host variants, real-404 handling, TLS expiry,
   asset caching, analytics stack, redirect chains with the full hop list.
 - **Client-render suppression**, **RFC 9309 robots evaluation**, **PageSpeed integration**,
@@ -349,7 +428,8 @@ against a local fixture site that reproduces each defect (and a clean twin that 
 against false positives), plus `tests/test_checks_21.py` and `tests/test_checks_22.py`
 (the 2.1.0 and 2.2.0 checks and fixed false positives, each with a firing and a silent
 case), `tests/test_checks_23.py` (the 2.3.0 fixes), `tests/test_google_console_review.py` (the console reviewer against canned Google
-responses, no key needed), `tests/test_compare.py` and `tests/test_find_competitors.py`
+responses, no key needed: collection, the findings rules, template sampling and the
+Search Console roll-ups), `tests/test_compare.py` and `tests/test_find_competitors.py`
 (the comparison and discovery scripts on synthetic inputs). Run it after changing any check. No network access is needed.
 
 ## Notes
@@ -366,6 +446,9 @@ responses, no key needed), `tests/test_compare.py` and `tests/test_find_competit
 - The crawl score moves when the tool changes. When comparing with an earlier run, compare
   the findings, and re-run the old commit of the site with the new version if the number
   matters.
+- Search Console's verdicts are as old as Google's last crawl of each URL. Always compare
+  a verdict with what the page serves now before calling it a live fault, and always date
+  it.
 - The network load is modest but real: about 200 to 300 requests for a default run,
   eight at a time. Lower `--sweep` for fragile sites.
 - Re-running after fixes and diffing the `--json` outputs is a good way to show progress.
