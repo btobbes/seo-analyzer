@@ -148,9 +148,13 @@ last two days are included (they are marked incomplete). Pull totals, then by `p
   position before quoting it.
 
 URL inspection. `POST searchconsole/v1/urlInspection/index:inspect` with `inspectionUrl`
-and `siteUrl`, one call per URL, roughly 2,000 a day per property and 600 a minute. Inspect
-every sitemap URL on a small site, one per template on a large one, plus the apex variant
-of the homepage. Fields:
+and `siteUrl`, one call per URL, roughly 2,000 a day per property and 600 a minute. Each
+call takes 3 to 10 seconds, so the script runs four at a time and logs progress. Inspect
+every sitemap URL when the sitemap is under about 1,500 URLs (`--inspect-max`); above
+that the script samples across URL templates, never the first N entries, and prints an
+estimate scaled by template size beside the raw sample totals. The first N entries of a
+sitemap are the static pages; the first version of this tool inspected those 50 and
+reported on a directory of 477 from them. Add the apex variant of the homepage. Fields:
 
 - `verdict` PASS with `coverageState` "Submitted and indexed" is the only good answer.
   "URL is unknown to Google" means never crawled: on a relaunch that is normal for new
@@ -169,6 +173,111 @@ of the homepage. Fields:
 Compare the inspection date with what the crawl saw live. "Page with redirect" recorded
 weeks ago on an apex that answers 200 today is a conflict to resolve (usually the redirect
 was lost in a hosting move), not two findings.
+
+## Using Search Console data to set the review's priorities
+
+The crawl ranks findings by severity. Search Console tells you which of them sit on pages
+people are shown, and whether Google holds the page at all. Read four things, in order.
+
+**1. Index state by template.** The inspection table counts coverage states per URL
+template. Read each state for what it asks of you:
+
+- "Submitted and indexed": nothing.
+- "Excluded by 'noindex' tag", or an indexing state beginning `BLOCKED_BY`: look at
+  `lastCrawlTime` first. The script re-fetches each such URL without credentials and marks
+  it "live: indexable" or "live: noindex". Indexable today means the verdict is stale: the
+  page was fixed and Google has not been back. This was the largest finding on a
+  local-directory site reviewed on 2026-11-23. A site-wide `X-Robots-Tag: noindex` came off on 20
+  September; 85 days later 133 of 473 sitemap URLs still held the verdict from a crawl on
+  30 and 31 August, including two of the main hubs, half of the state pages and the
+  city pages for the three largest markets. Every one of those URLs had zero
+  impressions. The sitemap carried a `<lastmod>` later than the crawl the whole time and
+  Google downloaded it, so a fresh `<lastmod>` is necessary and was not sufficient.
+  What works: the owner's "Request indexing" in URL Inspection, about a dozen URLs a day,
+  hubs first, since a recrawled hub hands Google fresh links to its children. Give the owner
+  the list in that order. Still noindex today and listed in the sitemap is a different
+  finding: take it out of the sitemap or remove the tag.
+- "Discovered - currently not indexed": Google knows the URL and has not spent a fetch on
+  it. This is crawl demand, which follows links and traffic. More internal links from pages
+  that do get crawled, and external links, move it. Content changes cannot, because Google
+  has not read the content.
+- "Crawled - currently not indexed": Google read the page and passed. This is the quality
+  signal. Put it beside the crawl's median unique words for that template.
+- "URL is unknown to Google": never seen. Normal for new URLs; otherwise the sitemap was
+  not read or nothing links there.
+- "Alternate page with proper canonical tag" on a URL that declares another canonical is
+  the correct answer, not a problem.
+- `googleCanonical` different from `userCanonical`: Google overrode the tag. Find which
+  URL the site's own links point at; that is usually the one Google chose.
+
+Also read the age line (median age of Google's copy, share older than 60 days). When most
+copies predate the last template change, every on-page finding in the crawl describes a
+page Google has not seen, and shipping more on-page changes will not show up in rankings
+until the recrawl happens. Say so, so nobody judges the changes on next week's numbers.
+
+**2. Search performance by URL template.** One row per template: sitemap URLs, pages with
+an impression, clicks, impressions and impression-weighted position. This says where the
+site's demand is. On the site above the business-profile template held 63% of impressions
+at position 40, where no title change moves anything, while 51 city pages held 17% at
+position 10 and took as many clicks. The city template is where content and titles pay. A
+template with many sitemap URLs and no impressions is either not indexed (check the
+inspection table before anything else) or not ranking.
+
+**3. Queries within reach.** Query and page pairs at positions 4 to 20 with at least five
+impressions. For each, open the page and compare its title, H1 and opening paragraph with
+the query. If they already match, the page needs links, better content than the pages
+above it, or time, and a rewrite is churn. If the query's words are missing and the page
+does answer it, that is a real on-page fix. Brand queries landing on an inner page instead
+of the homepage are worth a look (the homepage may not say plainly what the brand is), and
+check what else owns the brand's words: when a larger company uses the same phrase for
+something of its own, a new site can sit at position 7 for its own name.
+
+**4. Crawl findings ranked by search demand** (`--audit-json`). Each crawl finding with
+the impressions of the pages it sits on (deep-crawled pages by URL; swept findings by
+template, scaled by the share of the template's pages that carry the finding). Work from
+the top. Severity still matters for anything that blocks indexing; for the rest, a LOW on
+the template that earns the impressions outranks a MEDIUM on pages nobody is shown.
+
+Other tables: brand against non-brand (`--brand`) shows whether anyone finds the site
+without already knowing it; "queries split across pages" lists queries where two pages
+each hold a real share, which is sometimes two pages competing and sometimes a hub and its
+child; the weekly trend shows direction, and a week with under seven days is partial.
+
+Traps:
+
+- Small numbers. Under about 1,000 impressions in the window, widen to 90 days and quote
+  counts, not rates. A position on five impressions is an anecdote.
+- Search Console data starts when the property was verified and only for URLs Google
+  showed. Sixteen months is the most it keeps; a young site returns the same rows for 90
+  and 480 days.
+- Page rows include URLs with tracking parameters and URLs outside the sitemap (a dated
+  twin, a short link, a login page). The template table keeps them as their own rows; a
+  login page or redirect link collecting impressions is a finding (it should be noindex and
+  crawlable so Google can read the tag, or not linked).
+- The Page indexing report in the Search Console UI lags the URL Inspection API by days.
+  Judge the index from the API.
+- Never fetch the site with a search engine's user-agent to "see what Google sees". It
+  pollutes the owner's bot analytics and proves nothing a plain GET does not. The script's
+  live re-fetch uses its own user-agent.
+- Device rows can differ wildly (desktop position 41, mobile 13 on the site above). Do not
+  build a finding on that split without the query mix behind each device.
+
+## No API access
+
+Ask the owner for exports from the Search Console UI, and read them the same way:
+
+- Performance > Search results, date range 3 months, Export: gives Queries, Pages,
+  Countries, Devices and Dates sheets. Roll the Pages sheet up by URL template by hand
+  (path shape), then find the positions 4 to 20 rows in Queries.
+- Indexing > Pages: the counts by reason, then open each reason ("Excluded by 'noindex'
+  tag", "Discovered - currently not indexed", "Crawled - currently not indexed") and
+  export its URL list. For each noindex URL, fetch the live page and check the header and
+  the meta tag; the export does not carry crawl dates, so ask for a screenshot of URL
+  Inspection on two or three of them to date the verdict.
+- Sitemaps: a screenshot showing last read date and discovered URL count.
+
+State in the report that the exports were the source and what they could not show (no
+per-URL crawl dates, the UI's lag, at most 1,000 rows per sheet).
 
 ## GA4: what to read and what it means
 
@@ -304,6 +413,12 @@ Three joins tend to matter:
    checks and bots; say so before anyone reads the session count as an audience.
 
 ## Reporting
+
+Give three lists, because they have three different owners: what you changed in the
+site, what needs the owner's click in a console (Request indexing, resubmit the sitemap, a
+GA4 setting), and what needs a product decision. A review that ends with "request indexing
+for the affected pages" and no list has left the work undone; write the URLs out, hubs
+first.
 
 Lead with the stage (see "Which stage is the site at"), then the console facts that
 override the crawl score: "Google has not fetched the

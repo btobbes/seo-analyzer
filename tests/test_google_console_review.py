@@ -208,6 +208,9 @@ class StubbedNetwork(unittest.TestCase):
 
     def setUp(self):
         self._saved = (G.call, G.get_token, G.INSPECT_DELAY)
+        self._live = G.live_robots
+        G.live_robots = lambda url, timeout=20: {"status": 200, "x_robots": "", "meta_robots": "",
+                                                 "noindex": False}
         self._env = os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
         # a key in the developer's own environment must not leak into a "no key" test
         self._inline = {v: os.environ.pop(v) for v in G.INLINE_KEY_VARS if v in os.environ}
@@ -218,6 +221,7 @@ class StubbedNetwork(unittest.TestCase):
 
     def tearDown(self):
         G.call, G.get_token, G.INSPECT_DELAY = self._saved
+        G.live_robots = self._live
         if self._env is not None:
             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = self._env
         os.environ.update(self._inline)
@@ -798,6 +802,267 @@ class TestHelpers(unittest.TestCase):
             G.call = saved
         self.assertEqual((len(found), total, errs), (50, 60, []))
         self.assertEqual(used, ["https://x.com/index.xml", "https://x.com/a.xml"])
+
+    def test_sitemap_sample_is_spread_across_templates(self):
+        urls = ["https://x.com/about"] + ["https://x.com/blog/p%d" % i for i in range(10)] \
+            + ["https://x.com/2025/us/az/c%d/" % i for i in range(89)]
+        xml = '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">%s</urlset>' % "".join(
+            "<url><loc>%s</loc></url>" % u for u in urls)
+        saved = G.call
+        G.call = lambda u, body=None, auth=True, raw=False, timeout=30: (200, xml)
+        try:
+            found, total, used, errs = G.sitemap_urls(["https://x.com/sitemap.xml"], "https://x.com/", cap=9)
+        finally:
+            G.call = saved
+        self.assertEqual((len(found), total), (9, 100))
+        tpls = [G.url_template(u) for u in found]
+        self.assertEqual(tpls.count("/*"), 1)                 # the one-page template is not skipped
+        self.assertEqual(tpls.count("/blog/*"), 4)
+        self.assertEqual(tpls.count("/{year}/*/*/*/"), 4)
+        self.assertNotEqual(found[-4:], urls[11:15])          # spread, not the first four
+
+    def test_url_template_matches_the_audit(self):
+        for u, want in (("https://x.com/", "/"), ("https://x.com/about", "/*"),
+                        ("https://x.com/blog/", "/*/"), ("https://x.com/blog/a", "/blog/*"),
+                        ("https://x.com/2025/us/az/", "/{year}/*/*/"),
+                        ("https://x.com/us/az/tucson/bars/x", "/us/*/*/*/*")):
+            self.assertEqual(G.url_template(u), want)
+
+
+def page(u, imp, pos, clicks=0):
+    return {"keys": [u], "clicks": clicks, "impressions": imp, "ctr": clicks / imp if imp else 0.0,
+            "position": pos}
+
+
+def qp(q, u, imp, pos, clicks=0):
+    return {"keys": [q, u], "clicks": clicks, "impressions": imp, "ctr": 0.0, "position": pos}
+
+
+class TestRollups(unittest.TestCase):
+    """The Search Console roll-ups, on the shape of the 2026-11-23 review of a 477-URL
+    directory site: most impressions on a template ranking around position 40, the money
+    on a 51-page template ranking around 10, and a third of the index holding a noindex
+    verdict from a crawl made before the header was removed."""
+
+    SM = ["https://x.com/", "https://x.com/about", "https://x.com/2025/us/az/flagstaff/",
+          "https://x.com/2025/us/az/tucson/", "https://x.com/us/az/flagstaff/bars/a",
+          "https://x.com/us/az/flagstaff/bars/b", "https://x.com/us/az/flagstaff/bars/c"]
+
+    def test_performance_by_template(self):
+        rows = [page("https://x.com/2025/us/az/flagstaff/", 200, 9.0, 3),
+                page("https://x.com/us/az/flagstaff/bars/a", 60, 40.0),
+                page("https://x.com/us/az/flagstaff/bars/b?utm_source=s", 40, 60.0)]
+        out = G.performance_by_template(rows, self.SM)
+        self.assertEqual(out[0], {"template": "/{year}/*/*/*/", "sitemap_urls": 2,
+                                  "pages_with_impressions": 1, "clicks": 3, "impressions": 200,
+                                  "position": 9.0})
+        biz = out[1]
+        self.assertEqual((biz["template"], biz["sitemap_urls"], biz["impressions"], biz["position"]),
+                         ("/us/*/*/*/*", 3, 100, 48.0))         # weighted by impressions
+        self.assertEqual({x["template"]: x["impressions"] for x in out[2:]}, {"/": 0, "/*": 0})
+
+    def test_striking_distance_thresholds(self):
+        rows = [qp("best of flagstaff 2025", "https://x.com/2025/us/az/flagstaff/", 39, 4.9, 1),
+                qp("brand", "https://x.com/", 50, 1.2),                   # already at the top
+                qp("deep", "https://x.com/us/az/flagstaff/bars/a", 80, 41.0),   # too far
+                qp("rare", "https://x.com/about", 2, 8.0)]               # too few impressions
+        out = G.striking_distance(rows)
+        self.assertEqual([x["query"] for x in out], ["best of flagstaff 2025"])
+
+    def test_low_ctr_and_split_queries(self):
+        self.assertEqual([x["page"] for x in G.low_ctr_pages([
+            page("https://x.com/a", 100, 2.0, 0), page("https://x.com/b", 100, 2.0, 9),
+            page("https://x.com/c", 5, 1.0, 0), page("https://x.com/d", 100, 12.0, 0)])],
+            ["https://x.com/a"])
+        out = G.split_queries([qp("acme award", "https://x.com/business", 71, 6.8),
+                               qp("acme award", "https://x.com/about", 17, 15.1),
+                               qp("acme award", "https://x.com/faq", 3, 16.0),
+                               qp("solo", "https://x.com/", 40, 3.0)])
+        self.assertEqual(out, [])       # 71 of 91 on one page: the others hold under 20% each
+
+    def test_split_queries_fires_on_a_real_split(self):
+        out = G.split_queries([qp("q", "https://x.com/a", 30, 6.0), qp("q", "https://x.com/b", 20, 9.0)])
+        self.assertEqual([p["page"] for p in out[0]["pages"]], ["https://x.com/a", "https://x.com/b"])
+
+    def test_brand_split_and_weekly(self):
+        b = G.brand_split([{"keys": ["acme award"], "clicks": 5, "impressions": 39},
+                           {"keys": ["best of springfield"], "clicks": 0, "impressions": 33}], ["acme"])
+        self.assertEqual((b["brand"]["impressions"], b["non_brand"]["impressions"]), (39, 33))
+        wk = G.weekly_trend([{"keys": ["2026-11-16"], "clicks": 1, "impressions": 10},
+                             {"keys": ["2026-11-22"], "clicks": 2, "impressions": 5},
+                             {"keys": ["2026-11-23"], "clicks": 0, "impressions": 7}])
+        self.assertEqual(wk, [{"week": "2026-11-16", "clicks": 3, "impressions": 15, "days": 2},
+                              {"week": "2026-11-23", "clicks": 0, "impressions": 7, "days": 1}])
+
+    def test_inspection_rollup(self):
+        now = dt.datetime(2026, 11, 24, tzinfo=dt.timezone.utc)
+        res = [{"url": self.SM[0], "ok": True, "source": "sitemap", "coverageState": "Submitted and indexed",
+                "lastCrawlTime": "2026-11-19T12:00:00Z", "googleCanonical": self.SM[0], "userCanonical": self.SM[0]},
+               {"url": self.SM[2], "ok": True, "source": "sitemap", "coverageState": "Excluded by 'noindex' tag",
+                "lastCrawlTime": "2026-08-30T12:00:00Z"},
+               {"url": self.SM[4], "ok": True, "source": "sitemap", "coverageState": "URL is unknown to Google"},
+               {"url": self.SM[5], "ok": True, "source": "sitemap", "coverageState": "Submitted and indexed",
+                "lastCrawlTime": "2026-10-15T00:00:00Z", "googleCanonical": "https://x.com/2025/us/az/flagstaff/bars/b",
+                "userCanonical": self.SM[5]},
+               {"url": "https://www.x.com/", "ok": True, "source": "variant", "coverageState": "Page with redirect"},
+               {"url": self.SM[6], "ok": False, "status": 0}]
+        ru = G.inspection_rollup(res, now)
+        self.assertEqual((ru["inspected"], ru["crawled"], ru["never_crawled"], ru["crawl_older_than_60d"]),
+                         (4, 3, 1, 1))
+        self.assertEqual(ru["by_template"]["/us/*/*/*/*"],
+                         {"URL is unknown to Google": 1, "Submitted and indexed": 1})
+        self.assertEqual([m["url"] for m in ru["canonical_mismatch"]], [self.SM[5]])
+
+    def test_rank_crawl_findings_orders_by_demand(self):
+        audit = {"pages": [
+            {"url": "https://x.com/2025/us/az/flagstaff/", "findings": [
+                {"severity": "LOW", "title": "Heading levels skip"},
+                {"severity": "INFO", "title": "ignored"}]},
+            {"url": "https://x.com/about", "findings": [{"severity": "MEDIUM", "title": "Title too long"}]}],
+            "sweep_summary": [{"severity": "LOW", "title": "Heading levels skip", "count": 40,
+                               "templates": ["/{year}/*/*/*/"], "example": "https://x.com/2025/us/az/tucson/"},
+                              {"severity": "MEDIUM", "title": "Thin content (<300 words)", "count": 9,
+                               "templates": ["/us/*/*/*/*"], "example": "https://x.com/us/az/flagstaff/bars/a"}]}
+        rows = [page("https://x.com/2025/us/az/flagstaff/", 200, 9.0), page("https://x.com/2025/us/az/tucson/", 26, 15.0),
+                page("https://x.com/us/az/flagstaff/bars/a", 60, 40.0), page("https://x.com/about", 5, 9.0)]
+        out = G.rank_crawl_findings(audit, rows)
+        self.assertEqual([(x["title"], x["impressions"], x["pages"]) for x in out],
+                         [("Heading levels skip", 226, 41), ("Thin content (<300 words)", 60, 9),
+                          ("Title too long", 5, 1)])            # a LOW on the busy template comes first
+        # with the sitemap known, a swept finding owns only its share of the template's demand
+        sm = ["https://x.com/us/az/flagstaff/bars/p%d" % i for i in range(90)]
+        out = G.rank_crawl_findings(audit, rows, sm)
+        thin = next(x for x in out if x["title"].startswith("Thin"))
+        self.assertEqual(thin["impressions"], 6)                 # 9 of 90 pages, 60 impressions
+
+    def test_capped_inspection_is_scaled_to_the_sitemap(self):
+        sm = ["https://x.com/about"] + ["https://x.com/us/az/f/bars/p%d" % i for i in range(99)]
+        res = [{"url": sm[0], "ok": True, "source": "sitemap", "coverageState": "Excluded by 'noindex' tag"},
+               {"url": sm[1], "ok": True, "source": "sitemap", "coverageState": "Submitted and indexed"},
+               {"url": sm[2], "ok": True, "source": "sitemap", "coverageState": "Submitted and indexed"}]
+        data = {"sc": {"sitemap_urls": sm, "analytics": {"current": {}},
+                       "inspection": {"mode": "sitemap", "capped": True, "results": res}}}
+        ir = G.build_rollups(data)["inspection"]
+        self.assertEqual(ir["by_state"]["Excluded by 'noindex' tag"], 1)          # a third of the sample
+        self.assertEqual(ir["estimated_site_wide"], {"Excluded by 'noindex' tag": 1,
+                                                     "Submitted and indexed": 99})   # 1% of the site
+
+    def test_live_robots_parses_header_and_meta(self):
+        class Resp:
+            status = 200
+
+            def __init__(self, headers, body):
+                import email.message
+                self.headers = email.message.Message()
+                for k, v in headers:
+                    self.headers[k] = v
+                self._b = body.encode()
+
+            def read(self, n):
+                return self._b
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        saved = G.urllib.request.urlopen
+        try:
+            G.urllib.request.urlopen = lambda req, timeout=20: Resp([("X-Robots-Tag", "noindex")], "<html></html>")
+            self.assertTrue(G.live_robots("https://x.com/a")["noindex"])
+            G.urllib.request.urlopen = lambda req, timeout=20: Resp(
+                [], '<meta content="noindex, follow" name="robots">')
+            self.assertTrue(G.live_robots("https://x.com/a")["noindex"])
+            G.urllib.request.urlopen = lambda req, timeout=20: Resp(
+                [], '<meta name="robots" content="index, follow, max-image-preview:large">')
+            r = G.live_robots("https://x.com/a")
+            self.assertEqual((r["noindex"], r["meta_robots"]), (False, "index, follow, max-image-preview:large"))
+        finally:
+            G.urllib.request.urlopen = saved
+
+
+class TestIndexRules(unittest.TestCase):
+    NOW = dt.datetime(2026, 10, 12, 12, tzinfo=dt.timezone.utc)
+
+    def titles(self, data):
+        return {f["title"]: f["severity"] for f in G.evaluate(data, None, self.NOW)}
+
+    def test_stale_noindex_needs_a_live_recheck(self):
+        d = good_data()
+        res = d["sc"]["inspection"]["results"]
+        res.append({"url": "https://www.btobbes.com/winners", "ok": True, "source": "sitemap",
+                    "coverageState": "Excluded by \u2018noindex\u2019 tag", "indexingState": "BLOCKED_BY_HTTP_HEADER",
+                    "lastCrawlTime": "2026-08-30T18:14:00Z"})
+        # no live fetch, no stale claim: only the general held-back finding
+        self.assertEqual(self.titles(d), {"Sitemap URLs Google has not indexed": "MEDIUM"})
+        res[-1]["live"] = {"status": 200, "x_robots": "", "meta_robots": "", "noindex": False}
+        t = self.titles(d)
+        self.assertEqual(t, {"Google still records a noindex these pages no longer serve": "HIGH"})
+        res[-1]["live"] = {"status": 200, "x_robots": "noindex", "meta_robots": "", "noindex": True}
+        self.assertEqual(self.titles(d), {"Sitemap lists pages that serve noindex": "MEDIUM"})
+
+    def test_canonical_mismatch_and_limbo(self):
+        d = good_data()
+        res = d["sc"]["inspection"]["results"]
+        res[0].update(googleCanonical="https://www.btobbes.com/home", userCanonical="https://www.btobbes.com/")
+        self.assertEqual(self.titles(d), {"Google chose a different canonical than the page declares": "MEDIUM"})
+        res[0].update(googleCanonical="https://www.btobbes.com", userCanonical="https://www.btobbes.com/")
+        self.assertEqual(self.titles(d), {})                       # a trailing slash is not a disagreement
+        for i in range(3):
+            res.append({"url": "https://www.btobbes.com/p%d" % i, "ok": True, "source": "sitemap",
+                        "coverageState": "Discovered - currently not indexed"})
+        found = [f for f in G.evaluate(d, None, self.NOW)]
+        self.assertEqual([f["title"] for f in found], ["Sitemap URLs Google has not indexed"])
+        self.assertIn("By template: /* 3", found[0]["observed"])
+
+    def test_old_copies(self):
+        d = good_data()
+        d["sc"]["inspection"]["results"] = [
+            {"url": "https://www.btobbes.com/p%d" % i, "ok": True, "source": "sitemap",
+             "coverageState": "Submitted and indexed",
+             "lastCrawlTime": "2026-07-30T00:00:00Z" if i < 7 else "2026-10-10T00:00:00Z"} for i in range(12)]
+        self.assertEqual(self.titles(d), {"Most of Google's copies are over 60 days old": "MEDIUM"})
+
+    def test_striking_distance_and_low_ctr_findings(self):
+        d = good_data()
+        cur = d["sc"]["analytics"]["current"]
+        cur["query_page"] = {"ok": True, "rows": [qp("best of flagstaff 2025", "https://www.btobbes.com/f", 39, 4.9)]}
+        self.assertEqual(self.titles(d), {"Queries ranking just off the top results": "LOW"})
+        cur["query_page"] = {"ok": True, "rows": []}
+        cur["page"]["rows"] = [page("https://www.btobbes.com/", 40, 2.0, 0)]
+        self.assertEqual(self.titles(d), {"Pages shown near the top that few people click": "LOW"})
+
+
+class TestEndToEndRollups(StubbedNetwork):
+
+    def test_rollups_flags_and_sections(self):
+        apath = os.path.join(self.tmp.name, "audit.json")
+        with open(apath, "w") as fh:
+            json.dump({"pages": [{"url": "https://www.btobbes.com/", "findings": [
+                {"severity": "LOW", "title": "Heading levels skip"}]}], "sweep_summary": []}, fh)
+        jpath = os.path.join(self.tmp.name, "out.json")
+        code, out, err = self.run_main(["--site", "https://www.btobbes.com", "--key", self.key,
+                                        "--urls-from-sitemap", "--inspect-max", "4", "--brand", "btobbes",
+                                        "--audit-json", apath, "--json", jpath])
+        self.assertEqual(code, 0, err)
+        data = read_json(jpath)
+        ru = data["sc"]["rollups"]
+        self.assertEqual(len(data["sc"]["inspection"]["results"]), 5)      # 4 sampled + the variant
+        self.assertTrue(data["sc"]["inspection"]["capped"])
+        self.assertEqual(ru["by_template"][0]["template"], "/")
+        self.assertEqual(ru["sitemap_urls_without_impressions"], {"total": 4, "of": 6, "by_template": {"/*": 4}})
+        self.assertEqual(ru["crawl_findings_by_demand"][0]["impressions"], 26)
+        self.assertIn("### Search performance by URL template", out)
+        self.assertIn("### Crawl findings ranked by search demand", out)
+        self.assertIn("sampled across URL templates", out)
+        posts = [u for m, u, b, a in self.fake.calls if m == "POST"]
+        self.assertTrue(all("searchAnalytics/query" in u or "index:inspect" in u or ":run" in u for u in posts))
+
+    def test_bad_flags(self):
+        for extra in (["--inspect-max", "0"], ["--inspect-max", "5000"], ["--inspect-workers", "40"],
+                      ["--audit-json", "/nonexistent/audit.json"]):
+            code, out, err = self.run_main(["--site", "https://www.btobbes.com", "--key", self.key] + extra)
+            self.assertEqual(code, 2, extra)
 
 
 if __name__ == "__main__":

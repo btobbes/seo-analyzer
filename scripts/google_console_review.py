@@ -6,7 +6,8 @@ Google Search Console property, authenticated with a Google Cloud service-accoun
 Usage:
     python3 scripts/google_console_review.py --site https://www.example.com --key KEY.json
         [--property properties/123] [--sc-site sc-domain:example.com] [--days 28]
-        [--urls-from-sitemap | --url URL ...] [--launched YYYY-MM-DD]
+        [--urls-from-sitemap | --url URL ...] [--inspect-max N] [--inspect-workers N]
+        [--launched YYYY-MM-DD] [--brand TERM ...] [--audit-json seo-report.json]
         [--key-env VAR] [--json out.json] [--markdown out.md]
 
 READ-ONLY, ALWAYS
@@ -45,13 +46,27 @@ What it collects
     ("last event 2026-09-25"), plus events, hostnames, source/medium and landing pages
     over that span. The homepage is fetched once without credentials and searched for each
     stream's measurement ID and for a GTM container.
-    Search Console: sitemaps; searchAnalytics totals and by page, query (top 25), country
-    and device for the last --days days and the --days before that (dataState "all");
-    clicks and impressions by date for the last 16 months (everything Search Console keeps);
-    URL Inspection for --url URLs, or with --urls-from-sitemap for every sitemap URL
-    (capped at 50 per run) plus the other host variant of the homepage (apex for a www
-    site). Inspection quota is about 2,000 calls a day and 600 a minute per property; the
-    tool sleeps 0.2 s between calls and never comes near either.
+    Search Console: sitemaps; searchAnalytics totals and by page, query, country and device
+    for the last --days days and the --days before that (dataState "all"), plus query x page
+    pairs and a by-date series for the current window; clicks and impressions by date
+    for the last 16 months (everything Search Console keeps); URL Inspection for --url URLs, or
+    with --urls-from-sitemap for the sitemap's URLs plus the other host variant of the
+    homepage (apex for a www site). When the sitemap holds more URLs than --inspect-max
+    (default 50), the inspected set is sampled across URL templates, never "the first N".
+    Inspections run --inspect-workers at a time (default 4, each takes 3 to 7 seconds);
+    quota is about 2,000 calls a day and 600 a minute per property, and --inspect-max is
+    capped at 1,800. Every URL Google records as noindex is then fetched once, without
+    credentials and with this tool's own user-agent, to see whether the live page still
+    serves a noindex (capped at 25).
+
+What it derives (data["sc"]["rollups"], rendered as tables)
+    Search performance by URL template, with the sitemap URLs that earned no impression;
+    query and page pairs at positions 4 to 20 ("within reach"); pages near the top with a
+    very low click-through rate; queries split across pages; a weekly trend; brand against
+    non-brand queries with --brand; coverage state by template, canonical disagreements and
+    the age of Google's copies from URL Inspection; and, with --audit-json pointing at a
+    seo_audit.py --json report, the crawl's findings ranked by the impressions of the pages
+    and templates they sit on.
 
 Output
     Markdown to stdout (findings first, then tables). --markdown also writes it to a file;
@@ -62,6 +77,7 @@ Output
 
 import argparse
 import base64
+import concurrent.futures
 import datetime as dt
 import json
 import os
@@ -73,7 +89,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 SCOPES = ("https://www.googleapis.com/auth/analytics.readonly "
           "https://www.googleapis.com/auth/webmasters.readonly")
@@ -92,7 +108,11 @@ READ_ONLY_POSTS = (
     re.compile(r"^https://searchconsole\.googleapis\.com/v1/urlInspection/index:inspect$"),
 )
 
-INSPECT_CAP = 50
+INSPECT_CAP = 50            # default number of URLs inspected; --inspect-max raises it
+INSPECT_HARD_CAP = 1800     # stay under the 2,000-a-day URL Inspection quota per property
+INSPECT_WORKERS = 4         # concurrent inspections (the API takes 3 to 7 s per URL)
+LIVE_RECHECK_CAP = 25       # noindex verdicts re-fetched live, without credentials
+STRIKING_MIN_IMPRESSIONS = 5
 INSPECT_DELAY = 0.2          # seconds between URL Inspection calls (tests set it to 0)
 NOT_READABLE = "not readable with this scope/API"
 SEVERITY_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "INFO": 3}
@@ -580,11 +600,14 @@ def date_windows(days, today=None):
     return (start.isoformat(), end.isoformat()), (p_start.isoformat(), p_end.isoformat())
 
 
-def search_analytics(sc_site, start, end):
+def search_analytics(sc_site, start, end, deep=False):
     url = WEBMASTERS + "sites/" + sc_quote(sc_site) + "/searchAnalytics/query"
     out = {"range": [start, end]}
-    for label, dims, limit in (("totals", [], 1), ("page", ["page"], 250), ("query", ["query"], 25),
-                               ("country", ["country"], 25), ("device", ["device"], 10)):
+    for label, dims, limit in (("totals", [], 1), ("page", ["page"], 1000), ("query", ["query"], 1000),
+                               ("country", ["country"], 25), ("device", ["device"], 10),
+                               ("query_page", ["query", "page"], 1000), ("date", ["date"], 500)):
+        if label in ("query_page", "date") and not deep:
+            continue
         body = {"startDate": start, "endDate": end, "dimensions": dims, "rowLimit": limit,
                 "dataState": "all"}
         status, r = call(url, body)
@@ -598,7 +621,9 @@ def search_analytics(sc_site, start, end):
         rows = [{"keys": x.get("keys", []), "clicks": x.get("clicks", 0),
                  "impressions": x.get("impressions", 0), "ctr": x.get("ctr", 0.0),
                  "position": x.get("position", 0.0)} for x in r.get("rows", [])]
-        if dims:
+        if label == "date":
+            rows.sort(key=lambda x: x["keys"])
+        elif dims:
             rows.sort(key=lambda x: (-x["impressions"], -x["clicks"]))
         out[label] = {"ok": True, "rows": rows, "metadata": r.get("metadata")}
     return out
@@ -627,9 +652,19 @@ def search_history(sc_site, today=None, days=SC_HISTORY_DAYS):
 
 
 def sitemap_urls(paths, site_url, cap=INSPECT_CAP):
+    """The sitemap URLs to inspect: all of them when they fit under `cap`, otherwise a
+    sample spread across URL templates (the first `cap` entries of a sitemap are usually
+    the static pages, which says nothing about the template that holds most of the site).
+    Returns (picked, total_found, sources_used, errors)."""
+    urls, used, errors = sitemap_all(paths, site_url)
+    picked = urls if len(urls) <= cap else stratified_sample(urls, cap)
+    return picked, len(urls), used, errors
+
+
+def sitemap_all(paths, site_url):
     """Collect <loc> URLs from the given sitemaps (following one level of sitemap index).
     Falls back to robots.txt Sitemap: lines, then /sitemap.xml. Fetched without credentials.
-    Returns (urls_in_order, total_found, sources_used, errors)."""
+    Returns (urls_in_order, sources_used, errors)."""
     if not paths:
         root = "%s://%s/" % (urllib.parse.urlsplit(site_url).scheme, host_of(site_url))
         st, txt = call(root + "robots.txt", auth=False, raw=True)
@@ -661,11 +696,101 @@ def sitemap_urls(paths, site_url, cap=INSPECT_CAP):
             if u not in seen:
                 seen.add(u)
                 urls.append(u)
-    return urls[:cap], len(urls), used, errors
+    return urls, used, errors
+
+
+# URL templates and sampling. Kept in step with seo_audit.py (url_template, stratified_sample)
+# so the console tables and the crawl's coverage table use the same template names.
+_YEAR_RE = re.compile(r"^(19|20)\d{2}$")
+
+
+def url_template(u):
+    """A coarse path-shape signature: '/blog/*', '/{year}/*/*/*/', '/about' -> '/*'."""
+    path = urllib.parse.urlsplit(u).path or "/"
+    segs = [x for x in path.split("/") if x]
+    if not segs:
+        return "/"
+    first = "{year}" if _YEAR_RE.match(segs[0]) else segs[0]
+    if len(segs) == 1:
+        return "/*" + ("/" if path.endswith("/") else "")
+    return "/" + first + "/*" * (len(segs) - 1) + ("/" if path.endswith("/") else "")
+
+
+def _spread(items, k):
+    if k <= 0:
+        return []
+    if k >= len(items):
+        return list(items)
+    step = len(items) / k
+    return [items[int(i * step)] for i in range(k)]
+
+
+def stratified_sample(urls, n):
+    """Up to n URLs across template clusters: every template gets a slot before any gets a
+    second, and picks are spread evenly inside each. Sitemap order is kept in the result."""
+    pool = list(dict.fromkeys(urls))
+    if n <= 0 or not pool:
+        return []
+    clusters = {}
+    for u in pool:
+        clusters.setdefault(url_template(u), []).append(u)
+    ordered = sorted(clusters.items(), key=lambda kv: -len(kv[1]))
+    quota = {t: 0 for t, _ in ordered}
+    left = min(n, len(pool))
+    while left > 0:
+        progressed = False
+        for t, members in ordered:
+            if left and quota[t] < len(members):
+                quota[t] += 1
+                left -= 1
+                progressed = True
+        if not progressed:
+            break
+    chosen = set()
+    for t, members in ordered:
+        chosen.update(_spread(members, quota[t]))
+    return [u for u in pool if u in chosen]
+
+
+_META_ROBOTS_RE = re.compile(
+    r"<meta\b[^>]*\bname\s*=\s*[\"']?(?:robots|googlebot)[\"']?[^>]*>", re.I)
+_CONTENT_RE = re.compile(r"\bcontent\s*=\s*[\"']([^\"']*)[\"']", re.I)
+
+
+def live_robots(url, timeout=20):
+    """Fetch a URL with no credentials and report what it tells a crawler about indexing
+    today: {"status", "x_robots", "meta_robots", "noindex"}. Used to tell a stale noindex
+    verdict (Google's record is old, the page is indexable now) from a live one. The request
+    is a plain GET with this tool's own user-agent, never a search engine's."""
+    _guard(url, "GET", False)
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "text/html,*/*"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = resp.status
+            xr = ", ".join(resp.headers.get_all("X-Robots-Tag") or [])
+            body = resp.read(600_000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return {"status": e.code, "x_robots": ", ".join(e.headers.get_all("X-Robots-Tag") or []),
+                "meta_robots": "", "noindex": None}
+    except (urllib.error.URLError, OSError) as e:
+        return {"status": 0, "x_robots": "", "meta_robots": "", "noindex": None,
+                "error": str(getattr(e, "reason", e))[:120]}
+    metas = []
+    for tag in _META_ROBOTS_RE.findall(body):
+        m = _CONTENT_RE.search(tag)
+        if m:
+            metas.append(m.group(1))
+    meta = ", ".join(metas)
+    return {"status": status, "x_robots": xr, "meta_robots": meta,
+            "noindex": bool(re.search(r"\b(noindex|none)\b", (xr + "," + meta).lower()))}
 
 
 def inspect_url(url, sc_site):
-    status, r = call(INSPECT_URL, {"inspectionUrl": url, "siteUrl": sc_site, "languageCode": "en-US"})
+    body = {"inspectionUrl": url, "siteUrl": sc_site, "languageCode": "en-US"}
+    status, r = call(INSPECT_URL, body, timeout=60)
+    if status == 0:                      # a timeout or dropped connection: one more try
+        time.sleep(INSPECT_DELAY * 5)
+        status, r = call(INSPECT_URL, body, timeout=60)
     if status != 200:
         e = parse_error(status, r)
         return {"url": url, "ok": False, "status": status, "error": e["message"][:300]}
@@ -684,7 +809,8 @@ def inspect_url(url, sc_site):
             "link": ir.get("inspectionResultLink")}
 
 
-def collect_sc(sc_site, permission, site_url, days, inspect_mode, urls, today=None):
+def collect_sc(sc_site, permission, site_url, days, inspect_mode, urls, today=None,
+               inspect_max=INSPECT_CAP, workers=INSPECT_WORKERS):
     sc = {"site": sc_site, "permission": permission}
     log("Search Console: sitemaps for " + sc_site)
     sc["sitemaps"] = item(*call(WEBMASTERS + "sites/" + sc_quote(sc_site) + "/sitemaps"))
@@ -692,36 +818,276 @@ def collect_sc(sc_site, permission, site_url, days, inspect_mode, urls, today=No
         sc["sitemaps"]["data"] = sc["sitemaps"]["data"].get("sitemap") or []
     cur, prev = date_windows(days, today)
     log("Search Console: search analytics %s..%s and %s..%s" % (cur + prev))
-    sc["analytics"] = {"current": search_analytics(sc_site, *cur),
+    sc["analytics"] = {"current": search_analytics(sc_site, *cur, deep=True),
                        "previous": search_analytics(sc_site, *prev)}
     sc["history"] = search_history(sc_site, today)
 
+    # The sitemap is read whenever it can be, inspection or not: the performance tables
+    # need the template sizes and the list of sitemap URLs that earned no impression.
+    paths = [s.get("path") for s in (sc["sitemaps"].get("data") or []) if s.get("path")] \
+        if sc["sitemaps"]["ok"] else []
+    all_urls, used, errs = sitemap_all(paths, site_url)
+    sc["sitemap_urls"] = all_urls[:50000]
+
     targets = []
-    insp = {"mode": inspect_mode, "cap": INSPECT_CAP, "capped": False}
+    insp = {"mode": inspect_mode, "cap": inspect_max, "capped": False}
     if inspect_mode == "sitemap":
-        paths = [s.get("path") for s in (sc["sitemaps"].get("data") or []) if s.get("path")] \
-            if sc["sitemaps"]["ok"] else []
-        found, total, used, errs = sitemap_urls(paths, site_url)
+        total = len(all_urls)
+        found = all_urls if total <= inspect_max else stratified_sample(all_urls, inspect_max)
         insp.update({"sitemaps_read": used, "sitemap_errors": errs, "sitemap_url_count": total,
-                     "capped": total > INSPECT_CAP})
+                     "capped": total > inspect_max})
         targets = [(u, "sitemap") for u in found]
         v = variant_homepage(site_url)
         if v not in found:
             targets.append((v, "variant"))
     elif inspect_mode == "url":
-        targets = [(u, "url") for u in urls[:INSPECT_CAP]]
-        insp["capped"] = len(urls) > INSPECT_CAP
+        targets = [(u, "url") for u in urls[:inspect_max]]
+        insp["capped"] = len(urls) > inspect_max
     insp["results"] = []
     if targets:
-        log("Search Console: inspecting %d URL(s)" % len(targets))
-    for i, (u, source) in enumerate(targets):
-        if i:
+        log("Search Console: inspecting %d URL(s), %d at a time (about 4 s each)"
+            % (len(targets), max(1, workers)))
+
+    def one(t):
+        if INSPECT_DELAY:
             time.sleep(INSPECT_DELAY)
-        res = inspect_url(u, sc_site)
-        res["source"] = source
-        insp["results"].append(res)
+        res = inspect_url(t[0], sc_site)
+        res["source"] = t[1]
+        return res
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        for i, res in enumerate(ex.map(one, targets), 1):      # map keeps the input order
+            insp["results"].append(res)
+            if i % 25 == 0 and i < len(targets):
+                log("  inspected %d of %d" % (i, len(targets)))
+
+    # A noindex verdict is only as fresh as Google's last crawl. Fetch those pages now
+    # (no credentials) so the report can say which verdicts the live page no longer earns.
+    blocked = [r for r in insp["results"] if r.get("ok") and is_noindex_verdict(r)]
+    if blocked:
+        log("re-fetching %d page(s) Google records as noindex" % min(len(blocked), LIVE_RECHECK_CAP))
+    for r in _spread(blocked, LIVE_RECHECK_CAP):
+        r["live"] = live_robots(r["url"])
     sc["inspection"] = insp
     return sc
+
+
+def is_noindex_verdict(r):
+    return "noindex" in (r.get("coverageState") or "").lower() \
+        or (r.get("indexingState") or "").startswith("BLOCKED_BY")
+
+
+# =================================================================================
+# Roll-ups (pure: no network). These turn rows into the questions a review asks.
+# =================================================================================
+def _wpos(rows):
+    imps = sum(r.get("impressions", 0) for r in rows)
+    return (sum(r.get("position", 0.0) * r.get("impressions", 0) for r in rows) / imps) if imps else 0.0
+
+
+def performance_by_template(page_rows, sitemap_list):
+    """One row per URL template: how many sitemap URLs it holds, how many pages earned an
+    impression, clicks, impressions, impression-weighted position. Sorted by impressions."""
+    agg = {}
+    for u in sitemap_list or []:
+        agg.setdefault(url_template(u), {"sitemap_urls": 0, "rows": []})["sitemap_urls"] += 1
+    for r in page_rows or []:
+        u = (r.get("keys") or [""])[0].split("?")[0].split("#")[0]
+        agg.setdefault(url_template(u), {"sitemap_urls": 0, "rows": []})["rows"].append(r)
+    out = []
+    for t, a in agg.items():
+        rows = a["rows"]
+        out.append({"template": t, "sitemap_urls": a["sitemap_urls"], "pages_with_impressions": len(rows),
+                    "clicks": sum(r.get("clicks", 0) for r in rows),
+                    "impressions": sum(r.get("impressions", 0) for r in rows),
+                    "position": round(_wpos(rows), 1)})
+    out.sort(key=lambda x: (-x["impressions"], -x["sitemap_urls"]))
+    return out
+
+
+def striking_distance(qp_rows, min_impressions=STRIKING_MIN_IMPRESSIONS, lo=3.0, hi=20.0):
+    """Query and page pairs ranking just off the top results: the cheapest wins available,
+    because the page already ranks and a better title, answer or internal link can move it."""
+    out = [{"query": r["keys"][0], "page": r["keys"][1], "clicks": r["clicks"],
+            "impressions": r["impressions"], "position": round(r["position"], 1)}
+           for r in qp_rows or [] if len(r.get("keys") or []) == 2
+           and lo < r.get("position", 0) <= hi and r.get("impressions", 0) >= min_impressions]
+    out.sort(key=lambda x: (-x["impressions"], x["position"]))
+    return out
+
+
+def low_ctr_pages(page_rows, max_position=5.0, min_impressions=20, max_ctr=0.02):
+    """Pages shown near the top that almost nobody clicks: a title or description problem,
+    or a query the page does not really answer."""
+    out = [{"page": r["keys"][0], "clicks": r["clicks"], "impressions": r["impressions"],
+            "ctr": r.get("ctr", 0.0), "position": round(r["position"], 1)}
+           for r in page_rows or [] if r.get("keys") and 0 < r.get("position", 0) <= max_position
+           and r.get("impressions", 0) >= min_impressions and r.get("ctr", 0.0) < max_ctr]
+    out.sort(key=lambda x: -x["impressions"])
+    return out
+
+
+def split_queries(qp_rows, min_share=0.2, min_impressions=10):
+    """Queries whose impressions are split between two or more pages, each holding a real
+    share. Usually two pages competing for one intent; sometimes a hub and its child."""
+    by_q = {}
+    for r in qp_rows or []:
+        if len(r.get("keys") or []) == 2:
+            by_q.setdefault(r["keys"][0], []).append(r)
+    out = []
+    for q, rows in by_q.items():
+        total = sum(r["impressions"] for r in rows)
+        big = [r for r in rows if total and r["impressions"] / total >= min_share]
+        if total >= min_impressions and len(big) >= 2:
+            big.sort(key=lambda r: -r["impressions"])
+            out.append({"query": q, "impressions": total,
+                        "pages": [{"page": r["keys"][1], "impressions": r["impressions"],
+                                   "position": round(r["position"], 1)} for r in big]})
+    out.sort(key=lambda x: -x["impressions"])
+    return out
+
+
+def brand_split(query_rows, brand_terms):
+    """Clicks and impressions for queries that contain a brand term against the rest.
+    Only visible queries count; anonymized ones are in the totals and nowhere else."""
+    terms = [t.lower() for t in brand_terms or [] if t.strip()]
+    out = {"brand": {"queries": 0, "clicks": 0, "impressions": 0},
+           "non_brand": {"queries": 0, "clicks": 0, "impressions": 0}}
+    for r in query_rows or []:
+        q = ((r.get("keys") or [""])[0]).lower()
+        k = "brand" if any(t in q for t in terms) else "non_brand"
+        out[k]["queries"] += 1
+        out[k]["clicks"] += r.get("clicks", 0)
+        out[k]["impressions"] += r.get("impressions", 0)
+    return out
+
+
+def weekly_trend(date_rows):
+    """Clicks and impressions per ISO week (Monday start) from by-date rows."""
+    wk = {}
+    for r in date_rows or []:
+        try:
+            d = dt.date.fromisoformat((r.get("keys") or [""])[0])
+        except ValueError:
+            continue
+        k = (d - dt.timedelta(days=d.weekday())).isoformat()
+        a = wk.setdefault(k, {"week": k, "clicks": 0, "impressions": 0, "days": 0})
+        a["clicks"] += r.get("clicks", 0)
+        a["impressions"] += r.get("impressions", 0)
+        a["days"] += 1
+    return [wk[k] for k in sorted(wk)]
+
+
+def inspection_rollup(results, today=None):
+    """Coverage state by template, canonical disagreements, and how old Google's copies are."""
+    today = today or dt.datetime.now(dt.timezone.utc)
+    ok = [r for r in results or [] if r.get("ok") and r.get("source") != "variant"]
+    by_state, by_tpl, ages, mismatch = {}, {}, [], []
+    for r in ok:
+        state = r.get("coverageState") or "unspecified"
+        by_state[state] = by_state.get(state, 0) + 1
+        t = by_tpl.setdefault(url_template(r["url"]), {})
+        t[state] = t.get(state, 0) + 1
+        lc = parse_time(r.get("lastCrawlTime"))
+        if lc:
+            ages.append((today - lc).days)
+        g, u = r.get("googleCanonical"), r.get("userCanonical")
+        if g and u and g.rstrip("/") != u.rstrip("/"):
+            mismatch.append({"url": r["url"], "googleCanonical": g, "userCanonical": u})
+    ages.sort()
+    return {"inspected": len(ok), "by_state": by_state, "by_template": by_tpl,
+            "crawled": len(ages), "never_crawled": len(ok) - len(ages),
+            "median_crawl_age_days": ages[len(ages) // 2] if ages else None,
+            "crawl_older_than_60d": len([a for a in ages if a > 60]),
+            "canonical_mismatch": mismatch}
+
+
+def rank_crawl_findings(audit, page_rows, sitemap_list=None):
+    """Join a seo_audit.py --json report with Search Console page rows: every crawl finding
+    gets the impressions of the pages (deep-crawled) or templates (swept) it sits on, so the
+    fix list can be ordered by where search demand already is. A swept finding is reported
+    per template, not per URL, so its impressions are the templates' impressions scaled by
+    the share of those templates' pages that carry it (19 slow pages out of 460 do not own
+    the whole template's demand). Returns rows sorted by impressions, then severity. Pure."""
+    tpl_size = {}
+    for u in sitemap_list or []:
+        tpl_size[url_template(u)] = tpl_size.get(url_template(u), 0) + 1
+    by_url, by_tpl = {}, {}
+    for r in page_rows or []:
+        u = (r.get("keys") or [""])[0].split("?")[0].split("#")[0].rstrip("/")
+        by_url[u] = by_url.get(u, 0) + r.get("impressions", 0)
+        t = url_template((r.get("keys") or [""])[0].split("?")[0])
+        by_tpl[t] = by_tpl.get(t, 0) + r.get("impressions", 0)
+    rows = {}
+    for p in audit.get("pages") or []:
+        imp = by_url.get((p.get("url") or "").rstrip("/"), 0)
+        for f in p.get("findings") or []:
+            if f.get("severity") == "INFO":
+                continue
+            k = (f.get("severity"), f.get("title"))
+            a = rows.setdefault(k, {"severity": k[0], "title": k[1], "pages": 0, "impressions": 0,
+                                    "templates": set(), "example": p.get("url")})
+            a["pages"] += 1
+            a["impressions"] += imp
+            a["templates"].add(url_template(p.get("url") or "/"))
+    for sw in audit.get("sweep_summary") or []:
+        if sw.get("severity") == "INFO":
+            continue
+        k = (sw.get("severity"), sw.get("title"))
+        a = rows.setdefault(k, {"severity": k[0], "title": k[1], "pages": 0, "impressions": 0,
+                                "templates": set(), "example": sw.get("example")})
+        a["pages"] += sw.get("count", 0)
+        a["templates"] |= set(sw.get("templates") or [])
+        # template impressions stand in for the swept pages; deep pages already counted by URL
+        size = sum(tpl_size.get(t, 0) for t in a["templates"])
+        share = min(1.0, a["pages"] / size) if size else 1.0
+        a["impressions"] = max(a["impressions"],
+                               int(round(share * sum(by_tpl.get(t, 0) for t in a["templates"]))))
+    out = [dict(a, templates=sorted(a["templates"])) for a in rows.values()]
+    out.sort(key=lambda x: (-x["impressions"], SEVERITY_ORDER.get(x["severity"], 9), -x["pages"]))
+    return out
+
+
+def build_rollups(data, brand_terms=None, audit=None, today=None):
+    """Everything derived from the collected Search Console data, in one place, stored under
+    data["sc"]["rollups"] so the JSON carries it and the Markdown renders it."""
+    sc = data.get("sc") or {}
+    cur = (sc.get("analytics") or {}).get("current") or {}
+
+    def rows(label):
+        blk = cur.get(label) or {}
+        return blk.get("rows") or [] if blk.get("ok") else []
+    sm = sc.get("sitemap_urls") or []
+    seen = {(r.get("keys") or [""])[0].split("?")[0].split("#")[0].rstrip("/") for r in rows("page")}
+    silent = {}
+    for u in sm:
+        if u.rstrip("/") not in seen:
+            silent[url_template(u)] = silent.get(url_template(u), 0) + 1
+    out = {"by_template": performance_by_template(rows("page"), sm),
+           "striking_distance": striking_distance(rows("query_page")),
+           "low_ctr": low_ctr_pages(rows("page")),
+           "split_queries": split_queries(rows("query_page")),
+           "weekly": weekly_trend(rows("date")),
+           "sitemap_urls_without_impressions": {"total": sum(silent.values()), "of": len(sm),
+                                                "by_template": silent},
+           "inspection": inspection_rollup((sc.get("inspection") or {}).get("results"), today)}
+    if brand_terms:
+        out["brand"] = dict(brand_split(rows("query"), brand_terms), terms=list(brand_terms))
+    if audit:
+        out["crawl_findings_by_demand"] = rank_crawl_findings(audit, rows("page"), sm)
+    # A capped inspection samples every template about equally, so its raw totals overweight
+    # the small templates. Scale each template's shares by its size for a site-wide estimate.
+    insp = sc.get("inspection") or {}
+    ir = out["inspection"]
+    if insp.get("capped") and insp.get("mode") == "sitemap" and ir["inspected"]:
+        sizes, est = {}, {}
+        for u in sm:
+            sizes[url_template(u)] = sizes.get(url_template(u), 0) + 1
+        for t, states in ir["by_template"].items():
+            n = sum(states.values())
+            for st, c in states.items():
+                est[st] = est.get(st, 0.0) + sizes.get(t, 0) * c / n
+        ir["estimated_site_wide"] = {st: int(round(v)) for st, v in est.items()}
+    return out
 
 
 # =================================================================================
@@ -948,11 +1314,61 @@ def evaluate(data, launched=None, today=None):
                 "Request indexing for these URLs so Google picks up the launched content, titles and "
                 "canonicals instead of the pre-launch version."))
 
-    held = {}
+    # --- what Google's index holds, by state, against what the page serves today ---
+    noidx = [r for r in checked if is_noindex_verdict(r)]
+    stale = [r for r in noidx if (r.get("live") or {}).get("noindex") is False
+             and (r.get("live") or {}).get("status") == 200]
+    live_no = [r for r in noidx if (r.get("live") or {}).get("noindex") is True]
+    if stale:
+        oldest = min((r.get("lastCrawlTime") or "9999")[:10] for r in stale)
+        rechecked = len([r for r in noidx if r.get("live")])
+        out.append(finding(
+            "HIGH", "Google still records a noindex these pages no longer serve", "search-console",
+            "%d of %d re-fetched noindex verdicts are stale (%d noindex verdicts among %d inspected "
+            "URLs; oldest crawl %s): %s"
+            % (len(stale), rechecked, len(noidx), len(checked), oldest,
+               ", ".join("%s (crawled %s)" % (r["url"], (r.get("lastCrawlTime") or "?")[:10])
+                         for r in stale[:12]) + (" ..." if len(stale) > 12 else "")),
+            "A verdict lasts until Google recrawls the URL, and a page it believes is noindex is "
+            "recrawled rarely, so this does not clear on its own for months. Use URL Inspection > "
+            "Request indexing on the hubs first (the pages that link to the most others), a dozen a "
+            "day; move the sitemap <lastmod> of every affected URL to a date after the noindex was "
+            "removed and resubmit the sitemap; link the affected pages from pages Google does crawl."))
+    if live_no:
+        out.append(finding(
+            "MEDIUM", "Sitemap lists pages that serve noindex", "search-console",
+            ", ".join("%s (%s)" % (r["url"], (r["live"].get("x_robots") or r["live"].get("meta_robots")))
+                      for r in live_no[:12]),
+            "A sitemap should list only indexable URLs. Remove these from the sitemap, or remove "
+            "the noindex if the page is meant to rank."))
+    mism = [r for r in checked if r.get("googleCanonical") and r.get("userCanonical")
+            and r["googleCanonical"].rstrip("/") != r["userCanonical"].rstrip("/")]
+    if mism:
+        out.append(finding(
+            "MEDIUM", "Google chose a different canonical than the page declares", "search-console",
+            "%d of %d inspected: %s" % (len(mism), len(checked), "; ".join(
+                "%s declares %s, Google chose %s" % (r["url"], r["userCanonical"], r["googleCanonical"])
+                for r in mism[:8])),
+            "Google follows links and content over the tag. Point internal links, the sitemap and "
+            "redirects at the URL you declare, and make sure the declared page is the fuller one."))
+    dated = [parse_time(r.get("lastCrawlTime")) for r in checked if parse_time(r.get("lastCrawlTime"))]
+    old = [d for d in dated if (today - d).days > 60]
+    if len(dated) >= 10 and len(old) * 2 > len(dated):
+        out.append(finding(
+            "MEDIUM", "Most of Google's copies are over 60 days old", "search-console",
+            "%d of %d crawled URLs were last fetched more than 60 days ago" % (len(old), len(dated)),
+            "Google is spending very few fetches here. Changes shipped since then are not in the "
+            "index. Crawl demand follows links and traffic: earn links to the hubs, keep the sitemap "
+            "<lastmod> honest, and request indexing for the pages that matter most."))
+
+    # the general finding; verdicts the live re-fetch already explained above are left out
+    explained = set(r["url"] for r in stale + live_no)
+    held, held_tp = {}, {}
     for r in checked:
         state = r.get("coverageState") or "no coverage state"
-        if state not in INDEXED_STATES and state != UNKNOWN_STATE:
+        if state not in INDEXED_STATES and state != UNKNOWN_STATE and r["url"] not in explained:
             held.setdefault(state, []).append(r["url"])
+            held_tp[url_template(r["url"])] = held_tp.get(url_template(r["url"]), 0) + 1
     if held:
         indexed = len([r for r in checked if r.get("coverageState") in INDEXED_STATES])
         n_held = sum(len(v) for v in held.values())
@@ -975,10 +1391,11 @@ def evaluate(data, launched=None, today=None):
         out.append(finding(
             "HIGH" if indexed * 2 < len(checked) else "MEDIUM",
             "Sitemap URLs Google has not indexed", "search-console",
-            "%d of %d inspected URLs are indexed; %d held back: %s" % (
+            "%d of %d inspected URLs are indexed; %d held back: %s. By template: %s" % (
                 indexed, len(checked), n_held,
                 "; ".join("%s (%d): %s" % (k, len(v), ", ".join(v[:6]) + (" ..." if len(v) > 6 else ""))
-                          for k, v in sorted(held.items(), key=lambda kv: -len(kv[1])))),
+                          for k, v in sorted(held.items(), key=lambda kv: -len(kv[1]))),
+                ", ".join("%s %d" % kv for kv in sorted(held_tp.items(), key=lambda kv: -kv[1]))),
             ". ".join(h[0].upper() + h[1:] for h in hints) + "." if hints else
             "Open each in Search Console URL Inspection for the reason."))
 
@@ -998,6 +1415,30 @@ def evaluate(data, launched=None, today=None):
             "third-party link is good news and worth knowing about."))
 
     an = sc.get("analytics") or {}
+    cur0 = an.get("current") or {}
+    qp = (cur0.get("query_page") or {}).get("rows") or [] if (cur0.get("query_page") or {}).get("ok") else []
+    near = striking_distance(qp)
+    if near:
+        out.append(finding(
+            "LOW", "Queries ranking just off the top results", "search-console",
+            "%d query and page pairs at positions 4 to 20 with at least %d impressions; largest: %s"
+            % (len(near), STRIKING_MIN_IMPRESSIONS, "; ".join(
+                "'%s' on %s (pos %.1f, %d imp)" % (x["query"], urllib.parse.urlsplit(x["page"]).path,
+                                                   x["position"], x["impressions"]) for x in near[:6])),
+            "These pages already rank, so they are the cheapest gains: put the query's words in the "
+            "title and H1 where honest, answer it in the first screen, and link to the page from "
+            "related pages with descriptive anchor text. Re-read after 28 days."))
+    pg_rows = (cur0.get("page") or {}).get("rows") or [] if (cur0.get("page") or {}).get("ok") else []
+    weak = low_ctr_pages(pg_rows)
+    if weak:
+        out.append(finding(
+            "LOW", "Pages shown near the top that few people click", "search-console",
+            "; ".join("%s (pos %.1f, %d imp, %.1f%% CTR)" % (urllib.parse.urlsplit(x["page"]).path,
+                      x["position"], x["impressions"], 100 * x["ctr"]) for x in weak[:6]),
+            "Rewrite the title and meta description for the queries the page is shown for (the "
+            "query table, filtered to that page). A top position with no clicks can also mean a "
+            "SERP feature answers the query above the result; check the live results page."))
+
     site_scheme = data.get("site_scheme", "https")
     variants = {}
     for period in ("current", "previous"):
@@ -1240,19 +1681,73 @@ def render_markdown(data, findings):
         w("%d impressions and %d clicks on %d day(s) with an impression; first %s, last %s.\n" % (
             sh["impressions"], sh["clicks"], sh["days_with_impressions"],
             sh.get("first_day") or "none", sh.get("last_day") or "none"))
+    ru = sc.get("rollups") or {}
+    if ru.get("by_template"):
+        w("### Search performance by URL template\n")
+        w(md_table(["Template", "Sitemap URLs", "Pages with impressions", "Clicks", "Impressions", "Position"],
+                   [[x["template"], x["sitemap_urls"], x["pages_with_impressions"], x["clicks"],
+                     x["impressions"], "%.1f" % x["position"]] for x in ru["by_template"]]))
+        si = ru.get("sitemap_urls_without_impressions") or {}
+        if si.get("of"):
+            w("%d of %d sitemap URLs earned no impression in the period%s.\n" % (
+                si["total"], si["of"], (": " + ", ".join("%s %d" % kv for kv in sorted(
+                    si["by_template"].items(), key=lambda kv: -kv[1]))) if si["by_template"] else ""))
+    if ru.get("brand"):
+        b = ru["brand"]
+        w("### Brand and non-brand queries (terms: %s)\n" % ", ".join(b.get("terms") or []))
+        w(md_table(["Segment", "Visible queries", "Clicks", "Impressions"],
+                   [[k, b[k]["queries"], b[k]["clicks"], b[k]["impressions"]] for k in ("brand", "non_brand")]))
+    if ru.get("striking_distance"):
+        w("### Queries within reach (positions 4 to 20)\n")
+        w(md_table(["Query", "Page", "Clicks", "Impressions", "Position"],
+                   [[x["query"], x["page"], x["clicks"], x["impressions"], "%.1f" % x["position"]]
+                    for x in ru["striking_distance"][:25]]))
+    if ru.get("split_queries"):
+        w("### Queries split across pages\n")
+        w(md_table(["Query", "Impressions", "Pages"],
+                   [[x["query"], x["impressions"], "; ".join("%s (%d imp, pos %.1f)" % (
+                       p["page"], p["impressions"], p["position"]) for p in x["pages"])]
+                    for x in ru["split_queries"][:15]]))
+    if ru.get("weekly"):
+        w("### Weekly trend\n")
+        w(md_table(["Week of", "Days", "Clicks", "Impressions"],
+                   [[x["week"], x["days"], x["clicks"], x["impressions"]] for x in ru["weekly"]]))
+    if ru.get("crawl_findings_by_demand"):
+        w("### Crawl findings ranked by search demand\n")
+        w("Each crawl finding with the impressions of the pages or templates it sits on. Fix from "
+          "the top: a LOW on the template that earns the impressions outranks a MEDIUM on pages "
+          "nobody is shown.\n")
+        w(md_table(["Impressions", "Severity", "Finding", "Pages", "Templates"],
+                   [[x["impressions"], x["severity"], x["title"], x["pages"], ", ".join(x["templates"])]
+                    for x in ru["crawl_findings_by_demand"][:30]]))
 
     insp = sc.get("inspection") or {}
     w("### URL inspection\n")
+    ir = ru.get("inspection") or {}
+    if ir.get("inspected"):
+        states = sorted(ir["by_state"], key=lambda k: -ir["by_state"][k])
+        w("%d URLs inspected; %d never crawled; median age of Google's copy %s days; %d older than "
+          "60 days.\n" % (ir["inspected"], ir["never_crawled"], ir["median_crawl_age_days"],
+                          ir["crawl_older_than_60d"]))
+        w(md_table(["Template"] + states + ["Inspected"],
+                   [[t] + [c.get(st, 0) for st in states] + [sum(c.values())]
+                    for t, c in sorted(ir["by_template"].items(), key=lambda kv: -sum(kv[1].values()))]
+                   + [["ALL"] + [ir["by_state"][st] for st in states] + [ir["inspected"]]]
+                   + ([["Estimate for all %d sitemap URLs (sample scaled by template size)"
+                        % len(sc.get("sitemap_urls") or [])]
+                       + [ir["estimated_site_wide"].get(st, 0) for st in states] + [""]]
+                      if ir.get("estimated_site_wide") else [])))
     if insp.get("mode") is None:
         w("Skipped (pass --urls-from-sitemap or --url).\n")
     else:
         if insp.get("mode") == "sitemap":
             w("Sitemaps read: %s. %d URL(s) found%s.%s\n" % (
                 ", ".join(insp.get("sitemaps_read") or []) or "none", insp.get("sitemap_url_count", 0),
-                "; capped at %d" % INSPECT_CAP if insp.get("capped") else "",
+                "; %d inspected, sampled across URL templates (raise --inspect-max)" % insp.get("cap", INSPECT_CAP)
+                if insp.get("capped") else "",
                 (" Errors: " + "; ".join(insp["sitemap_errors"])) if insp.get("sitemap_errors") else ""))
         elif insp.get("capped"):
-            w("Capped at %d URLs.\n" % INSPECT_CAP)
+            w("Capped at %d URLs.\n" % insp.get("cap", INSPECT_CAP))
         rows = []
         for r in insp.get("results", []):
             if not r.get("ok"):
@@ -1260,7 +1755,11 @@ def render_markdown(data, findings):
                 continue
             rich = r.get("richResults")
             rows.append([r["url"] + (" (variant)" if r.get("source") == "variant" else ""), r.get("verdict"),
-                         r.get("coverageState"), r.get("indexingState"), (r.get("lastCrawlTime") or "")[:16],
+                         r.get("coverageState") + (
+                             "" if "live" not in r else " (live: indexable)" if r["live"].get("noindex") is False
+                             else " (live: noindex)" if r["live"].get("noindex") else " (live: HTTP %s)"
+                             % r["live"].get("status")) if r.get("coverageState") else None,
+                         r.get("indexingState"), (r.get("lastCrawlTime") or "")[:16],
                          r.get("pageFetchState"),
                          r.get("googleCanonical") if r.get("googleCanonical") == r.get("userCanonical")
                          else "G: %s / U: %s" % (r.get("googleCanonical"), r.get("userCanonical")),
@@ -1290,8 +1789,19 @@ def build_parser():
     ap.add_argument("--days", type=int, default=28, help="reporting window in days (default 28)")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--urls-from-sitemap", action="store_true",
-                   help="inspect every sitemap URL (cap %d) plus the homepage host variant" % INSPECT_CAP)
+                   help="inspect sitemap URLs (up to --inspect-max, sampled across URL templates when "
+                        "there are more) plus the homepage host variant")
     g.add_argument("--url", nargs="+", default=[], help="inspect these URLs")
+    ap.add_argument("--inspect-max", type=int, default=INSPECT_CAP,
+                    help="URLs to inspect (default %d, max %d; the API allows about 2,000 a day)"
+                         % (INSPECT_CAP, INSPECT_HARD_CAP))
+    ap.add_argument("--inspect-workers", type=int, default=INSPECT_WORKERS,
+                    help="concurrent inspections (default %d)" % INSPECT_WORKERS)
+    ap.add_argument("--brand", nargs="+", default=[],
+                    help="brand terms (lowercase substrings) to split brand from non-brand queries")
+    ap.add_argument("--audit-json",
+                    help="a seo_audit.py --json report; its findings are ranked by the search "
+                         "impressions of the pages and templates they sit on")
     ap.add_argument("--launched", help="YYYY-MM-DD; flag URLs last crawled before this date")
     ap.add_argument("--json", help="write raw data plus findings to this file")
     ap.add_argument("--markdown", help="also write the Markdown report to this file")
@@ -1303,6 +1813,17 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     if not 1 <= args.days <= 480:
         return _usage_error("--days must be between 1 and 480")
+    if not 1 <= args.inspect_max <= INSPECT_HARD_CAP:
+        return _usage_error("--inspect-max must be between 1 and %d" % INSPECT_HARD_CAP)
+    if not 1 <= args.inspect_workers <= 8:
+        return _usage_error("--inspect-workers must be between 1 and 8")
+    audit = None
+    if args.audit_json:
+        try:
+            with open(args.audit_json, encoding="utf-8") as fh:
+                audit = json.load(fh)
+        except (OSError, ValueError) as e:
+            return _usage_error("cannot read --audit-json (%s)" % type(e).__name__)
     launched = None
     if args.launched:
         try:
@@ -1398,7 +1919,9 @@ def main(argv=None):
     data["ga"] = collect_ga(prop, args.days, site_url) if prop else {"error": ga_error or "no property"}
     if sc_site:
         mode = "sitemap" if args.urls_from_sitemap else ("url" if args.url else None)
-        data["sc"] = collect_sc(sc_site, permission, site_url, args.days, mode, args.url)
+        data["sc"] = collect_sc(sc_site, permission, site_url, args.days, mode, args.url,
+                                inspect_max=args.inspect_max, workers=args.inspect_workers)
+        data["sc"]["rollups"] = build_rollups(data, args.brand, audit)
     else:
         data["sc"] = {"error": sc_error}
 
