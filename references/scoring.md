@@ -154,8 +154,9 @@ and at least one crawled URL is two path segments deep (LOW); LocalBusiness sche
 
 **trust:** not HTTPS (CRITICAL); http:// version serves 200 without redirecting to HTTPS
 (HIGH); mixed content — http:// subresources on an HTTPS page (MEDIUM); missing security
-headers (MEDIUM if CSP missing, else LOW); TLS certificate expired (CRITICAL) / <14 days
-(HIGH) / <30 days (MEDIUM); no visible contact route — no contact page, tel: or mailto:
+headers (MEDIUM if CSP missing, else LOW; a CSP in a `<meta http-equiv>` tag counts as
+present); TLS certificate expired (CRITICAL) / <14 days (HIGH) / <30 days (MEDIUM), not
+measured when the run goes through an HTTPS proxy, whose certificate is what would be read; no visible contact route — no contact page, tel: or mailto:
 (MEDIUM); trust pages (about/privacy/terms) not found (LOW). Contact/trust checks are
 skipped when the site exposes no crawlable links at all.
 
@@ -200,7 +201,8 @@ These sit alongside the lists above. Function names are in `scripts/seo_audit.py
 (LOW), *internal links point at non-canonical URLs* (MEDIUM; HIGH when no canonical target
 is linked from any crawled page), *canonical points at a thinner page than the one
 carrying it* (HIGH; ≥150 fewer words and <75% of the source, schema types lost are
-listed), *internal links lead to noindexed pages* (LOW; MEDIUM at ≥40% of the sample),
+listed), *internal links lead to noindexed pages* (LOW; MEDIUM at ≥40% of the sample; a target
+whose every link carries `rel=nofollow` is not counted),
 *a sitemap template gets no internal links* (MEDIUM; only when the crawl saw a meaningful
 share of the sitemap). Sitemap: lists error URLs (HIGH at ≥10%, else MEDIUM; 404/410/5xx
 only), noindexed URLs (MEDIUM), non-canonical URLs (MEDIUM), redirecting URLs (LOW),

@@ -209,6 +209,8 @@ class StubbedNetwork(unittest.TestCase):
     def setUp(self):
         self._saved = (G.call, G.get_token, G.INSPECT_DELAY)
         self._env = os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
+        # a key in the developer's own environment must not leak into a "no key" test
+        self._inline = {v: os.environ.pop(v) for v in G.INLINE_KEY_VARS if v in os.environ}
         G.get_token = lambda: "fake-token"
         G.INSPECT_DELAY = 0
         self.tmp = tempfile.TemporaryDirectory()
@@ -218,6 +220,7 @@ class StubbedNetwork(unittest.TestCase):
         G.call, G.get_token, G.INSPECT_DELAY = self._saved
         if self._env is not None:
             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = self._env
+        os.environ.update(self._inline)
         self.tmp.cleanup()
 
     def run_main(self, argv, overrides=None):
@@ -262,7 +265,11 @@ class TestEndToEnd(StubbedNetwork):
         self.assertEqual(res[-1]["source"], "variant")
         unknown = next(f for f in data["findings"] if f["title"] == "Pages Google has never seen")
         self.assertIn("4 of 6", unknown["observed"])
-        self.assertEqual(len(res[0]["referringUrls"]), 2)
+        self.assertEqual(len(res[0]["referringUrls"]), 3)
+        # a referrer on another host is surfaced; the site's own apex sitemap is not
+        ext = next(f for f in data["findings"] if f["title"] == "Google found pages through other hosts")
+        self.assertIn("centurionawards.com", ext["observed"])
+        self.assertNotIn("btobbes.com referred", ext["observed"])
         self.assertEqual(res[0]["richResults"], {"verdict": "PASS", "types": ["Breadcrumbs", "FAQ"]})
         # a 404 on an Admin resource is recorded, not fatal
         ann = data["ga"]["items"]["reportingDataAnnotations"]
@@ -323,6 +330,87 @@ class TestEndToEnd(StubbedNetwork):
         self.assertIn("properties/543665599", err)
         self.assertIn("--property", err)
 
+    def test_no_search_console_grant_still_reviews_ga(self):
+        """The first thing that happened on 2026-11-24: the key worked, sites.list answered 200
+        with nothing in it. That is a finding, and GA4 is still worth reading."""
+        jpath = os.path.join(self.tmp.name, "o.json")
+        code, out, err = self.run_main(["--site", "https://www.btobbes.com", "--key", self.key, "--json", jpath],
+                                       {"webmasters/v3/sites": {}})
+        self.assertEqual(code, 0, err)
+        self.assertIn("continuing with GA4 only", err)
+        data = read_json(jpath)
+        f = next(x for x in data["findings"] if x["category"] == "access")
+        self.assertEqual((f["severity"], f["title"]),
+                         ("HIGH", "The service account has no Search Console property for this site"))
+        self.assertIn("an empty list (HTTP 200)", f["observed"])
+        self.assertIn("reviewer@proj.iam.gserviceaccount.com", f["fix"])
+        self.assertIn("Search Console not reviewed", out)
+        self.assertIn("GA4 event data retention is TWO_MONTHS", out)
+
+    def test_no_ga_grant_still_reviews_search_console(self):
+        jpath = os.path.join(self.tmp.name, "o.json")
+        code, out, err = self.run_main(["--site", "https://www.btobbes.com", "--key", self.key, "--json", jpath],
+                                       {"v1beta/accountSummaries": {}})
+        self.assertEqual(code, 0, err)
+        titles = {x["title"] for x in read_json(jpath)["findings"]}
+        self.assertIn("The service account cannot see any GA4 property", titles)
+        self.assertIn("Sitemap not fetched by Google in over 30 days", titles)
+
+    def test_no_grant_anywhere_exits_2(self):
+        code, out, err = self.run_main(["--site", "https://www.btobbes.com", "--key", self.key],
+                                       {"v1beta/accountSummaries": {}, "webmasters/v3/sites": {}})
+        self.assertEqual(code, 2)
+        self.assertIn("nothing to review", err)
+
+    def test_empty_property_is_dated_and_joined_with_the_homepage(self):
+        """GA4 answering 200 with no rows is the loudest fact in the review, not a blank table."""
+        def report(url, body):
+            dims = [d["name"] for d in body.get("dimensions", [])]
+            heads = {"dimensionHeaders": [{"name": d} for d in dims],
+                     "metricHeaders": [{"name": m["name"]} for m in body.get("metrics", [])]}
+            if body["dateRanges"][0]["startDate"] != "%ddaysAgo" % G.HISTORY_DAYS:
+                return heads                                    # the 28-day window: nothing
+            if body.get("dimensionFilter"):
+                return dict(heads, rows=[])
+            rows = {"date": [["20260906", "6", "19"], ["20260925", "1", "14"]],
+                    "eventName": [["page_view", "469", "170"], ["form_start", "17", "5"]],
+                    "hostName": [["www.btobbes.com", "208"], ["127.0.0.1", "1"]],
+                    "sessionSourceMedium": [["(direct) / (none)", "158", "11", "0"]],
+                    "landingPage": [["/", "74", "18"]]}[dims[0]]
+            return dict(heads, rows=[{"dimensionValues": [{"value": r[0]}],
+                                      "metricValues": [{"value": v} for v in r[1:]]} for r in rows])
+
+        class Fake(FakeGoogle):
+            def __call__(self, url, body=None, auth=True, raw=False, timeout=30):
+                if url.endswith(":runReport"):
+                    G._guard(url, "POST", auth)
+                    return 200, report(url, body)
+                return super().__call__(url, body, auth, raw, timeout)
+
+        G.call = self.fake = Fake({
+            ":runRealtimeReport": {"metricHeaders": [{"name": "activeUsers"}]},
+            "https://www.btobbes.com/": "<html><head><title>x</title></head><body>no tag</body></html>",
+            "v1beta/" + P + "/keyEvents": {"keyEvents": [{"eventName": "purchase"},
+                                                         {"eventName": "qualify_lead"}]}})
+        jpath = os.path.join(self.tmp.name, "o.json")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = G.main(["--site", "https://www.btobbes.com", "--key", self.key, "--json", jpath])
+        self.assertEqual(code, 0, err.getvalue())
+        data = read_json(jpath)
+        by = {f["title"]: f for f in data["findings"]}
+        f = by["GA4 has received no events in the reporting window"]
+        self.assertEqual(f["severity"], "HIGH")
+        self.assertIn("last day with data 2026-09-25", f["observed"])
+        self.assertIn("G-LHZ92FTHKQ is not in the homepage HTML", f["observed"])
+        self.assertIn("decision for the owner", f["fix"])
+        self.assertEqual(data["ga"]["data_api"]["history"]["sessions"], 7)
+        self.assertIn("purchase, qualify_lead", by["Key events that nothing sends"]["observed"])
+        self.assertIn("127.0.0.1 (1 sessions)",
+                      by["GA4 is collecting from hosts other than the site"]["observed"])
+        self.assertIn("Last day with data: 2026-09-25", out.getvalue())
+        self.assertIn("Stream IDs found in the HTML: none", out.getvalue())
+
     def test_explicit_property_skips_autodetect(self):
         code, out, err = self.run_main(["--site", "https://www.btobbes.com", "--key", self.key,
                                         "--property", "519189573"])
@@ -365,6 +453,41 @@ class TestKeyHandling(StubbedNetwork):
             del os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
         self.assertEqual(code, 0, err)
 
+    KEY_JSON = json.dumps({"type": "service_account", "client_email": "env@proj.iam.gserviceaccount.com",
+                           "private_key": "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----\n"})
+
+    def with_env(self, name, value, argv):
+        os.environ[name] = value
+        try:
+            return self.run_main(argv)
+        finally:
+            del os.environ[name]
+
+    def test_key_json_in_a_named_env_var(self):
+        code, out, err = self.with_env("MY_KEY", self.KEY_JSON,
+                                       ["--site", "https://www.btobbes.com", "--key-env", "MY_KEY"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("key read from environment variable MY_KEY", err)
+        self.assertIn("env@proj.iam.gserviceaccount.com", out)
+        self.assertNotIn("PRIVATE KEY", out + err)
+
+    def test_key_base64_in_a_default_env_var(self):
+        import base64
+        b64 = base64.b64encode(self.KEY_JSON.encode()).decode()
+        code, out, err = self.with_env("GSC_SERVICE_ACCOUNT_JSON", b64, ["--site", "https://www.btobbes.com"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("GSC_SERVICE_ACCOUNT_JSON", err)
+
+    def test_env_var_that_is_not_a_key(self):
+        code, out, err = self.with_env("MY_KEY", "hunter2-not-json",
+                                       ["--site", "https://www.btobbes.com", "--key-env", "MY_KEY"])
+        self.assertEqual(code, 2)
+        self.assertIn("MY_KEY", err)
+        self.assertNotIn("hunter2", out + err)             # the value is never echoed
+        code, out, err = self.run_main(["--site", "https://www.btobbes.com", "--key-env", "UNSET_VAR_X"])
+        self.assertEqual(code, 2)
+        self.assertIn("UNSET_VAR_X is not set", err)
+
     def test_not_a_service_account_key(self):
         p = os.path.join(self.tmp.name, "user.json")
         with open(p, "w") as fh:
@@ -376,7 +499,7 @@ class TestKeyHandling(StubbedNetwork):
     def test_version(self):
         code, out, err = self.run_main(["--version"])
         self.assertEqual(code, 0)
-        self.assertIn("google-console-review 0.1.0", out + err)
+        self.assertIn("google-console-review " + G.VERSION, out + err)
 
 
 class TestGuards(unittest.TestCase):
@@ -571,6 +694,74 @@ class TestRules(unittest.TestCase):
         self.assertEqual(self.titles(d), {"No queries visible (anonymized by Search Console)": "INFO"})
         d["sc"]["analytics"]["current"]["totals"]["rows"] = [{"clicks": 0, "impressions": 0}]
         self.assertEqual(self.titles(d), {})
+
+    def test_held_back_urls(self):
+        d = good_data()
+        res = d["sc"]["inspection"]["results"]
+        for i in range(4):
+            res.append({"url": "https://www.btobbes.com/p%d" % i, "ok": True, "source": "sitemap",
+                        "coverageState": "Discovered - currently not indexed"})
+        f = [x for x in G.evaluate(d, None, self.NOW) if x["title"] == "Sitemap URLs Google has not indexed"]
+        self.assertEqual(len(f), 1)
+        self.assertEqual(f[0]["severity"], "HIGH")                # 1 of 5 indexed
+        self.assertIn("1 of 5 inspected URLs are indexed; 4 held back", f[0]["observed"])
+        self.assertIn("demand problem", f[0]["fix"])
+        self.assertNotIn("declined it", f[0]["fix"])              # no 'Crawled' state, no 'Crawled' advice
+        for r in res[2:5]:
+            r["coverageState"] = "Submitted and indexed"
+        res[5]["coverageState"] = "Crawled - currently not indexed"
+        f = [x for x in G.evaluate(d, None, self.NOW) if x["title"] == "Sitemap URLs Google has not indexed"]
+        self.assertEqual(f[0]["severity"], "MEDIUM")              # 4 of 5 indexed
+        self.assertIn("declined it", f[0]["fix"])
+        # the variant homepage and an unknown URL are other rules' business
+        d = good_data()
+        self.assertNotIn("Sitemap URLs Google has not indexed", self.titles(d))
+
+    def test_invisible_in_search(self):
+        d = good_data()
+        d["days"] = 28
+        d["sc"]["sitemaps"]["data"][0]["lastSubmitted"] = "2026-07-01T00:00:00Z"   # 103 days ago
+        self.assertEqual(self.titles(d), {})                       # 40 impressions: quiet, not invisible
+        d["sc"]["analytics"]["current"]["totals"]["rows"] = [{"clicks": 0, "impressions": 2}]
+        d["sc"]["history"] = {"ok": True, "impressions": 22, "clicks": 2, "days_with_impressions": 17}
+        f = [x for x in G.evaluate(d, None, self.NOW) if x["title"].startswith("The site is close to invisible")]
+        self.assertEqual(f[0]["severity"], "HIGH")
+        self.assertIn("2 impressions in the last 28 days", f[0]["observed"])
+        self.assertIn("22 impressions and 2 clicks", f[0]["observed"])
+        d["sc"]["sitemaps"]["data"][0]["lastSubmitted"] = "2026-10-01T00:00:00Z"   # a new site gets time
+        self.assertNotIn("The site is close to invisible in Google Search", self.titles(d))
+
+    def test_external_referrers(self):
+        d = good_data()
+        d["sc"]["inspection"]["results"][0]["referringUrls"] = [
+            "https://btobbes.com/sitemap.xml", "https://old-name.example/sitemap.xml"]
+        self.assertEqual(self.titles(d), {"Google found pages through other hosts": "INFO"})
+
+    def test_no_events_rule_needs_an_answer_from_the_data_api(self):
+        d = good_data()
+        d["ga"]["data_api"] = {"available": True, "date_range": {"startDate": "28daysAgo"},
+                               "reports": {"events": {"ok": True, "rows": []}},
+                               "history": {"days_with_data": 0, "reports": {}}}
+        f = G.evaluate(d, None, self.NOW)
+        self.assertEqual([x["title"] for x in f], ["GA4 has received no events in the reporting window"])
+        self.assertIn("never received an event", f[0]["observed"])
+        d["ga"]["tag_check"] = {"status": 200, "measurement_ids_found": ["G-ABCDEFGH12"],
+                                "measurement_ids_missing": []}
+        self.assertIn("consent gate", G.evaluate(d, None, self.NOW)[0]["observed"])
+        d["ga"]["data_api"]["reports"]["events"] = {"ok": False, "status": 403}
+        self.assertEqual(self.titles(d), {})                       # unreadable is not empty
+
+    def test_unassigned_campaign_traffic(self):
+        d = good_data()
+        d["ga"]["data_api"] = {"available": True, "history": {"sessions": 211, "reports": {
+            "unassigned": {"ok": True, "rows": [["metricool / reel", "40"]]}}}}
+        f = G.evaluate(d, None, self.NOW)
+        self.assertEqual([(x["severity"], x["title"]) for x in f],
+                         [("LOW", "Campaign traffic GA4 files under Unassigned")])
+        self.assertIn("40 of 211 sessions (19%): metricool / reel (40)", f[0]["observed"])
+        self.assertIn("utm_medium=social", f[0]["fix"])
+        d["ga"]["data_api"]["history"]["reports"]["unassigned"]["rows"] = [["(not set)", "4"]]
+        self.assertEqual(self.titles(d), {})                       # a handful is noise
 
     def test_findings_shape_and_order(self):
         d = good_data()

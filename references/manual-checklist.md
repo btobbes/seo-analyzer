@@ -70,6 +70,13 @@ Each item names the failure it exists to catch. They come from real audits.
     A flaky free API that gates checkout turns every outage into lost sales.
 17. Confirm payment webhooks deliver 2xx in the provider dashboard. A browser redirect that
     works can hide a webhook that has been failing for weeks.
+    Three more that have no number because they belong to the console review, not to a
+    launch: read the privacy policy against the tags that actually fire, in both directions
+    (a policy promising no third-party analytics while a tag loads; a tag removed while the
+    policy still describes it); before recommending that analytics be added, search the
+    repository history for the commit that removed it and read why; and on a single-page
+    app, check that page views come from one mechanism only (the app's own `page_view` or
+    GA4's history-change setting, never both). See `references/google-console-review.md`.
 18. **Check analytics can see revenue.** The purchase event needs value, currency and a
     transaction id, and purchases made inside logged-in areas need server-side events.
 19. **Check nothing secret rides in a URL that analytics can read.** Resume links, magic

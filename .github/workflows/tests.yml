@@ -4,8 +4,11 @@ on:
   pull_request:
 jobs:
   unittest:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04, which has no Python 3.9 build, and the 3.9 job
+    # failed at setup before any test ran (and cancelled the other two).
+    runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
         python: ["3.9", "3.12", "3.13"]
     steps:
