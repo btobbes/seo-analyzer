@@ -7,7 +7,7 @@ Usage:
     python3 scripts/google_console_review.py --site https://www.example.com --key KEY.json
         [--property properties/123] [--sc-site sc-domain:example.com] [--days 28]
         [--urls-from-sitemap | --url URL ...] [--launched YYYY-MM-DD]
-        [--json out.json] [--markdown out.md]
+        [--key-env VAR] [--json out.json] [--markdown out.md]
 
 READ-ONLY, ALWAYS
     The access token is requested with exactly two scopes, analytics.readonly and
@@ -19,8 +19,10 @@ READ-ONLY, ALWAYS
     indexing is requested, no GA setting is touched. The tool reports; a person acts.
 
 Credentials
-    The key path comes only from --key or the GOOGLE_APPLICATION_CREDENTIALS environment
-    variable. The service account signs an RS256 JWT (the `cryptography` package, imported
+    The key comes from --key PATH, --key-env VAR (an environment variable holding the key
+    JSON itself, or its base64, which is how cloud sessions and CI usually carry it), the
+    GOOGLE_APPLICATION_CREDENTIALS path, or the first of the INLINE_KEY_VARS that is set.
+    The service account signs an RS256 JWT (the `cryptography` package, imported
     lazily so this module imports without it) and trades it at
     https://oauth2.googleapis.com/token for a one-hour access token. Neither the private
     key nor the access token is ever printed, logged or written to the JSON output, and
@@ -39,8 +41,13 @@ What it collects
     GA4, Data API v1beta: sessions and totalUsers by sessionDefaultChannelGroup, eventCount
     by eventName, screenPageViews by pagePath (top 20), all for the last --days days, plus
     a realtime activeUsers. A 403 SERVICE_DISABLED is reported with Google's enable URL.
+    Then the last 14 months: sessions by date, so an empty recent window can be dated
+    ("last event 2026-09-25"), plus events, hostnames, source/medium and landing pages
+    over that span. The homepage is fetched once without credentials and searched for each
+    stream's measurement ID and for a GTM container.
     Search Console: sitemaps; searchAnalytics totals and by page, query (top 25), country
     and device for the last --days days and the --days before that (dataState "all");
+    clicks and impressions by date for the last 16 months (everything Search Console keeps);
     URL Inspection for --url URLs, or with --urls-from-sitemap for every sitemap URL
     (capped at 50 per run) plus the other host variant of the homepage (apex for a www
     site). Inspection quota is about 2,000 calls a day and 600 a minute per property; the
@@ -66,7 +73,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 SCOPES = ("https://www.googleapis.com/auth/analytics.readonly "
           "https://www.googleapis.com/auth/webmasters.readonly")
@@ -89,6 +96,14 @@ INSPECT_CAP = 50
 INSPECT_DELAY = 0.2          # seconds between URL Inspection calls (tests set it to 0)
 NOT_READABLE = "not readable with this scope/API"
 SEVERITY_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "INFO": 3}
+HISTORY_DAYS = 420            # GA look-back used to date the last event and list what ever arrived
+SC_HISTORY_DAYS = 480         # Search Console keeps 16 months
+INDEXED_STATES = ("Submitted and indexed", "Indexed, not submitted in sitemap")
+UNKNOWN_STATE = "URL is unknown to Google"
+# Environment variables that may hold the key itself (JSON text or base64 of it), checked in
+# this order after --key, --key-env and GOOGLE_APPLICATION_CREDENTIALS.
+INLINE_KEY_VARS = ("GOOGLE_SERVICE_ACCOUNT_JSON", "GSC_SERVICE_ACCOUNT_JSON", "GA_SERVICE_ACCOUNT_JSON",
+                   "GA_READER_KEY_JSON", "GA_READER_KEY_B64")
 GOOD_RETENTION = {"FOURTEEN_MONTHS", "TWENTY_SIX_MONTHS", "THIRTY_EIGHT_MONTHS", "FIFTY_MONTHS"}
 
 _KEY = None                  # parsed service-account key (dict); never printed
@@ -118,11 +133,36 @@ def load_key(path):
             k = json.load(fh)
     except (OSError, ValueError) as e:
         raise SystemExit(_usage_error("cannot read the key file as JSON (%s)" % type(e).__name__))
+    return _accept_key(k, "the key file")
+
+
+def load_key_env(var):
+    """Read a key from an environment variable that holds the JSON text or its base64.
+    Only the variable's NAME is ever printed."""
+    text = (os.environ.get(var) or "").strip()
+    if not text:
+        raise SystemExit(_usage_error("environment variable %s is not set or is empty" % var))
+    k = None
+    try:
+        k = json.loads(text)
+    except ValueError:
+        try:
+            k = json.loads(base64.b64decode(text, validate=True).decode("utf-8"))
+        except Exception:
+            k = None
+    if k is None:
+        raise SystemExit(_usage_error(
+            "environment variable %s is neither service-account JSON nor base64 of it" % var))
+    return _accept_key(k, "environment variable " + var)
+
+
+def _accept_key(k, where):
+    global _KEY, _TOKEN
     if not isinstance(k, dict) or k.get("type") != "service_account" \
             or not k.get("client_email") or not k.get("private_key"):
         raise SystemExit(_usage_error(
-            "the key file is not a service-account key (needs type=service_account, "
-            "client_email and private_key)"))
+            "%s is not a service-account key (needs type=service_account, "
+            "client_email and private_key)" % where))
     _KEY, _TOKEN = k, None
     return k["client_email"]
 
@@ -365,7 +405,7 @@ def data_report(prop, body, realtime=False):
             "rowCount": r.get("rowCount", 0), "metadata": r.get("metadata", {})}
 
 
-def collect_ga(prop, days):
+def collect_ga(prop, days, site_url=None):
     P = prop
     ga = {"property_name": P, "items": {}, "streams": [], "data_api": {}}
     it = ga["items"]
@@ -386,6 +426,8 @@ def collect_ga(prop, days):
             sec["data"] = [{"name": x.get("name"), "displayName": x.get("displayName")} for x in sec["data"]]
         st["measurementProtocolSecrets"] = sec
         ga["streams"].append(st)
+    if site_url and ga["streams"]:
+        ga["tag_check"] = check_tag(site_url, ga["streams"])
     it["keyEvents"] = admin_list(ADMIN_B + P + "/keyEvents", "keyEvents")
     it["customDimensions"] = admin_list(ADMIN_B + P + "/customDimensions", "customDimensions")
     it["customMetrics"] = admin_list(ADMIN_B + P + "/customMetrics", "customMetrics")
@@ -421,6 +463,7 @@ def collect_ga(prop, days):
     if first["ok"]:
         da["available"] = True
         da["reports"]["realtime"] = data_report(P, {"metrics": [{"name": "activeUsers"}]}, realtime=True)
+        da["history"] = collect_ga_history(P)
     else:
         da["available"] = False
         da["status"] = first["status"]
@@ -428,6 +471,77 @@ def collect_ga(prop, days):
         da["error"] = first["error"]
         da["enable_url"] = first["enable_url"]
     return ga
+
+
+def collect_ga_history(prop, days=HISTORY_DAYS):
+    """What the property has ever received, as far back as `days`: sessions by date (to date
+    the first and last day with data) and the events, hostnames, sources and landing pages
+    over that span. A short reporting window on a property whose tag was removed is all
+    blanks; this is what turns the blanks into 'last event on 2026-09-25'."""
+    dr = [{"startDate": "%ddaysAgo" % days, "endDate": "today"}]
+    h = {"date_range": dr[0], "reports": {}}
+    by_sessions = [{"metric": {"metricName": "sessions"}, "desc": True}]
+    reports = {
+        "days": {"dateRanges": dr, "dimensions": [{"name": "date"}],
+                 "metrics": [{"name": "sessions"}, {"name": "eventCount"}], "limit": 500,
+                 "orderBys": [{"dimension": {"dimensionName": "date"}}]},
+        "events": {"dateRanges": dr, "dimensions": [{"name": "eventName"}],
+                   "metrics": [{"name": "eventCount"}, {"name": "totalUsers"}], "limit": 100,
+                   "orderBys": [{"metric": {"metricName": "eventCount"}, "desc": True}]},
+        "hosts": {"dateRanges": dr, "dimensions": [{"name": "hostName"}],
+                  "metrics": [{"name": "sessions"}], "limit": 15, "orderBys": by_sessions},
+        "sources": {"dateRanges": dr, "dimensions": [{"name": "sessionSourceMedium"}],
+                    "metrics": [{"name": "sessions"}, {"name": "engagedSessions"}, {"name": "keyEvents"}],
+                    "limit": 20, "orderBys": by_sessions},
+        # Sessions GA4 could not file under any default channel, by the source/medium that
+        # caused it. Almost always a hand-made utm_medium the channel rules do not know.
+        "unassigned": {"dateRanges": dr, "dimensions": [{"name": "sessionSourceMedium"}],
+                       "metrics": [{"name": "sessions"}], "limit": 10, "orderBys": by_sessions,
+                       "dimensionFilter": {"filter": {"fieldName": "sessionDefaultChannelGroup",
+                                                      "stringFilter": {"value": "Unassigned"}}}},
+        "landing": {"dateRanges": dr, "dimensions": [{"name": "landingPage"}],
+                    "metrics": [{"name": "sessions"}, {"name": "engagedSessions"}],
+                    "limit": 20, "orderBys": by_sessions},
+    }
+    for name, body in reports.items():
+        h["reports"][name] = data_report(prop, body)
+    d = h["reports"]["days"]
+    if d["ok"]:
+        with_data = [r for r in d["rows"] if len(r) >= 3 and (_int(r[1]) or _int(r[2]))]
+        h["days_with_data"] = len(with_data)
+        h["first_day"] = _iso_day(with_data[0][0]) if with_data else None
+        h["last_day"] = _iso_day(with_data[-1][0]) if with_data else None
+        h["sessions"] = sum(_int(r[1]) for r in with_data)
+        h["reports"]["days"] = dict(d, rows=[])       # the per-day rows are not worth keeping
+    return h
+
+
+def _int(v):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _iso_day(yyyymmdd):
+    return "%s-%s-%s" % (yyyymmdd[:4], yyyymmdd[4:6], yyyymmdd[6:8]) if len(yyyymmdd) == 8 else yyyymmdd
+
+
+def check_tag(site_url, streams):
+    """Fetch the homepage without credentials and look for each web stream's measurement ID
+    and for a GTM container. Absence is evidence, not proof: a tag loaded by a first-party
+    script, by GTM, or after a consent click is not in the HTML."""
+    status, html = call(site_url, auth=False, raw=True)
+    out = {"url": site_url, "status": status}
+    if status != 200 or not isinstance(html, str):
+        return out
+    ids = [s.get("measurementId") for s in streams if s.get("measurementId")]
+    out["measurement_ids_found"] = [i for i in ids if i in html]
+    out["measurement_ids_missing"] = [i for i in ids if i not in html]
+    out["other_ga_ids"] = sorted(set(re.findall(r"\bG-[A-Z0-9]{8,12}\b", html)) - set(ids))[:5]
+    out["gtm_containers"] = sorted(set(re.findall(r"\bGTM-[A-Z0-9]{5,9}\b", html)))[:5]
+    out["gtag_loader"] = "googletagmanager.com/gtag/js" in html
+    return out
 
 
 # =================================================================================
@@ -490,6 +604,28 @@ def search_analytics(sc_site, start, end):
     return out
 
 
+def search_history(sc_site, today=None, days=SC_HISTORY_DAYS):
+    """Clicks and impressions by date for everything Search Console keeps (16 months), reduced
+    to totals, the first and last day with an impression and how many days had one. A 28-day
+    window cannot tell a site that lost its traffic from one that never had any."""
+    today = today or dt.date.today()
+    start, end = (today - dt.timedelta(days=days)).isoformat(), today.isoformat()
+    url = WEBMASTERS + "sites/" + sc_quote(sc_site) + "/searchAnalytics/query"
+    status, r = call(url, {"startDate": start, "endDate": end, "dimensions": ["date"],
+                           "rowLimit": 1000, "dataState": "all"})
+    if status != 200:
+        e = parse_error(status, r)
+        return {"ok": False, "status": status, "error": e["message"][:300], "range": [start, end]}
+    rows = [x for x in r.get("rows", []) if x.get("impressions", 0) > 0]
+    days_seen = sorted((x.get("keys") or [""])[0] for x in rows)
+    return {"ok": True, "range": [start, end],
+            "clicks": int(sum(x.get("clicks", 0) for x in rows)),
+            "impressions": int(sum(x.get("impressions", 0) for x in rows)),
+            "days_with_impressions": len(rows),
+            "first_day": days_seen[0] if days_seen else None,
+            "last_day": days_seen[-1] if days_seen else None}
+
+
 def sitemap_urls(paths, site_url, cap=INSPECT_CAP):
     """Collect <loc> URLs from the given sitemaps (following one level of sitemap index).
     Falls back to robots.txt Sitemap: lines, then /sitemap.xml. Fetched without credentials.
@@ -542,7 +678,7 @@ def inspect_url(url, sc_site):
             "indexingState": ix.get("indexingState"), "lastCrawlTime": ix.get("lastCrawlTime"),
             "pageFetchState": ix.get("pageFetchState"), "googleCanonical": ix.get("googleCanonical"),
             "userCanonical": ix.get("userCanonical"), "robotsTxtState": ix.get("robotsTxtState"),
-            "crawledAs": ix.get("crawledAs"), "referringUrls": (ix.get("referringUrls") or [])[:2],
+            "crawledAs": ix.get("crawledAs"), "referringUrls": (ix.get("referringUrls") or [])[:5],
             "sitemap": ix.get("sitemap"),
             "richResults": ({"verdict": rr.get("verdict"), "types": types} if rr else None),
             "link": ir.get("inspectionResultLink")}
@@ -558,6 +694,7 @@ def collect_sc(sc_site, permission, site_url, days, inspect_mode, urls, today=No
     log("Search Console: search analytics %s..%s and %s..%s" % (cur + prev))
     sc["analytics"] = {"current": search_analytics(sc_site, *cur),
                        "previous": search_analytics(sc_site, *prev)}
+    sc["history"] = search_history(sc_site, today)
 
     targets = []
     insp = {"mode": inspect_mode, "cap": INSPECT_CAP, "capped": False}
@@ -654,7 +791,107 @@ def evaluate(data, launched=None, today=None):
                 "Edit the stream URL in Admin > Data streams to https://%s. The tag collects from any "
                 "host, so no data is lost; this keeps the stream pointed at the canonical host." % site_host))
 
+    acc = data.get("access") or {}
+    email = data.get("client_email") or "the service account"
+    if acc.get("ga") == "none":
+        out.append(finding(
+            "HIGH", "The service account cannot see any GA4 property", "access",
+            "accountSummaries returned no accounts for %s" % email,
+            "In GA4, Admin > Property access management > add %s as Viewer. Access is granted per "
+            "property (or account) inside Analytics; an IAM role in the Cloud project does nothing. "
+            "GA4 was not reviewed." % email))
+    if acc.get("sc") == "none":
+        seen = acc.get("sc_visible") or []
+        out.append(finding(
+            "HIGH", "The service account has no Search Console property for this site", "access",
+            "sites.list returned %s" % (", ".join(seen) if seen else "an empty list (HTTP 200)"),
+            "In Search Console open the property, Settings > Users and permissions > Add user, and "
+            "enter %s (Restricted is enough to read). A 200 with an empty list means the key and the "
+            "API are fine and only this grant is missing. Add it to the domain property if there is "
+            "one. Search Console was not reviewed." % email))
+
     da = ga.get("data_api") or {}
+    hist = da.get("history") or {}
+    hrep = hist.get("reports") or {}
+    tag = ga.get("tag_check") or {}
+    ev = (da.get("reports") or {}).get("events") or {}
+    if da.get("available") and ev.get("ok") and not ev.get("rows"):
+        window = (da.get("date_range") or {}).get("startDate", "the window")
+        if hist.get("last_day"):
+            last = dt.date.fromisoformat(hist["last_day"])
+            seen = "last day with data %s (%d days ago), first %s, %d sessions over %d day(s) with data" % (
+                hist["last_day"], (today.date() - last).days, hist.get("first_day"),
+                hist.get("sessions", 0), hist.get("days_with_data", 0))
+        elif "days_with_data" in hist:
+            seen = "and nothing in the last %d days either: the property has never received an event" % HISTORY_DAYS
+        else:
+            seen = "history could not be read"
+        missing = tag.get("measurement_ids_missing") or []
+        if tag.get("status") == 200 and missing and not tag.get("measurement_ids_found"):
+            where = "; %s is not in the homepage HTML%s" % (
+                ", ".join(missing),
+                " (GTM container %s is, so the tag may load from there)" % ", ".join(tag["gtm_containers"])
+                if tag.get("gtm_containers") else
+                " (another GA4 ID is: %s)" % ", ".join(tag["other_ga_ids"]) if tag.get("other_ga_ids") else
+                " and no gtag loader or GTM container is either")
+        elif tag.get("measurement_ids_found"):
+            where = "; %s is in the homepage HTML, so look at a consent gate, a CSP block or a host " \
+                    "filter" % ", ".join(tag["measurement_ids_found"])
+        else:
+            where = ""
+        out.append(finding(
+            "HIGH", "GA4 has received no events in the reporting window", "analytics",
+            "0 events since %s; %s%s" % (window, seen, where),
+            "The property is configured but nothing is arriving, so every other GA4 setting is moot "
+            "until this is fixed. Confirm in a real browser (network requests to "
+            "google-analytics.com/g/collect) whether the tag fires, then check the site's history for "
+            "why it stopped: a tag removed on purpose (privacy policy, consent) is a decision for the "
+            "owner, not a bug to patch. Annotate the gap in GA4 once data flows again."))
+
+    kev = it.get("keyEvents") or {}
+    hev = hrep.get("events") or {}
+    if kev.get("ok") and hev.get("ok") and hev.get("rows"):
+        sent = {r[0] for r in hev["rows"] if r}
+        dead = [k.get("eventName") for k in kev["data"] if k.get("eventName") not in sent]
+        if dead:
+            out.append(finding(
+                "MEDIUM", "Key events that nothing sends", "analytics",
+                "marked as key events but absent from %d days of events: %s (events seen: %s)"
+                % (HISTORY_DAYS, ", ".join(dead), ", ".join(sorted(sent))[:200]),
+                "A key event no event matches counts nothing, so conversion and acquisition reports "
+                "stay at zero. Either send the event from the site (the action the business runs on: "
+                "sign_up, purchase, generate_lead) or unmark it in Admin > Data display > Key events and "
+                "mark the events that do arrive. close_convert_lead and qualify_lead are created by "
+                "GA's lead-generation setup and are leftovers on a site that never sends them."))
+
+    un = hrep.get("unassigned") or {}
+    if un.get("ok") and un.get("rows") and hist.get("sessions"):
+        rows_u = [(r[0], _int(r[1])) for r in un["rows"] if len(r) >= 2 and _int(r[1])]
+        lost = sum(n for _, n in rows_u)
+        if lost >= 10 and lost * 20 >= hist["sessions"]:           # at least 10 sessions and 5%
+            out.append(finding(
+                "LOW", "Campaign traffic GA4 files under Unassigned", "analytics",
+                "%d of %d sessions (%d%%): %s" % (lost, hist["sessions"], round(100 * lost / hist["sessions"]),
+                                                  ", ".join("%s (%d)" % r for r in rows_u[:6])),
+                "GA4 assigns a channel from utm_medium, and only knows a fixed vocabulary: social, "
+                "email, cpc, organic, referral, affiliate, display, video and a few "
+                "more. A medium such as 'reel', 'post' or 'bio' matches no rule, so the visit lands in "
+                "Unassigned and drops out of every channel report. Use utm_medium=social (or email, "
+                "cpc...) and move the detail to utm_content or utm_campaign. It cannot be fixed "
+                "retroactively."))
+
+    hosts = hrep.get("hosts") or {}
+    if hosts.get("ok") and site_host:
+        stray = [(r[0], _int(r[1])) for r in hosts["rows"]
+                 if len(r) >= 2 and r[0] and strip_www(r[0].lower()) != strip_www(site_host) and _int(r[1])]
+        if stray:
+            out.append(finding(
+                "LOW", "GA4 is collecting from hosts other than the site", "analytics",
+                ", ".join("%s (%d sessions)" % h for h in stray[:8]),
+                "Localhost, preview and staging hits pollute a small property. Load the tag only when "
+                "location.hostname is the production host, or exclude the others with a data filter "
+                "(Admin > Data collection and modification > Data filters)."))
+
     if da and da.get("available") is False:
         if da.get("reason") == "SERVICE_DISABLED":
             out.append(finding(
@@ -711,6 +948,55 @@ def evaluate(data, launched=None, today=None):
                 "Request indexing for these URLs so Google picks up the launched content, titles and "
                 "canonicals instead of the pre-launch version."))
 
+    held = {}
+    for r in checked:
+        state = r.get("coverageState") or "no coverage state"
+        if state not in INDEXED_STATES and state != UNKNOWN_STATE:
+            held.setdefault(state, []).append(r["url"])
+    if held:
+        indexed = len([r for r in checked if r.get("coverageState") in INDEXED_STATES])
+        n_held = sum(len(v) for v in held.values())
+        hints = []
+        if any(k.startswith("Discovered") for k in held):
+            hints.append("'Discovered - currently not indexed' means Google has the URL and has not "
+                         "spent a crawl on it. That is a demand problem, not a blocked page: the site "
+                         "has too little authority or too little evidence of value for Google to "
+                         "bother. Request indexing by hand for the few pages that matter most (about "
+                         "ten a day), earn links from other sites to those pages, and make sure "
+                         "unknown URLs return a real 404, since a host that answers 200 to anything "
+                         "teaches Google that its URLs are not worth sampling")
+        if any(k.startswith("Crawled") for k in held):
+            hints.append("'Crawled - currently not indexed' means Google fetched the page and "
+                         "declined it: look for thin, templated or duplicated content before anything else")
+        if any("redirect" in k.lower() or "canonical" in k.lower() or "noindex" in k.lower()
+               or "404" in k or "robots" in k.lower() for k in held):
+            hints.append("redirecting, canonicalized, noindexed, blocked or missing URLs do not belong "
+                         "in a sitemap: fix the page or remove the entry")
+        out.append(finding(
+            "HIGH" if indexed * 2 < len(checked) else "MEDIUM",
+            "Sitemap URLs Google has not indexed", "search-console",
+            "%d of %d inspected URLs are indexed; %d held back: %s" % (
+                indexed, len(checked), n_held,
+                "; ".join("%s (%d): %s" % (k, len(v), ", ".join(v[:6]) + (" ..." if len(v) > 6 else ""))
+                          for k, v in sorted(held.items(), key=lambda kv: -len(kv[1])))),
+            ". ".join(h[0].upper() + h[1:] for h in hints) + "." if hints else
+            "Open each in Search Console URL Inspection for the reason."))
+
+    own = strip_www(site_host)
+    ext = {}
+    for r in checked:
+        for u in r.get("referringUrls") or []:
+            h = strip_www(host_of(u))
+            if h and h != own:
+                ext.setdefault(h, set()).add(r["url"])
+    if ext:
+        out.append(finding(
+            "INFO", "Google found pages through other hosts", "search-console",
+            "; ".join("%s referred %d URL(s)" % (h, len(v)) for h, v in sorted(ext.items())),
+            "Check that each is intended. An old domain, a staging or platform host, or another site "
+            "whose sitemap lists these URLs should 301 here (or stop listing them); a genuine "
+            "third-party link is good news and worth knowing about."))
+
     an = sc.get("analytics") or {}
     site_scheme = data.get("site_scheme", "https")
     variants = {}
@@ -741,6 +1027,27 @@ def evaluate(data, launched=None, today=None):
                 "%d impressions in %s..%s but zero query rows" % (imps, *cur.get("range", ["?", "?"])),
                 "Search Console hides rare queries for privacy; totals still count them. Not a fault: "
                 "read the empty query table as 'too little data', not 'no demand'."))
+
+    oldest = min([t for t in (parse_time(x.get("lastSubmitted")) for x in (sm.get("data") or [])
+                              if isinstance(x, dict)) if t] or [None], key=lambda t: t or today) \
+        if sm.get("ok") else None
+    days_n = max(1, int(data.get("days") or 28))
+    if tot.get("ok") and oldest and (today - oldest).days >= 60:
+        imps = sum(r.get("impressions", 0) for r in tot["rows"])
+        if imps < days_n:                      # under one impression a day
+            sh = sc.get("history") or {}
+            longer = ("; %d impressions and %d clicks in the %d days Search Console keeps, on %d day(s)"
+                      % (sh.get("impressions", 0), sh.get("clicks", 0), SC_HISTORY_DAYS,
+                         sh.get("days_with_impressions", 0))) if sh.get("ok") else ""
+            out.append(finding(
+                "HIGH", "The site is close to invisible in Google Search", "search-console",
+                "%d impressions in the last %d days, sitemap first submitted %d days ago%s"
+                % (imps, days_n, (today - oldest).days, longer),
+                "At this level on-page tuning is not the constraint: titles and descriptions cannot "
+                "raise the click-through of pages that are never shown. Work in this order: get the "
+                "pages indexed (see the inspection findings), then earn links and mentions so Google "
+                "has a reason to rank them, then revisit copy once queries appear in this report. "
+                "Report the crawl score as hygiene, not as an explanation of traffic."))
 
     out.sort(key=lambda x: SEVERITY_ORDER[x["severity"]])
     return out
@@ -849,6 +1156,29 @@ def render_markdown(data, findings):
                     w(md_table(rep["headers"], rows))
                 else:
                     w("HTTP %s: %s\n" % (rep.get("status"), rep.get("error")))
+            h = da.get("history") or {}
+            if h:
+                w("### Data API history (last %d days)\n" % HISTORY_DAYS)
+                w("First day with data: %s. Last day with data: %s. %s sessions on %s day(s).\n" % (
+                    h.get("first_day") or "none", h.get("last_day") or "none",
+                    h.get("sessions", 0), h.get("days_with_data", 0)))
+                for name in ("sources", "unassigned", "landing", "events", "hosts"):
+                    rep_ = (h.get("reports") or {}).get(name) or {}
+                    if rep_.get("ok") and rep_.get("rows"):
+                        w("**%s**\n" % name)
+                        w(md_table(rep_["headers"], rep_["rows"]))
+            tc_ = ga.get("tag_check") or {}
+            if tc_:
+                w("### Tag on the homepage\n")
+                if tc_.get("status") != 200:
+                    w("Homepage not readable (HTTP %s).\n" % tc_.get("status"))
+                else:
+                    w("Stream IDs found in the HTML: %s. Missing: %s. GTM containers: %s. gtag loader: %s. "
+                      "A tag loaded by a first-party script or after consent is not visible here.\n" % (
+                          ", ".join(tc_.get("measurement_ids_found") or []) or "none",
+                          ", ".join(tc_.get("measurement_ids_missing") or []) or "none",
+                          ", ".join(tc_.get("gtm_containers") or []) or "none",
+                          "yes" if tc_.get("gtag_loader") else "no"))
         else:
             w("Not available: HTTP %s %s. %s\n" % (da.get("status"), da.get("reason") or "",
                                                    ("Enable: " + da["enable_url"]) if da.get("enable_url")
@@ -904,6 +1234,13 @@ def render_markdown(data, findings):
             else:
                 w("HTTP %s %s\n" % (blk.get("status"), blk.get("error")))
 
+    sh = sc.get("history") or {}
+    if sh.get("ok"):
+        w("### Search history (%s..%s, everything Search Console keeps)\n" % tuple(sh["range"]))
+        w("%d impressions and %d clicks on %d day(s) with an impression; first %s, last %s.\n" % (
+            sh["impressions"], sh["clicks"], sh["days_with_impressions"],
+            sh.get("first_day") or "none", sh.get("last_day") or "none"))
+
     insp = sc.get("inspection") or {}
     w("### URL inspection\n")
     if insp.get("mode") is None:
@@ -944,7 +1281,10 @@ def build_parser():
         description="Read-only review of a site's GA4 and Search Console properties with a "
                     "service-account key. Nothing is ever written to Google.")
     ap.add_argument("--site", required=True, help="the site, e.g. https://www.example.com")
-    ap.add_argument("--key", help="service-account JSON key (else $GOOGLE_APPLICATION_CREDENTIALS)")
+    ap.add_argument("--key", help="service-account JSON key file (else $GOOGLE_APPLICATION_CREDENTIALS)")
+    ap.add_argument("--key-env", metavar="VAR",
+                    help="environment variable holding the key JSON or its base64 (default: the first "
+                         "set of %s)" % ", ".join(INLINE_KEY_VARS))
     ap.add_argument("--property", help="GA4 property, e.g. properties/123 (default: auto-detect)")
     ap.add_argument("--sc-site", help="Search Console property, e.g. sc-domain:example.com (default: auto)")
     ap.add_argument("--days", type=int, default=28, help="reporting window in days (default 28)")
@@ -969,20 +1309,26 @@ def main(argv=None):
             launched = dt.date.fromisoformat(args.launched)
         except ValueError:
             return _usage_error("--launched must be YYYY-MM-DD")
-    key_path = args.key or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-    if not key_path:
-        return _usage_error("no service-account key: pass --key PATH or set GOOGLE_APPLICATION_CREDENTIALS")
+    key_path = args.key or (None if args.key_env else os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"))
+    key_var = args.key_env or (None if key_path else
+                               next((v for v in INLINE_KEY_VARS if os.environ.get(v, "").strip()), None))
+    if not key_path and not key_var:
+        return _usage_error("no service-account key: pass --key PATH or --key-env VAR, or set "
+                            "GOOGLE_APPLICATION_CREDENTIALS (a path) or one of %s (the key JSON or its "
+                            "base64)" % ", ".join(INLINE_KEY_VARS))
     try:
-        client_email = load_key(key_path)
+        client_email = load_key(key_path) if key_path else load_key_env(key_var)
     except SystemExit as e:
         return e.code
+    if key_var:
+        log("key read from environment variable " + key_var)
 
     site_url = normalize_site(args.site)
     site_host = host_of(site_url)
     data = {"tool": "google-console-review", "version": VERSION,
             "generated": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "site": site_url, "site_host": site_host, "site_scheme": urllib.parse.urlsplit(site_url).scheme,
-            "client_email": client_email, "days": args.days, "launched": args.launched}
+            "client_email": client_email, "days": args.days, "launched": args.launched, "access": {}}
     log("authenticating as %s (read-only scopes)" % client_email)
     try:
         get_token()
@@ -1003,13 +1349,20 @@ def main(argv=None):
             log("GA4: " + ga_error)
         else:
             prop = pick_property(cands, site_host)
-            if not prop:
+            if not prop and not cands:
+                # A key nobody has added to a GA4 property sees no accounts at all. That is an
+                # access finding to report, not a reason to throw away the Search Console half.
+                ga_error = "the service account sees no GA4 account"
+                data["access"]["ga"] = "none"
+                log("GA4: %s; continuing with Search Console only" % ga_error)
+            elif not prop:
                 log("error: no single GA4 property has a web stream for %s. Candidates:" % strip_www(site_host))
                 for c in cands:
                     log("  %s  %s  %s" % (c["property"], c["displayName"], ", ".join(c["uris"]) or "(no web stream)"))
                 log("pass --property properties/N")
                 return 2
-            log("GA4: selected %s" % prop)
+            else:
+                log("GA4: selected %s" % prop)
 
     # Search Console property
     st, body = call(WEBMASTERS + "sites")
@@ -1023,19 +1376,26 @@ def main(argv=None):
     if not sc_site and not sc_error:
         chosen = pick_sc_site(entries, site_url)
         if not chosen:
-            log("error: no Search Console property covers %s. Visible properties:" % site_url)
+            log("Search Console: no property covers %s. Visible properties:%s" % (
+                site_url, "" if entries else " none"))
             for e in entries:
                 log("  %s  (%s)" % (e.get("siteUrl"), e.get("permissionLevel")))
-            log("pass --sc-site")
-            return 2
-        sc_site = chosen["siteUrl"]
+            if not prop:
+                log("error: nothing to review; add the service account to the GA4 property and the "
+                    "Search Console property, or pass --property / --sc-site")
+                return 2
+            sc_error = "no Search Console property covers %s for this service account" % site_url
+            data["access"].update(sc="none", sc_visible=[e.get("siteUrl") for e in entries])
+            log("continuing with GA4 only")
+        else:
+            sc_site = chosen["siteUrl"]
     if sc_site:
         permission = next((e.get("permissionLevel") for e in entries if e.get("siteUrl") == sc_site),
                           "not in this account's site list")
         log("Search Console: %s, permission %s" % (sc_site, permission))
         sc_error = None
 
-    data["ga"] = collect_ga(prop, args.days) if prop else {"error": ga_error or "no property"}
+    data["ga"] = collect_ga(prop, args.days, site_url) if prop else {"error": ga_error or "no property"}
     if sc_site:
         mode = "sitemap" if args.urls_from_sitemap else ("url" if args.url else None)
         data["sc"] = collect_sc(sc_site, permission, site_url, args.days, mode, args.url)

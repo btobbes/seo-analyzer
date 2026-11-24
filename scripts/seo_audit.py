@@ -38,7 +38,7 @@ from html.parser import HTMLParser
 
 # A descriptive UA: honest about being an auditor, but browser-shaped so servers that
 # sniff for "Mozilla" still serve the real page.
-VERSION = "2.2.0"   # bump on every behavior change; shown in the report footer and --version
+VERSION = "2.3.0"   # bump on every behavior change; shown in the report footer and --version
 USER_AGENT = "Mozilla/5.0 (compatible; SEO-Audit-Skill/2.1; +https://claude.com/claude-code)"
 # A plain desktop-browser UA: the baseline an AI-crawler probe is compared against, and
 # what font/CSS endpoints need to see before they serve woff2.
@@ -227,6 +227,7 @@ class PageParser(HTMLParser):
         self.headings = {h: [] for h in HEADING_TAGS}
         self._heading_stack = []
         self.links = []          # hrefs
+        self.nofollow_links = set()   # hrefs whose <a> carries rel=nofollow (or sponsored/ugc)
         self.link_tags = []      # <link rel=...> dicts
         self.jsonld = []         # raw json-ld strings
         self._in_jsonld = False
@@ -299,6 +300,8 @@ class PageParser(HTMLParser):
                 self.stylesheet_seq.append(self._seq)
         elif tag == "a" and a.get("href"):
             self.links.append(a["href"])
+            if {"nofollow", "sponsored", "ugc"} & set((a.get("rel") or "").lower().split()):
+                self.nofollow_links.add(a["href"])
         elif tag == "picture":
             self._picture_sources = []
         elif tag == "source":
@@ -920,7 +923,7 @@ def analyze_page(url):
                               f"{len(insecure)} subresource(s) loaded over http://",
                               "Load all scripts, styles, images, and iframes over https:// — browsers "
                               "block mixed content and it breaks the padlock."))
-    missing_headers = missing_security_headers(r)
+    missing_headers = missing_security_headers(r, p.metas)
     if missing_headers:
         sev = "MEDIUM" if "Content-Security-Policy" in missing_headers else "LOW"
         findings.append(f(sev, f"Missing {len(missing_headers)} security header(s)", "trust", 2, 2,
@@ -1074,12 +1077,50 @@ def cwv_fix(metric):
     }.get(metric, "Address the Lighthouse opportunities for this metric.")
 
 
-def missing_security_headers(resp):
+def missing_security_headers(resp, metas=()):
+    """Security headers the response lacks. A Content-Security-Policy delivered by a
+    <meta http-equiv> tag counts as present: static hosts that cannot set headers (and
+    several site builders) ship it that way, and browsers enforce it. A meta policy cannot
+    carry frame-ancestors, report-uri or sandbox, so X-Frame-Options is still judged."""
     wanted = ["Strict-Transport-Security", "Content-Security-Policy",
               "X-Content-Type-Options", "X-Frame-Options", "Referrer-Policy",
               "Permissions-Policy"]
     present = {k.lower() for k in resp.headers}
+    if any((m.get("http-equiv") or "").lower() == "content-security-policy" and (m.get("content") or "").strip()
+           for m in metas or ()):
+        present.add("content-security-policy")
     return [w for w in wanted if w.lower() not in present]
+
+
+def demote_linked_noindex(pages):
+    """A page that answers 200, carries noindex, and was reached by following a link (it is
+    not in the sitemap and is not the homepage) is a utility page the owner has already
+    kept out of search: sign-in, cart, account. Its missing H1, thin body and shared title
+    are not SEO defects, and scoring them buried the real findings under four HIGHs for a
+    login form (2026-11-24). Each such page keeps one INFO note and is flagged so the
+    cross-page duplicate checks skip it. The site-level 'Internal links lead to noindexed
+    pages' finding still reports the links themselves. Returns the pages it changed."""
+    changed = []
+    for i, pg in enumerate(pages):
+        if i == 0 or pg.get("source") == "sitemap" or pg.get("status") != 200:
+            continue
+        if "noindex" not in (pg.get("robots") or "").lower():
+            continue
+        pg["utility_noindex"] = True
+        pg["findings"] = [f("INFO", "Noindexed page reached by a link (not in the sitemap)", "crawlability",
+                            1, 1, f'meta robots="{pg.get("robots")}"',
+                            "Nothing to fix if this is a sign-in, account or checkout page. On-page checks "
+                            "are skipped for it. If it should rank, remove the noindex and add it to the "
+                            "sitemap.")]
+        changed.append(pg)
+    return changed
+
+
+def tls_seen_through_proxy():
+    """True when this process reaches the web through a proxy that may terminate TLS itself
+    (cloud agent sandboxes, corporate networks). The certificate we would read is then the
+    proxy's, with its own issuer and a short life, and says nothing about the site."""
+    return any(os.environ.get(v, "").strip() for v in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"))
 
 
 # =================================================================================
@@ -1595,7 +1636,7 @@ def check_host_variants(base, canonical_final_url):
 def check_custom_404(base):
     """Probe a URL that can't exist and verify the site answers with a real 404."""
     probe = normalize(base, "/seo-audit-404-probe-x9q3z7/")
-    r = fetch(probe, max_bytes=4096)
+    r = fetch(probe, max_bytes=65536)
     findings = []
     if r.status == 200 and r.final_url.rstrip("/") == base.rstrip("/"):
         findings.append(f("MEDIUM", "Missing pages redirect to the homepage", "crawlability", 3, 2,
@@ -1604,10 +1645,21 @@ def check_custom_404(base):
                           "blanket redirects to the homepage as soft 404s."))
         health = ("404 handling", "redirects to homepage (soft 404)")
     elif r.status == 200:
+        # An SPA host that serves its shell for every path is the usual cause. Say what the
+        # body claims, because that decides how bad it is: a canonical pointing at the homepage
+        # folds junk URLs into it, a self-canonical or none lets them be indexed on their own.
+        can = re.search(r'<link[^>]+rel=["\']canonical["\'][^>]*href=["\']([^"\']+)', r.text or "", re.I) or \
+            re.search(r'<link[^>]+href=["\']([^"\']+)["\'][^>]*rel=["\']canonical["\']', r.text or "", re.I)
+        noindex = bool(re.search(r'<meta[^>]+name=["\']robots["\'][^>]*noindex', r.text or "", re.I))
+        says = ("the body carries noindex" if noindex else
+                f"the body's canonical is {can.group(1)}" if can else "the body has no canonical and no noindex")
         findings.append(f("HIGH", "Missing pages return HTTP 200 (soft 404)", "crawlability", 4, 2,
-                          f"GET {probe} → 200",
+                          f"GET {probe} → 200; {says}",
                           "Return a real 404 status for unknown URLs — soft 404s waste crawl budget and "
-                          "can get junk URLs indexed."))
+                          "can get junk URLs indexed. On a single-page-app host that serves the app shell "
+                          "for every path, a noindex added by JavaScript only helps crawlers that render; "
+                          "the status code has to come from the host (a 404.html the platform honours, an "
+                          "edge rule, or a host that does)."))
         health = ("404 handling", "returns 200 for missing pages (soft 404)")
     elif r.status in (404, 410):
         health = ("404 handling", f"correct (HTTP {r.status})")
@@ -1633,6 +1685,10 @@ def tls_certificate(host):
             for k, v in rdn:
                 if k == "organizationName":
                     issuer = v
+        if tls_seen_through_proxy():
+            return [], ("TLS certificate", "not measured: this run goes through an HTTPS proxy, so the "
+                        f"certificate seen ({days} days left" + (f", issuer {issuer}" if issuer else "") +
+                        ") may be the proxy's, not the site's")
         if days < 0:
             findings.append(f("CRITICAL", "TLS certificate expired", "trust", 5, 2,
                               f"expired {-days} day(s) ago",
@@ -2135,15 +2191,18 @@ def check_link_architecture(pages, crawled_urls, sm_urls, limit=40):
       * does a canonical hand indexing to a thinner page than the one carrying it?
       * is a whole sitemap template reachable only through the sitemap?"""
     seen = {u.rstrip("/") for u in crawled_urls}
-    link_set, candidates = set(), []
+    link_set, candidates, followed = set(), [], set()
     for page in pages:
         p = page.get("parser")
         if not p:
             continue
+        nofollow = getattr(p, "nofollow_links", set())
         for href in p.links:
             u = normalize(page["url"], href)
             if not u or not u.startswith("http") or not same_site(u, page["url"]):
                 continue
+            if href not in nofollow:
+                followed.add(u.rstrip("/"))      # at least one link to it passes signals
             if u.rstrip("/") != (page.get("final_url") or page["url"]).rstrip("/") \
                     and u.rstrip("/") != page["url"].rstrip("/"):
                 link_set.add(u.rstrip("/"))      # self-links don't count as inlinks
@@ -2159,6 +2218,7 @@ def check_link_architecture(pages, crawled_urls, sm_urls, limit=40):
         results = list(ex.map(lambda u: fetch(u, max_bytes=200_000), sample))
 
     broken, errors5, redirs, slash_redirs, noncanon, noindexed = [], [], [], [], [], []
+    nofollowed_noindex = 0
     for u, r in zip(sample, results):
         if r.status in (404, 410):
             broken.append(u)
@@ -2170,7 +2230,11 @@ def check_link_architecture(pages, crawled_urls, sm_urls, limit=40):
             (slash_redirs if _trivial_redirect(u, r.final_url) else redirs).append(u)
         if r.status == 200 and "html" in r.header("content-type", "").lower():
             can, noindex, _ = _head_signals(r)
-            if noindex:
+            if noindex and u.rstrip("/") not in followed:
+                # Every link to it is rel=nofollow: the site already tells crawlers not to
+                # spend the visit (a sign-up button to a noindexed auth page). Not a finding.
+                nofollowed_noindex += 1
+            elif noindex:
                 noindexed.append(u)
             elif can and same_site(can, u) and (urllib.parse.urlparse(can).path.rstrip("/")
                                                 != urllib.parse.urlparse(r.final_url).path.rstrip("/")):
@@ -4009,8 +4073,11 @@ def run_audit(start_url, max_pages=15, use_pagespeed=False, sweep=100, probe_ai=
             "as partial."))
 
     # cross-page duplicates — across deep AND swept pages
+    demote_linked_noindex(pages)
     descriptions, titles = {}, {}
     for page in all_pages:
+        if page.get("utility_noindex"):
+            continue
         if page.get("description"):
             descriptions.setdefault(page["description"], []).append(page["url"])
         if page.get("title"):
@@ -4018,14 +4085,14 @@ def run_audit(start_url, max_pages=15, use_pagespeed=False, sweep=100, probe_ai=
     for desc, urls in descriptions.items():
         if len(urls) > 1:
             for page in all_pages:
-                if page.get("description") == desc:
+                if page.get("description") == desc and not page.get("utility_noindex"):
                     page["findings"].append(f("MEDIUM", "Duplicate meta description across pages",
                                               "on page", 3, 2, f"Same description on {len(urls)} pages",
                                               "Write a page-specific description reflecting this page's unique content."))
     for title, urls in titles.items():
         if len(urls) > 1:
             for page in all_pages:
-                if page.get("title") == title:
+                if page.get("title") == title and not page.get("utility_noindex"):
                     page["findings"].append(f("MEDIUM", "Duplicate title across pages",
                                               "on page", 3, 2, f"Same title on {len(urls)} pages",
                                               "Give each page a distinct, descriptive title."))

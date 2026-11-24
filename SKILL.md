@@ -16,7 +16,11 @@ description: >-
   search?". Also use it for competitive analysis: "who is outranking us", "compare us
   with <rival>", "why are we losing position to <site>", "what does <rival> do better",
   or "find our top competitors and compare" (competitor discovery, side-by-side audits,
-  the seven-lens comparison in references/competitive-analysis.md).
+  the seven-lens comparison in references/competitive-analysis.md). Also use it to review
+  or set up Google Analytics 4 and Google Search Console for a site: checking a
+  service-account key, listing what it can see, reading indexing, search performance,
+  traffic sources and GA4 settings read-only, and saying what to change so the properties
+  capture how visitors arrive and what they do (references/google-console-review.md).
 ---
 
 # SEO Audit
@@ -30,7 +34,7 @@ Core Web Vitals when PageSpeed runs, **Keyword focus**, a social-share preview, 
 per-page findings tables. Every finding is paired with a concrete fix.
 
 The score is a description of what the script could observe, not a verdict on the site.
-Two rules follow from that, and they matter more than anything else in this file:
+Three rules follow from that, and they matter more than anything else in this file:
 
 1. **Read the coverage table before you quote the score.** The crawl samples across URL
    templates so a 250-page directory can't hide behind a dozen static pages, but if a
@@ -41,6 +45,11 @@ Two rules follow from that, and they matter more than anything else in this file
    copy that contradicts the access policy, a geo-personalized hub. When the user is about
    to launch, open indexing, or migrate, also work through
    `references/manual-checklist.md` and say which items you did and could not do.
+3. **When Google Analytics or Search Console access exists, their data outranks the
+   score.** A site Google has indexed one page of, or that has been shown 22 times in 16
+   months, has a search problem no crawl finding explains, whatever the score says. Run
+   the console review (step 5) in the same pass as the crawl, decide which stage the site
+   is at (measured, indexed, shown, clicked, converting), and lead the report with that.
 
 ## Workflow
 
@@ -70,7 +79,8 @@ Two rules follow from that, and they matter more than anything else in this file
      When PSI answers 429 (the keyless quota is shared across every keyless user and is
      often exhausted), run Lighthouse locally instead:
      `npx -y lighthouse@12 <URL> --only-categories=performance,accessibility,seo,best-practices --form-factor=mobile --screenEmulation.mobile --throttling-method=simulate --output=json --output-path=lh.json --chrome-flags="--headless=new" --quiet`.
-     From `lh.json` read the category scores; the LCP, CLS and TBT display values; the
+     In a sandbox with a preinstalled browser, add `--chrome-path=<path to chromium>` and
+     `--no-sandbox` to the chrome flags. From `lh.json` read the category scores; the LCP, CLS and TBT display values; the
      `largest-contentful-paint-element` phases (a large Render Delay on a text LCP usually
      means a web-font swap); `errors-in-console` (a CSP block shows here); and the hosts in
      `network-requests`, which prove which analytics tags actually fire (the static audit
@@ -87,22 +97,67 @@ Two rules follow from that, and they matter more than anything else in this file
    GET fine). If two findings conflict, resolve it first. If the site is being changed
    while you audit, re-run immediately before reporting; findings go stale in hours.
 
-5. **Review the Google consoles when the owner can give access.** The crawl cannot see
-   whether Google has fetched the sitemap, which URLs it knows, or whether GA4 keeps and
-   counts the events the site sends. With a read-only service-account key:
+5. **Review Google Analytics and Search Console whenever access exists, and ask for it
+   when it does not.** The crawl cannot see whether Google has indexed the pages, whether
+   anyone is shown them, or whether GA4 receives, keeps and counts what the site sends.
+   With a read-only service-account key:
 
    ```bash
-   python3 scripts/google_console_review.py --site <URL> --key <key.json> --urls-from-sitemap --launched YYYY-MM-DD --json <output-dir>/console.json
+   python3 scripts/google_console_review.py --site <URL> --key <key.json> --urls-from-sitemap --launched YYYY-MM-DD --json <output-dir>/console.json --markdown <output-dir>/console.md
    ```
 
-   It prints a findings table (retention, key events, custom dimensions, signals and
-   identity, stream URL, sitemap freshness, URLs unknown to Google or crawled before the
-   launch date, host variants collecting impressions) and the raw configuration. It never
-   writes. What each answer means, what the APIs refuse to show (data filters, the Search
-   Console link, reporting identity in v1beta, change history without `analytics.edit`), and
-   how to join the console facts with the crawl are in `references/google-console-review.md`.
+   The key can also come from an environment variable holding the JSON or its base64
+   (`--key-env VAR`, or one of the default names the script looks for), which is how a
+   cloud session or CI job carries it. Look for one before asking:
+   `env | grep -iE 'GOOGLE|GSC|GA_' | sed 's/=.*/=<set>/'`. Never print the key, never
+   write it into the repository.
+
+   The order of work:
+
+   1. **Check access first.** Confirm the key parses (field names and `client_email`
+      only) and see what the account can read. GA4 and Search Console are granted
+      separately, each inside its own console; an IAM role does nothing. A 200 with an
+      empty property list means the owner has not added the `client_email` yet. The script
+      reports that as a finding and reviews whichever half it can. Tell the owner the
+      exact address to add and where (`references/google-console-review.md`, "Access").
+   2. **Run the review** with `--urls-from-sitemap`. It inspects every sitemap URL,
+      pulls search performance for the window, the window before and all 16 months, reads
+      the GA4 settings, the events for the window, and 14 months of sessions by date,
+      source, landing page, event and hostname, and fetches the homepage to see whether
+      the stream's measurement ID is in it.
+   3. **Place the site on the ladder** (measured, indexed, shown, clicked, converting; the
+      table is in the reference) and stop at the first "no". That is the headline. The
+      findings that decide it: *GA4 has received no events*, *Sitemap URLs Google has not
+      indexed*, *Pages Google has never seen*, *The site is close to invisible in Google
+      Search*.
+   4. **Before proposing to fix missing measurement, find out why it is missing.** Read
+      the site's commit history, privacy policy, and tests for the tag. On 2026-11-24 the
+      tag had been removed on purpose, with a test that failed if it came back and a
+      privacy policy that promised its absence. Putting it back was the owner's call, and
+      it meant rewriting the policy in the same change. Ask; do not patch.
+   5. **Verify the tag in a browser** when the hosts are reachable: load the page in
+      headless Chromium, list requests to `googletagmanager.com` and
+      `google-analytics.com/g/collect`, and read `window.dataLayer`. The crawl and the
+      homepage check only see an ID in HTML. If the sandbox blocks those hosts, say the
+      firing check was not done.
+   6. **Use the data in the SEO findings.** Queries and pages with impressions decide
+      which titles are worth rewriting; with none, say that copy changes cannot be
+      measured yet. GA4's landing pages show where visits really arrive (a sign-in URL
+      near the top is a finding). Source/medium shows which campaign links are tagged in a
+      way GA4 can file. The joins are listed in the reference.
+   7. **Report the configuration changes as a list the owner can act on**, each with its
+      Admin path, in two groups: settings that lose data every day they stay wrong
+      (retention, key events, custom dimensions, the history-change page view on a
+      single-page app, the internal-traffic filter left in Testing) and the rest
+      (unwanted referrals, Search Console link, redaction, annotations). The full
+      checklist for both consoles is "Recommended configuration" in the reference. Say
+      which items the API could not show.
+
+   The script never writes: it requests read-only scopes and refuses any other POST.
+   Applying settings needs Editor access and a separate, explicit request from the owner.
    A relaunch two days old can score 90 on the crawl while Search Console still holds the
-   old site and GA4 is on two-month retention with no key event; these facts outrank the
+   old site and GA4 is on two-month retention with no key event; an eleven-week-old site
+   can score 92 with one page indexed and no measurement at all. These facts outrank the
    score.
 
 6. **Report back.** Lead with what blocks launch, not with the score. Give the overall
@@ -247,6 +302,26 @@ Two rules follow from that, and they matter more than anything else in this file
   when more than half of at least three non-legal pages lack one, instead of a LOW on
   nearly every page. A CSP that blocks the Cloudflare Web Analytics beacon is named as
   such, with the exact directives to add or the dashboard switch to turn it off.
+- **False positives fixed in 2.3.0** (a prerendered single-page app audited from a cloud
+  sandbox, 2026-11-24; the same site went from 79 to 92 with nothing changed on it). The
+  TLS expiry check is skipped, and says so, when the run goes through an HTTPS proxy,
+  because the certificate it would read is the proxy's (the report had flagged a 29-day
+  certificate issued by the sandbox). A Content-Security-Policy delivered in a
+  `<meta http-equiv>` tag counts as present; X-Frame-Options is still judged, since a meta
+  policy cannot carry `frame-ancestors`. A page that answers 200 with noindex and was
+  reached by a link, not listed in the sitemap, is a utility page (sign-in, account): it
+  gets one INFO note in place of noindex, missing-H1, thin-content and duplicate-title
+  findings. Links carrying `rel=nofollow` to noindexed pages no longer count toward
+  "Internal links lead to noindexed pages". The soft-404 finding now says what the 200
+  body claims (noindex, a canonical and where it points, or neither), which is what
+  decides how much it matters on a single-page-app host.
+- **Console reviewer 0.2.0.** Reads the key from an environment variable; reviews one
+  console when the account was only added to the other, with an access finding for the
+  missing one; dates the last GA4 event when the window is empty and checks the homepage
+  for the measurement ID; reports key events nothing sends, hostnames other than the
+  site's, campaign traffic filed under Unassigned, sitemap URLs held back from the index
+  by coverage state, other hosts Google found the pages through, and near-zero search
+  visibility on a site whose sitemap is more than 60 days old.
 - **Site-wide probes** (unchanged): all four host variants, real-404 handling, TLS expiry,
   asset caching, analytics stack, redirect chains with the full hop list.
 - **Client-render suppression**, **RFC 9309 robots evaluation**, **PageSpeed integration**,
@@ -273,15 +348,24 @@ once per issue type, like everything else. Details and the full check list are i
 against a local fixture site that reproduces each defect (and a clean twin that guards
 against false positives), plus `tests/test_checks_21.py` and `tests/test_checks_22.py`
 (the 2.1.0 and 2.2.0 checks and fixed false positives, each with a firing and a silent
-case), `tests/test_google_console_review.py` (the console reviewer against canned Google
+case), `tests/test_checks_23.py` (the 2.3.0 fixes), `tests/test_google_console_review.py` (the console reviewer against canned Google
 responses, no key needed), `tests/test_compare.py` and `tests/test_find_competitors.py`
 (the comparison and discovery scripts on synthetic inputs). Run it after changing any check. No network access is needed.
 
 ## Notes
 
-- This audits what is observable from the public site. It does not log in, submit forms,
-  execute JavaScript, or read Search Console. `scripts/google_console_review.py` covers the
-  consoles read-only when a key is available; otherwise be explicit about that scope.
+- The crawl audits what is observable from the public site. It does not log in, submit
+  forms or execute JavaScript. `scripts/google_console_review.py` covers Search Console
+  and GA4 read-only when a key is available; without one, say plainly that indexing,
+  search performance and measurement were not reviewed, and ask for access.
+- A sandbox changes what the tool can see. Behind an outbound allowlist, DNS-over-HTTPS,
+  RDAP, PageSpeed and any host not on the list fail, and the report says "could not
+  query"; list those as unchecked, not as passed. An old domain or a platform subdomain
+  that Search Console names as a referrer is worth asking the owner to allow, or to check
+  by hand, because whether it redirects is a real finding.
+- The crawl score moves when the tool changes. When comparing with an earlier run, compare
+  the findings, and re-run the old commit of the site with the new version if the number
+  matters.
 - The network load is modest but real: about 200 to 300 requests for a default run,
   eight at a time. Lower `--sweep` for fragile sites.
 - Re-running after fixes and diffing the `--json` outputs is a good way to show progress.
