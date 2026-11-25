@@ -354,7 +354,7 @@ once per issue type, like everything else. Details and the full check list are i
 against a local fixture site that reproduces each defect (and a clean twin that guards
 against false positives), plus `tests/test_checks_21.py` and `tests/test_checks_22.py`
 (the 2.1.0 and 2.2.0 checks and fixed false positives, each with a firing and a silent
-case), `tests/test_checks_23.py` (the 2.3.0 fixes), `tests/test_include_pages.py` (`--include-pages`), `tests/test_google_console_review.py` (the console reviewer against canned Google
+case), `tests/test_checks_23.py` (the 2.3.0 fixes), `tests/test_include_pages.py` (`--include-pages`, added in 2.4.0), `tests/test_google_console_review.py` (the console reviewer against canned Google
 responses, no key needed), `tests/test_compare.py` and `tests/test_find_competitors.py`
 (the comparison and discovery scripts on synthetic inputs). Run it after changing any check. No network access is needed.
 

@@ -39,7 +39,7 @@ from html.parser import HTMLParser
 
 # A descriptive UA: honest about being an auditor, but browser-shaped so servers that
 # sniff for "Mozilla" still serve the real page.
-VERSION = "2.3.0"   # bump on every behavior change; shown in the report footer and --version
+VERSION = "2.4.0"   # bump on every behavior change; shown in the report footer and --version
 USER_AGENT = "Mozilla/5.0 (compatible; SEO-Audit-Skill/2.1; +https://claude.com/claude-code)"
 # A plain desktop-browser UA: the baseline an AI-crawler probe is compared against, and
 # what font/CSS endpoints need to see before they serve woff2.
