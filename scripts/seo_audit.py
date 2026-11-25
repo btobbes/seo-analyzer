@@ -14,6 +14,7 @@ Design goals:
 
 Usage:
     python3 seo_audit.py https://example.com [--max-pages N] [--out DIR]
+                                             [--include-pages URL,PATH]
                                              [--no-pdf] [--pagespeed]
 
 The companion module report.py renders the HTML/PDF; this file does the analysis and
@@ -38,7 +39,7 @@ from html.parser import HTMLParser
 
 # A descriptive UA: honest about being an auditor, but browser-shaped so servers that
 # sniff for "Mozilla" still serve the real page.
-VERSION = "2.3.0"   # bump on every behavior change; shown in the report footer and --version
+VERSION = "2.4.0"   # bump on every behavior change; shown in the report footer and --version
 USER_AGENT = "Mozilla/5.0 (compatible; SEO-Audit-Skill/2.1; +https://claude.com/claude-code)"
 # A plain desktop-browser UA: the baseline an AI-crawler probe is compared against, and
 # what font/CSS endpoints need to see before they serve woff2.
@@ -610,16 +611,50 @@ def parse_robots(text):
     return {"sitemaps": sitemaps, "ai_blocked": ai_blocked, "blocks_all": blocks_all}
 
 
-def discover_pages(base_url, max_pages, sm_urls):
+def resolve_include_pages(base_url, include_pages):
+    """Resolve operator-named pages (--include-pages) against the site. Each entry is a
+    full URL or a site-relative path; paths are joined to base_url with normalize, the
+    same way links are. Returns (accepted, rejected): accepted are same-site http(s) URLs,
+    deduplicated against the homepage and each other, in the order given; rejected are
+    the raw entries that are off-site or not web URLs. Blank entries are dropped."""
+    seen = {base_url.rstrip("/")}
+    accepted, rejected = [], []
+    for raw in include_pages or []:
+        raw = (raw or "").strip()
+        if not raw:
+            continue
+        u = normalize(base_url, raw)
+        if (not u or urllib.parse.urlparse(u).scheme not in ("http", "https")
+                or not same_site(base_url, u)):
+            rejected.append(raw)
+            continue
+        if u.rstrip("/") in seen:
+            continue
+        seen.add(u.rstrip("/"))
+        accepted.append(u)
+    return accepted, rejected
+
+
+def discover_pages(base_url, max_pages, sm_urls, include_pages=None):
     """Return an ordered list of (url, source) to audit, homepage first. Sources:
-    'homepage', 'sitemap', 'link' — the report shows how each page was discovered."""
+    'homepage', 'include', 'sitemap', 'link' — the report shows how each page was
+    discovered. include_pages (--include-pages) are operator-named URLs or paths, placed
+    right after the homepage so a page the sample would miss (a noindexed /apply that is
+    not in the sitemap) is always audited. Off-site entries are ignored. Named pages are
+    never dropped: max_pages grows to 1 + their number when it is smaller."""
     home = base_url
     pages = [(home, "homepage")]
     seen = {home.rstrip("/")}
+    seeds, _rejected = resolve_include_pages(base_url, include_pages)
+    if seeds:
+        max_pages = max(max_pages, 1 + len(seeds))
+    for u in seeds:
+        seen.add(u.rstrip("/"))
+        pages.append((u, "include"))
     # Prefer the sitemap — it's the site's own statement of what matters — but sample
     # ACROSS its templates instead of taking the first N entries (see stratified_sample).
     sm_same = [u.strip() for u in sm_urls if u.strip() and same_site(base_url, u.strip())]
-    for u in stratified_sample(sm_same, max_pages - 1, exclude=[home]):
+    for u in stratified_sample(sm_same, max_pages - len(pages), exclude=[home] + seeds):
         seen.add(u.rstrip("/"))
         pages.append((u, "sitemap"))
     # Fall back to following homepage links if the sitemap was thin.
@@ -1102,7 +1137,8 @@ def demote_linked_noindex(pages):
     pages' finding still reports the links themselves. Returns the pages it changed."""
     changed = []
     for i, pg in enumerate(pages):
-        if i == 0 or pg.get("source") == "sitemap" or pg.get("status") != 200:
+        # A page named with --include-pages was asked for by the operator: audit it in full.
+        if i == 0 or pg.get("source") in ("sitemap", "include") or pg.get("status") != 200:
             continue
         if "noindex" not in (pg.get("robots") or "").lower():
             continue
@@ -3911,7 +3947,7 @@ def confidence_level(psi, pages, ai_blocked):
 # Orchestration
 # =================================================================================
 def run_audit(start_url, max_pages=15, use_pagespeed=False, sweep=100, probe_ai=True,
-              network_checks=True):
+              network_checks=True, include_pages=None):
     if not start_url.startswith("http"):
         start_url = "https://" + start_url
     parsed = urllib.parse.urlparse(start_url)
@@ -3941,7 +3977,10 @@ def run_audit(start_url, max_pages=15, use_pagespeed=False, sweep=100, probe_ai=
     llms_found = (llms_resp.status == 200 and bool(llms_resp.body)
                   and b"<html" not in llms_resp.body[:2000].lower())
 
-    page_specs = discover_pages(base, max_pages, sm_urls)
+    _included, include_rejected = resolve_include_pages(base, include_pages)
+    for raw in include_rejected:
+        print(f"--include-pages: skipping {raw!r}, not a page on {domain}", file=sys.stderr)
+    page_specs = discover_pages(base, max_pages, sm_urls, include_pages)
     pages_urls = [u for u, _ in page_specs]
 
     site_findings = []
@@ -4357,6 +4396,9 @@ def main():
     ap.add_argument("url", help="Site URL, e.g. https://example.com")
     ap.add_argument("--max-pages", type=int, default=15,
                     help="Pages that get a full per-page table, sampled across URL templates (default 15)")
+    ap.add_argument("--include-pages", action="append", default=[], metavar="URLS",
+                    help="Pages to always audit, right after the homepage: full URLs or site-relative "
+                         "paths, comma-separated, repeatable. --max-pages grows to fit them")
     ap.add_argument("--sweep", type=int, default=100,
                     help="Additional sitemap URLs analyzed and reported in aggregate (default 100, 0 = off)")
     ap.add_argument("--no-ai-probe", action="store_true",
@@ -4370,11 +4412,13 @@ def main():
     ap.add_argument("--pagespeed", action="store_true", help="Query PageSpeed Insights (best effort)")
     ap.add_argument("--json", action="store_true", help="Also write the raw report JSON")
     args = ap.parse_args()
+    include_pages = [p.strip() for item in args.include_pages for p in item.split(",") if p.strip()]
 
     print(f"seo-audit {VERSION} · auditing {args.url} ({args.max_pages} deep pages + "
           f"{args.sweep} swept)…", file=sys.stderr)
     report = run_audit(args.url, args.max_pages, args.pagespeed, sweep=args.sweep,
-                       probe_ai=not args.no_ai_probe, network_checks=not args.offline_dns)
+                       probe_ai=not args.no_ai_probe, network_checks=not args.offline_dns,
+                       include_pages=include_pages)
 
     # import the renderer (sibling module)
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
